@@ -386,6 +386,9 @@ if (xsavesInstruction && xssRead &&
     // Expanding it to all CPUID-enumerated XSS bits changes the XSAVES/XRSTORS
     // contract after boot and can break exception/debugger paths.
     g_XsavesMask = g_XsavesEnabled ? g_HostXssMask : 0;
+    // the guest selector must stay within the immutable frame mask. A guest
+    // XSS bit that XSAVES does not capture would leak state across VM-exits
+    g_SupportedXssMask &= g_XsavesMask;
 
     if (g_XsaveStateSize == 0 || g_XsaveStateSize > VMEXIT_XSAVE_MAX) {
         return false;
@@ -1874,13 +1877,12 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         !IsCanonical(reinterpret_cast<u64>(GuestSp))) return false;
     VmWriteChecked(GUEST_RIP, reinterpret_cast<u64>(GuestIp));
     VmWriteChecked(GUEST_RSP, reinterpret_cast<u64>(GuestSp));
-    // KeIpiGenericCall runs at IPI_LEVEL, where the IRQL/APIC mask already
-    // blocks ordinary interrupts. Preserve the interrupted Windows IF bit so
-    // the guest does not remain permanently non-interruptible after the IPI
-    // callback returns. The VM-exit stub owns CLI while using its private
-    // stack, so masking IF in the guest is neither necessary nor safe.
+    // KeIpiGenericCall invokes this callback with IF cleared. The guest starts
+    // on the callback continuation and then returns to ordinary kernel code;
+    // it must be interruptible or the clock/IPI path will stop making progress
     u64 guestRflags = GetRflags();
     const u64 callbackRflags = guestRflags;
+    guestRflags |= (1ULL << 9);                 // IF
     guestRflags |= (1ULL << 1);                 // architectural fixed bit
     guestRflags &= ~((1ULL << 17) |             // VM (invalid in long mode)
                       (1ULL << 19) |             // VIF

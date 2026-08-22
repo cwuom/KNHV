@@ -231,10 +231,12 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   const std::size_t setup_begin = vmm.find("bool SetupVmcs(");
   const std::size_t setup_end = vmm.find(
       "// ==============================================================================\n// Launch Logic", setup_begin);
-  Check(state, "IPI launch preserves callback interrupt state",
+  Check(state, "IPI launch enables guest interrupts",
          setup_begin != std::string::npos && setup_end > setup_begin &&
              vmm.substr(setup_begin, setup_end - setup_begin).find(
                  "u64 guestRflags = GetRflags()") != std::string::npos &&
+             vmm.substr(setup_begin, setup_end - setup_begin).find(
+                 "guestRflags |= (1ULL << 9)") != std::string::npos &&
              vmm.substr(setup_begin, setup_end - setup_begin).find(
                  "guestRflags &= ~((1ULL << 17)") != std::string::npos &&
              vmm.substr(setup_begin, setup_end - setup_begin).find(
@@ -249,8 +251,10 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(if\s*\(g_VcpuData\s*==\s*nullptr\)[\s\S]{0,500}g_VmxFeatureContractInitialized\s*=\s*false)");
   CheckPattern(state, "CPUID XSS mask is restricted to the guest contract", vmm,
                R"(g_SupportedXssMask\s*=\s*enumeratedXss\s*&\s*IA32_XSS_VIRTUALIZABLE_MASK)");
-  CheckPattern(state, "XSAVES fixed mask uses complete XSS enumeration", vmm,
-               R"(g_XsavesMask\s*=\s*g_XsavesEnabled\s*\?\s*g_EnumeratedXssMask\s*:\s*0)");
+  CheckPattern(state, "XSAVES fixed mask follows host XSS", vmm,
+               R"(g_XsavesMask\s*=\s*g_XsavesEnabled\s*\?\s*g_HostXssMask\s*:\s*0)");
+  CheckPattern(state, "guest XSS stays inside fixed frame mask", vmm,
+               R"(g_SupportedXssMask\s*&=\s*g_XsavesMask)");
   CheckPattern(state, "guest XSS contract preserves IPT and CET_U", vmx,
                R"(IA32_XSS_GUEST_KNOWN_MASK\s+\(IA32_XSS_IPT\s*\|\s*IA32_XSS_CET_U\))");
   CheckPattern(state, "active PT is rejected before VMX", vmm,
