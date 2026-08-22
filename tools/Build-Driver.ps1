@@ -39,8 +39,11 @@ if (-not $wdkHeader) {
 if ($WdkRoot) {
     $env:WDKContentRoot = [IO.Path]::GetFullPath($WdkRoot)
 } elseif (-not $env:WDKContentRoot) {
-    $wdkIncludeRoot = Split-Path -Parent (Split-Path -Parent $wdkHeader.FullName)
-    $env:WDKContentRoot = Split-Path -Parent (Split-Path -Parent $wdkIncludeRoot)
+    # ntddk.h is under Include\<kit>\km.  Find the Kits\10 root explicitly;
+    # FindWDK appends Include\*\km itself.
+    $wdkKitVersionRoot = Split-Path -Parent (Split-Path -Parent $wdkHeader.FullName)
+    $wdkIncludeRoot = Split-Path -Parent $wdkKitVersionRoot
+    $env:WDKContentRoot = Split-Path -Parent $wdkIncludeRoot
 }
 
 function Find-VisualStudioDevCmd {
@@ -195,7 +198,12 @@ if ($generator -eq "Ninja") {
 } else {
     $configureArgs += @("-A", "x64")
 }
-$configureArgs += @("-DNESTED_HV_SIGN=OFF", "-DNESTED_HV_BUILD_TESTS=ON")
+$configureArgs += @(
+    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+    "-DNESTED_HV_SIGN=OFF",
+    "-DNESTED_HV_BUILD_TESTS=ON",
+    "-DWDK_WINVER=0x0A00"
+)
 if ($WdkRoot) { $configureArgs += "-DWDK_CONTENT_ROOT=$WdkRoot" }
 
 Write-Host "Configuring $generator in $BuildDirectory"

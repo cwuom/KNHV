@@ -1,9 +1,12 @@
 # CMake/VS Code build trees
 /build/
 /cmake-build-*/
+/compile_commands.json
 
 # Local reference checkouts used for audit only; never package as source.
 /.tmprefs/
+/.tmp
+/.report
 
 # Local signing material and generated driver artifacts
 /certs/

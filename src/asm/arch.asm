@@ -5,8 +5,12 @@
 extern VmExitHandler:proc
 extern PrepareHvCallback:proc
 extern AbortHvLaunch:proc
+extern MarkCurrentVcpuLaunched:proc
 extern MarkCurrentVcpuParked:proc
 extern g_LinearAddressBits:byte
+extern g_CetVmcsEnabled:byte
+extern g_XsavesEnabled:byte
+extern g_XsavesMask:qword
 
 MSR_FS_BASE     equ 0C0000100h
 MSR_GS_BASE     equ 0C0000101h
@@ -25,6 +29,7 @@ MSR_IA32_SYSENTER_CS  equ 00000174h
 MSR_IA32_SYSENTER_ESP equ 00000175h
 MSR_IA32_SYSENTER_EIP equ 00000176h
 CR4_CET         equ 0800000h
+CR4_VMXE        equ 02000h
 
 ; VMCS fields used by the launch thunk.  The values are the architectural
 ; encodings from Intel SDM Vol. 3C, Table B-1.
@@ -121,12 +126,19 @@ RST_RING        equ 0C0h
 ; address.  Bits used by the VMLAUNCH CF/ZF result are deliberately not relied
 ; on by this stub; the caller should compare the complete value first.
 VMX_LAUNCH_SUCCESS_MAGIC equ 04C41554E43484544h
+VMX_LAUNCH_NOT_VMX_MAGIC equ 0BAD0000000000001h
+HYPERVISOR_MAGIC         equ 013371337h
+VMCALL_UNLOAD             equ 0DEADBEEFh
 
 ; ------------------------------------------------------------------------------
 ; HvVmExitEntryPoint
 ; handles the transition from guest to host
 ; ------------------------------------------------------------------------------
 HvVmExitEntryPoint proc
+    ; VM-exit does not switch to a Windows thread stack. Disable interrupts
+    ; before allocating the private frame so an IRQ cannot enter the kernel
+    ; while RSP still points at the VMX host stack.
+    cli
     ; 1180h is 64-byte aligned and leaves room for the full GuestContext plus
     ; the reserved host KERNEL_GS_BASE shadow at frame offset 0x1178.
     sub rsp, 1180h
@@ -166,11 +178,9 @@ HvVmExitEntryPoint proc
     mov ecx, MSR_KERNEL_GS_BASE
     wrmsr
 
-    ; VMX does not virtualize XCR0 or IA32_XSS.  Capture the guest masks
-    ; before switching to the host masks used by the C++ exit handler.  The
-    ; XSAVES/XRSTORS pair is deliberately used in compacted format: CPUID.0D
-    ; subleaf 1 is validated by the feature gate and the frame is large enough
-    ; for its reported maximum size.
+    ; VMX does not virtualize XCR0.  Capture it before switching to the host
+    ; mask used by the C++ exit handler. IA32_XSS is read only on the optional
+    ; XSAVES path; older processors may fault on that MSR.
     xor ecx, ecx
     xgetbv
     mov r8d, eax
@@ -180,6 +190,8 @@ HvVmExitEntryPoint proc
     or r8, rdx
     mov [rsp + CTX_GUEST_XCR0], r8
 
+    cmp byte ptr [g_XsavesEnabled], 0
+    je vmxSaveXsave
     mov ecx, MSR_IA32_XSS
     rdmsr
     mov r8d, eax
@@ -188,30 +200,29 @@ HvVmExitEntryPoint proc
     shl rdx, 20h
     or r8, rdx
     mov [rsp + CTX_GUEST_XSS], r8
+    ; Save with the immutable virtual XSS mask, not the guest's current
+    ; selector. This keeps the compacted XSAVE layout identical across exits
+    ; while still allowing the guest to change IA32_XSS architecturally.
+    mov r15, qword ptr [g_XsavesMask]
+    mov r14, r15
+    shr r14, 20h
+    mov eax, r15d
+    mov edx, r14d
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    or rax, r15
+    mov rdx, rax
+    shr rdx, 20h
+    xsaves [rsp]
+    jmp short vmxStateSaved
 
-    ; XSAVES uses EDX:EAX as the requested state mask.  Include both XCR0 and
-    ; IA32_XSS so supervisor components (including CET_U) cannot bleed into
-    ; the host handler.  A legacy non-CET machine uses ordinary XSAVE; the
-    ; contract rejects machines that need supervisor state without XSAVES.
-    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
-    test rax, rax
-    jnz vmxSaveXsaves
-    mov rax, cr4
-    test rax, CR4_CET
-    jnz vmxSaveXsaves
+vmxSaveXsave:
+    mov qword ptr [rsp + CTX_GUEST_XSS], 0
     mov rax, [rsp + CTX_GUEST_XCR0]
     mov rdx, rax
     shr rdx, 20h
     xsave [rsp]
-    jmp short vmxStateSaved
-
-vmxSaveXsaves:
-    mov rax, [rsp + CTX_GUEST_XCR0]
-    mov rdx, [rsp + CTX_GUEST_XSS]
-    or rax, rdx
-    mov rdx, rax
-    shr rdx, 20h
-    xsaves [rsp]
 
 vmxStateSaved:
 
@@ -224,11 +235,14 @@ vmxStateSaved:
     mov ecx, 0
     xsetbv
 
+    cmp byte ptr [g_XsavesEnabled], 0
+    je vmxHostMasksReady
     mov rax, [rsp + HOST_XSS_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
+vmxHostMasksReady:
 
     ; Windows x64 ABI requires DF=0 on entry to C/C++ code.  A guest can
     ; legally run with RFLAGS.DF set when a VM-exit occurs, but that flag is
@@ -242,39 +256,42 @@ vmxStateSaved:
     call VmExitHandler
     add rsp, 20h
 
-    ; The handler ran with host XCR0/XSS.  Restore the guest masks and the
-    ; compacted state frame before inspecting the VM-exit action flags.
+    ; The handler ran with the host XCR0/XSS contract. Restore the guest mask
+    ; and state frame before inspecting the VM-exit action flags.
     mov rax, [rsp + CTX_GUEST_XCR0]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, 0
     xsetbv
 
+    cmp byte ptr [g_XsavesEnabled], 0
+    je vmxRestoreXsave
+    ; XRSTORS must use the same compacted mask as XSAVES. Restore the guest
+    ; IA32_XSS value only after the state image has been consumed.
+    mov r15, qword ptr [g_XsavesMask]
+    mov r14, r15
+    shr r14, 20h
+    mov eax, r15d
+    mov edx, r14d
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    or rax, r15
+    mov rdx, rax
+    shr rdx, 20h
+    xrstors [rsp]
     mov rax, [rsp + CTX_GUEST_XSS]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
+    jmp short vmxStateRestored
 
-    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
-    test rax, rax
-    jnz vmxRestoreXsaves
-    mov rax, cr4
-    test rax, CR4_CET
-    jnz vmxRestoreXsaves
+vmxRestoreXsave:
     mov rax, [rsp + CTX_GUEST_XCR0]
     mov rdx, rax
     shr rdx, 20h
     xrstor [rsp]
-    jmp short vmxStateRestored
-
-vmxRestoreXsaves:
-    mov rax, [rsp + CTX_GUEST_XCR0]
-    mov rdx, [rsp + CTX_GUEST_XSS]
-    or rax, rdx
-    mov rdx, rax
-    shr rdx, 20h
-    xrstors [rsp]
 
 vmxStateRestored:
     ; Windows x64 C/C++ code requires DF=0.  RFLAGS (including the guest's
@@ -344,11 +361,14 @@ vmxHalt:
     shr rdx, 20h
     mov ecx, 0
     xsetbv
+    cmp byte ptr [g_XsavesEnabled], 0
+    je vmxHaltHostMasksReady
     mov rax, [rsp + HOST_XSS_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
+vmxHaltHostMasksReady:
     ; vmxResumeFailure reaches this label after the normal path has already
     ; installed the guest KERNEL_GS_BASE.  Restore the host value before the
     ; C++ marker call; otherwise GS-relative kernel accesses can fault while
@@ -365,10 +385,9 @@ vmxHalt:
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
-    ; Keep this CPU interruptible so a later stop/recovery IPI can wake the
-    ; HLT loop.  Host CR3/IDT are active after VMXOFF, so servicing an IPI is
-    ; safe; leaving IF=0 would strand the processor permanently.
-    sti
+    ; Keep interrupts disabled while parked. The current RSP is the private
+    ; VMX stack, not a Windows thread stack, so an IRQ here could enter the
+    ; kernel on an invalid stack and create a second fault.
 vmxHaltLoop:
     hlt
     jmp vmxHaltLoop
@@ -384,7 +403,7 @@ HvVmExitEntryPoint endp
 
 ; ------------------------------------------------------------------------------
 ; HvRestoreStateAndReturn
-; Called ONLY during Unload.
+; Called while tearing down a temporary guest handoff or an unload request.
 ; RCX = Pointer to GuestContext
 ; ------------------------------------------------------------------------------
 HvRestoreStateAndReturn proc
@@ -604,37 +623,45 @@ restoreSpillCanonicalCompare:
     shr rdx, 20h
     mov ecx, 0
     xsetbv
+    cmp byte ptr [g_XsavesEnabled], 0
+    je restoreGuestXsave
+    ; Use the fixed compacted layout for teardown as well, then expose the
+    ; guest selector after XRSTORS has restored CET_U state.
+    mov r15, qword ptr [g_XsavesMask]
+    mov r14, r15
+    shr r14, 20h
+    mov eax, r15d
+    mov edx, r14d
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+    mov rax, [r10 + CTX_GUEST_XCR0]
+    or rax, r15
+    mov rdx, rax
+    shr rdx, 20h
+    xrstors [r10]
     mov rax, [r10 + CTX_GUEST_XSS]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
-    mov rax, [r10 + HOST_XSS_FRAME_SLOT]
-    test rax, rax
-    jnz restoreGuestXsaves
-    mov rax, cr4
-    test rax, CR4_CET
-    jnz restoreGuestXsaves
+    jmp short restoreGuestStateDone
+
+restoreGuestXsave:
     mov rax, [r10 + CTX_GUEST_XCR0]
     mov rdx, rax
     shr rdx, 20h
     xrstor [r10]
-    jmp short restoreGuestStateDone
-
-restoreGuestXsaves:
-    mov rax, [r10 + CTX_GUEST_XCR0]
-    mov rdx, [r10 + CTX_GUEST_XSS]
-    or rax, rdx
-    mov rdx, rax
-    shr rdx, 20h
-    xrstors [r10]
 
 restoreGuestStateDone:
 
-    ; VMXOFF leaves the VM-exit host CET state active.  Restore the guest
-    ; supervisor CET fields that are represented directly in the VMCS before
-    ; leaving VMX root; the other CET XSTATE components were restored by
-    ; XRSTORS above.
+    ; VMXOFF returns to the original Windows context. Keep the guest XSS that
+    ; was restored above; it may differ from the host value after Windows has
+    ; dynamically changed IA32_XSS while the monitor was active.
+
+    ; The CET VMCS path is disabled for the current contract. Keep the writes
+    ; conditional so a future CET implementation cannot fault on old Intel.
+    cmp byte ptr [g_CetVmcsEnabled], 0
+    je restoreGuestCetDone
     mov ecx, MSR_IA32_S_CET
     mov rax, [r10 + CTX_GUEST_S_CET]
     mov rdx, rax
@@ -650,6 +677,7 @@ restoreGuestStateDone:
     mov rdx, rax
     shr rdx, 20h
     wrmsr
+restoreGuestCetDone:
 
     ; VMXOFF leaves CR4.VMXE set.  Install the guest CR4/CR3 pair only after
     ; all host-context reads are complete.
@@ -696,11 +724,14 @@ restoreInvalid:
     shr rdx, 20h
     mov ecx, 0
     xsetbv
+    cmp byte ptr [g_XsavesEnabled], 0
+    je restoreInvalidHostMasksReady
     mov rax, [r10 + HOST_XSS_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
+restoreInvalidHostMasksReady:
     ; vmxAbort reaches this path before the normal VMRESUME epilogue restores
     ; the host KERNEL_GS_BASE.  Restore the host per-CPU value before invoking
     ; the C++ marker, whose KPCR access is GS-relative.
@@ -718,7 +749,8 @@ restoreInvalid:
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
-    sti
+    ; Keep interrupts disabled while parked for the same private-stack reason
+    ; as the VM-exit fatal path above.
 restoreInvalidLoop:
     hlt
     jmp restoreInvalidLoop
@@ -763,12 +795,23 @@ HvVmRead proc
     ret
 HvVmRead endp
 
-HvLaunchGuest proc
-    ; The normal C++ caller's return address is already at [RSP].  Use that
-    ; exact stack and the leaf thunk as the initial guest state.  On a
-    ; successful VMLAUNCH the thunk executes RET and returns to the caller's
-    ; continuation; on failure VMLAUNCH returns here with CF/ZF in RFLAGS.
+HvLaunchGuest proc frame
+    ; Keep the caller return slot at the top of a private area.  The VMXOFF
+    ; restore path builds an IRET frame and a register spill below guest RSP.
+    ; Without this reservation those writes would corrupt the IPI dispatcher
+    ; stack before the guest RET reaches the wrapper continuation.
+    sub rsp, 200h
+    .allocstack 200h
+    .endprolog
+
+    ; Never execute a VMX instruction after a failed preparation or an
+    ; unexpected VMXOFF. The C++ caller treats this token as a non-VMX path.
+    mov rax, cr4
+    test rax, CR4_VMXE
+    jz launchNotVmx
+
     mov rax, rsp
+    add rax, 200h
     mov ecx, VMCS_GUEST_RSP
     mov rdx, rax
     vmwrite rcx, rdx
@@ -784,11 +827,18 @@ HvLaunchGuest proc
     vmlaunch
     pushfq
     pop rax
+    add rsp, 200h
     ret
 
 launchVmwriteFailure:
     pushfq
     pop rax
+    add rsp, 200h
+    ret
+
+launchNotVmx:
+    mov rax, VMX_LAUNCH_NOT_VMX_MAGIC
+    add rsp, 200h
     ret
 HvLaunchGuest endp
 
@@ -870,8 +920,11 @@ HvGetSegmentLimit endp
 
 ; u32 HvGetSegmentAr(u16 Selector)
 HvGetSegmentAr proc
+    test ecx, 0FFF8h
+    jz Unusable
     lar eax, ecx
     jz Success
+Unusable:
     mov eax, 10000h
     ret
 Success:
@@ -884,10 +937,10 @@ HvGetSegmentAr endp
 ; Guest Start Thunk
 ; ------------------------------------------------------------------------------
 GuestStartThunk proc
-    ; VMLAUNCH enters this thunk with the original HvLaunchGuest call frame
-    ; as the guest stack.  Returning here pops the normal C++ return address;
-    ; this preserves the caller's epilogue and avoids the old
-    ; _AddressOfReturnAddress()/RET stack corruption.
+    ; VMLAUNCH does not return through the HvLaunchGuest call frame. Returning
+    ; directly to that frame's continuation leaves the monitor active and lets
+    ; the IPI wrapper return to Windows in VMX non-root mode. StopHypervisor()
+    ; later uses the reserved VMCALL path to leave VMX on each processor.
     mov rax, VMX_LAUNCH_SUCCESS_MAGIC
     ret
 GuestStartThunk endp
@@ -897,29 +950,65 @@ GuestStartThunk endp
 ; ------------------------------------------------------------------------------
 ; The C++ preparation routine performs all VMX setup and returns before entry.
 ; This wrapper owns the call frame used as the initial guest stack.  A
-; successful GuestStartThunk RET therefore resumes at launchSuccess, while a
-; failed VMLAUNCH returns flags and is cleaned up by AbortHvLaunch.
-EnableHvCallback proc
-    ; Entry RSP points at the IPI dispatcher's return address.  0A8h keeps the
-    ; stack aligned for calls (entry is +8, subtracting 0A8h yields 0 mod 16).
+; successful GuestStartThunk RET therefore resumes at enableHvDone while VMX
+; remains active, while a failed VMLAUNCH returns flags and is cleaned up by
+; AbortHvLaunch.
+EnableHvCallback proc frame
+    ; Entry RSP points at the IPI dispatcher's return address.  148h keeps the
+    ; stack aligned for calls and reserves 0A0h bytes for XMM6-XMM15, which are
+    ; nonvolatile in the Windows x64 ABI (entry is +8, subtracting 148h yields
+    ; 0 mod 16).
     ; [RSP..1Fh] is the mandatory Windows x64 shadow space; nonvolatile saves
     ; start at 40h so a C++ callee cannot overwrite them.
-    sub rsp, 0A8h
+    sub rsp, 148h
+    .allocstack 148h
     mov [rsp + 40h], rbx
+    .savereg rbx, 40h
     mov [rsp + 48h], rbp
+    .savereg rbp, 48h
     mov [rsp + 50h], rsi
+    .savereg rsi, 50h
     mov [rsp + 58h], rdi
+    .savereg rdi, 58h
     mov [rsp + 60h], r12
+    .savereg r12, 60h
     mov [rsp + 68h], r13
+    .savereg r13, 68h
     mov [rsp + 70h], r14
+    .savereg r14, 70h
     mov [rsp + 78h], r15
+    .savereg r15, 78h
+    movdqu xmmword ptr [rsp + 080h], xmm6
+    .savexmm128 xmm6, 080h
+    movdqu xmmword ptr [rsp + 090h], xmm7
+    .savexmm128 xmm7, 090h
+    movdqu xmmword ptr [rsp + 0A0h], xmm8
+    .savexmm128 xmm8, 0A0h
+    movdqu xmmword ptr [rsp + 0B0h], xmm9
+    .savexmm128 xmm9, 0B0h
+    movdqu xmmword ptr [rsp + 0C0h], xmm10
+    .savexmm128 xmm10, 0C0h
+    movdqu xmmword ptr [rsp + 0D0h], xmm11
+    .savexmm128 xmm11, 0D0h
+    movdqu xmmword ptr [rsp + 0E0h], xmm12
+    .savexmm128 xmm12, 0E0h
+    movdqu xmmword ptr [rsp + 0F0h], xmm13
+    .savexmm128 xmm13, 0F0h
+    movdqu xmmword ptr [rsp + 100h], xmm14
+    .savexmm128 xmm14, 100h
+    movdqu xmmword ptr [rsp + 110h], xmm15
+    .savexmm128 xmm15, 110h
+    .endprolog
 
-    ; PrepareHvCallback(Context, GuestSp, GuestIp).  HvLaunchGuest overwrites
-    ; GUEST_RSP with its own [RSP] return slot immediately before VMLAUNCH.
-    lea rdx, [rsp + 80h]
+    ; PrepareHvCallback(Context, GuestSp, GuestIp).  The future call to
+    ; HvLaunchGuest writes its return slot at [RSP-8]; pass that slot to the
+    ; VMCS setup so the diagnostic guest RSP matches the VMX launch path.
+    lea rdx, [rsp - 8]
     lea r8, GuestStartThunk
     call PrepareHvCallback
-    test eax, eax
+    ; PrepareHvCallback is an explicit ULONG contract. Test the low byte as
+    ; well so older binaries that still return a C++ bool fail closed.
+    test al, al
     jz enableHvDone
 
     call HvLaunchGuest
@@ -927,8 +1016,11 @@ EnableHvCallback proc
     ; a volatile register before comparing it.
     mov rdx, VMX_LAUNCH_SUCCESS_MAGIC
     cmp rax, rdx
-    je enableHvDone
+    jne launchFailed
+    call MarkCurrentVcpuLaunched
+    jmp enableHvDone
 
+launchFailed:
     mov rcx, rax
     call AbortHvLaunch
 
@@ -941,8 +1033,18 @@ enableHvDone:
     mov r13, [rsp + 68h]
     mov r14, [rsp + 70h]
     mov r15, [rsp + 78h]
+    movdqu xmm6, xmmword ptr [rsp + 080h]
+    movdqu xmm7, xmmword ptr [rsp + 090h]
+    movdqu xmm8, xmmword ptr [rsp + 0A0h]
+    movdqu xmm9, xmmword ptr [rsp + 0B0h]
+    movdqu xmm10, xmmword ptr [rsp + 0C0h]
+    movdqu xmm11, xmmword ptr [rsp + 0D0h]
+    movdqu xmm12, xmmword ptr [rsp + 0E0h]
+    movdqu xmm13, xmmword ptr [rsp + 0F0h]
+    movdqu xmm14, xmmword ptr [rsp + 100h]
+    movdqu xmm15, xmmword ptr [rsp + 110h]
     xor eax, eax
-    add rsp, 0A8h
+    add rsp, 148h
     ret
 EnableHvCallback endp
 

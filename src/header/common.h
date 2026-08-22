@@ -26,16 +26,20 @@ constexpr u64 VMEXIT_HOST_KGS_OFFSET = 0x1178;
 // lets the C++ launch callback distinguish the normal guest continuation from
 // a VMLAUNCH failure (which returns VMX flags instead).
 constexpr u64 VMX_LAUNCH_SUCCESS_MAGIC = 0x4C41554E43484544ULL; // "LAUNCHED"
+// Returned by the defensive launch guard when CR4.VMXE is already clear. The
+// caller must not interpret this value as VMX instruction flags.
+constexpr u64 VMX_LAUNCH_NOT_VMX_MAGIC = 0xBAD0000000000001ULL;
 
 enum VcpuState : long {
     VcpuUninitialized = 0,
-    VcpuVmxOn         = 1,
-    VcpuLaunched      = 2,
-    VcpuStopped       = 3,
-    VcpuFailed        = 4,
+    VcpuStarting      = 1,
+    VcpuVmxOn         = 2,
+    VcpuLaunched      = 3,
+    VcpuStopped       = 4,
+    VcpuFailed        = 5,
     // Fatal VM-exit/restore path parked this processor after VMXOFF.  Its
     // host stack and the driver image must remain resident.
-    VcpuParked        = 5,
+    VcpuParked        = 6,
 };
 
 struct __declspec(align(64)) GuestContext {
@@ -160,9 +164,8 @@ struct VcpuContext {
     u64   GuestXcr0;
     u64   HostXss;
 
-    // 0 = uninitialized, 1 = VMXON, 2 = guest launched, 3 = stopped,
-    // 4 = failed.  LONG is used so the IPI callbacks can publish state with
-    // InterlockedExchange at DISPATCH_LEVEL.
+    // State is published with InterlockedExchange so lifecycle callbacks can
+    // inspect it without taking a lock at IPI_LEVEL.
     volatile long State;
 
     // XCR0 is not part of VMCS guest/host state.  XSETBV in VMX non-root can
@@ -171,4 +174,20 @@ struct VcpuContext {
     // permit a guest XSETBV that leaves it unchanged; a different request is
     // turned into #GP instead of touching host XCR0.
     u64   HostXcr0;
+
+    // Diagnostic counters are kept per logical processor so the VM-exit path
+    // can report the first failures without flooding the kernel debugger.
+    volatile long VmExitCount;
+
+    // These fields are a passive-level diagnostic snapshot.  They are written
+    // by the owning processor and read only after an IPI rendezvous completes.
+    volatile long LaunchStage;
+    volatile long LastExitReason;
+    volatile long LastExitAction;
+    volatile long VmResumeAttempts;
+    u64 LastExitQualification;
+    u64 LastGuestRip;
+    u64 LastGuestRsp;
+    u64 LastRflags;
+    u64 LastVmInstructionError;
 };

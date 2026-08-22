@@ -34,6 +34,7 @@
 #define MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x0000048E
 #define MSR_IA32_VMX_TRUE_EXIT_CTLS     0x0000048F
 #define MSR_IA32_VMX_TRUE_ENTRY_CTLS    0x00000490
+#define MSR_IA32_VMX_PROCBASED_CTLS3    0x00000492
 #define MSR_FS_BASE                     0xC0000100
 #define MSR_GS_BASE                     0xC0000101
 #define MSR_IA32_KERNEL_GS_BASE         0xC0000102
@@ -42,6 +43,13 @@
 #define MSR_IA32_SYSENTER_ESP           0x00000175
 #define MSR_IA32_SYSENTER_EIP           0x00000176
 #define MSR_IA32_PAT                    0x00000277
+#define MSR_IA32_RTIT_OUTPUT_BASE       0x00000560
+#define MSR_IA32_RTIT_OUTPUT_MASK_PTRS  0x00000561
+#define MSR_IA32_RTIT_CTL               0x00000570
+#define MSR_IA32_RTIT_STATUS            0x00000571
+#define MSR_IA32_RTIT_CR3_MATCH         0x00000572
+#define MSR_IA32_RTIT_ADDR0_A           0x00000580
+#define MSR_IA32_RTIT_ADDR3_B           0x00000587
 // CET/XSAVES state is enabled only after the runtime capability contract has
 // verified the paired CET VMCS controls and XSAVES support.
 #define MSR_IA32_XSS                    0x00000DA0
@@ -56,13 +64,17 @@
 // IA32_XSS state-component bits from the WDK/Intel XSTATE enumeration.
 // CET_U contains IA32_U_CET and IA32_PL3_SSP; CET_S contains supervisor
 // shadow-stack state. IPT is Intel Processor Trace state. These components are
-// preserved by the compacted XSAVES/XRSTORS image used by the VM-exit frame.
+// preserved by the complete compacted XSAVES/XRSTORS image used by the VM-exit
+// frame.
 #define IA32_XSS_IPT                        (1ULL << 8)
 #define IA32_XSS_CET_U                      (1ULL << 11)
 #define IA32_XSS_CET_S                      (1ULL << 12)
-#define IA32_XSS_VIRTUALIZABLE_MASK         (IA32_XSS_IPT | \
-                                             IA32_XSS_CET_U | \
-                                             IA32_XSS_CET_S)
+// The fixed XSAVES frame preserves the complete enumerated XSS state. Keep the
+// IPT component in the guest selector contract as well; PT MSRs remain trapped
+// so a guest cannot alter host tracing state through the VMX root path. CET_S
+// remains outside the guest contract until all supervisor CET MSRs are virtualized.
+#define IA32_XSS_GUEST_KNOWN_MASK            (IA32_XSS_IPT | IA32_XSS_CET_U)
+#define IA32_XSS_VIRTUALIZABLE_MASK          IA32_XSS_GUEST_KNOWN_MASK
 
 // Enable bits in IA32_{U,S}_CET. Other bits are state/configuration fields,
 // not evidence that shadow-stack or IBT enforcement is currently running.
@@ -78,6 +90,7 @@
 #define IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX   (1ULL << 2)
 #define VMX_BASIC_PHYSICAL_ADDRESS_32            (1ULL << 48)
 #define VMX_BASIC_TRUE_CONTROLS                  (1ULL << 55)
+#define VMX_BASIC_NO_HW_ERROR_CODE               (1ULL << 56)
 #define VMX_BASIC_REVISION_MASK                  0x7FFFFFFFULL
 
 // Mandatory-one masks from Intel's VMX capability MSRs. These bits are
@@ -96,6 +109,7 @@
 #define CPU_BASED_INTR_WINDOW_EXITING            (1UL << 2)
 #define CPU_BASED_USE_TSC_OFFSETTING             (1UL << 3)
 #define CPU_BASED_USE_MSR_BITMAPS                (1UL << 28)
+#define CPU_BASED_ACTIVATE_TERTIARY_CONTROLS     (1UL << 17)
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS    (1UL << 31)
 #define CPU_BASED_HLT_EXITING                   (1UL << 7)
 #define CPU_BASED_INVLPG_EXITING                (1UL << 9)
@@ -117,6 +131,13 @@
 #define SECONDARY_ENABLE_RDTSCP                  (1UL << 3)
 #define SECONDARY_ENABLE_INVPCID                 (1UL << 12)
 #define SECONDARY_ENABLE_XSAVES                  (1UL << 20)
+// CPUID.(0D,1).EAX feature bits. Bit 3 advertises the paired XSAVES and
+// XRSTORS instructions; bit 4 is XFD, not a separate XRSTORS capability.
+#define CPUID_D1_XSAVEOPT                        (1U << 0)
+#define CPUID_D1_XSAVEC                          (1U << 1)
+#define CPUID_D1_XGETBV1                         (1U << 2)
+#define CPUID_D1_XSAVES                          (1U << 3)
+#define CPUID_D1_XFD                             (1U << 4)
 #define VM_EXIT_HOST_ADDRESS_SPACE_SIZE          (1UL << 9)
 #define VM_EXIT_LOAD_CET_STATE                   (1UL << 28)
 #define VM_EXIT_CLEAR_IA32_RTIT_CTL              (1UL << 25)
@@ -191,6 +212,9 @@ enum VmcsField : ULONG {
     // in this bitmap causes an XSAVES/XRSTORS VM-exit for the corresponding
     // IA32_XSS state component.
     CONTROL_XSS_EXITING_BITMAP = 0x202c,
+    // 64-bit tertiary processor-based execution controls. The field is
+    // meaningful only when primary bit 17 activates tertiary controls.
+    CONTROL_TERTIARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS = 0x2034,
 
     // 64-Bit Guest State
     GUEST_VMCS_LINK_PTR = 0x2800,

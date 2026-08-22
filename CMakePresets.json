@@ -10,7 +10,8 @@
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
                 "NESTED_HV_SIGN": "OFF",
-                "NESTED_HV_BUILD_TESTS": "ON"
+                "NESTED_HV_BUILD_TESTS": "ON",
+                "WDK_WINVER": "0x0A00"
             }
         },
         {
@@ -22,7 +23,8 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
                 "NESTED_HV_SIGN": "OFF",
-                "NESTED_HV_BUILD_TESTS": "ON"
+                "NESTED_HV_BUILD_TESTS": "ON",
+                "WDK_WINVER": "0x0A00"
             }
         },
         {

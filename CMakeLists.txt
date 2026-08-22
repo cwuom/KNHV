@@ -2,6 +2,37 @@ cmake_minimum_required(VERSION 3.18)
 
 project(Nested_HV LANGUAGES C CXX)
 
+# Keep the compilation database available to CMake Tools and other IDEs even
+# when a caller does not provide a cache option explicitly.
+if(NOT DEFINED CMAKE_EXPORT_COMPILE_COMMANDS OR
+   CMAKE_EXPORT_COMPILE_COMMANDS STREQUAL "")
+    set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
+        "Generate compile_commands.json for IDE tooling" FORCE)
+endif()
+
+# CMake adds user-mode Debug switches to every MSVC target.  Remove switches
+# that are invalid or noisy for a WDK driver before the target is created
+if(MSVC)
+    function(nested_hv_strip_msvc_flag variable_name flag_regex)
+        if(DEFINED ${variable_name})
+            set(_nested_hv_flags "${${variable_name}}")
+            separate_arguments(_nested_hv_flags WINDOWS_COMMAND
+                               "${_nested_hv_flags}")
+            list(FILTER _nested_hv_flags EXCLUDE REGEX "${flag_regex}")
+            list(JOIN _nested_hv_flags " " _nested_hv_flags_text)
+            set(${variable_name} "${_nested_hv_flags_text}" CACHE STRING
+                "MSVC flags filtered for the WDK target" FORCE)
+        endif()
+    endfunction()
+
+    nested_hv_strip_msvc_flag(CMAKE_C_FLAGS_DEBUG "^[/-]RTC1$")
+    nested_hv_strip_msvc_flag(CMAKE_CXX_FLAGS "^[/-]GR$")
+    nested_hv_strip_msvc_flag(CMAKE_CXX_FLAGS "^[/-]EHsc$")
+    nested_hv_strip_msvc_flag(CMAKE_CXX_FLAGS_DEBUG "^[/-]RTC1$")
+    nested_hv_strip_msvc_flag(CMAKE_EXE_LINKER_FLAGS_DEBUG
+                               "^[/-]INCREMENTAL$")
+endif()
+
 if(NOT WIN32)
     message(FATAL_ERROR "Nested_HV is a Windows kernel driver and requires the Windows WDK")
 endif()
@@ -46,6 +77,12 @@ set(SOURCES
 )
 
 wdk_add_driver(Nested_HV ${SOURCES})
+
+# A kernel image has no user-mode CRT.  An empty runtime property prevents
+# CMake from adding /MDd or /MD to the WDK target
+if(MSVC)
+    set_property(TARGET Nested_HV PROPERTY MSVC_RUNTIME_LIBRARY "")
+endif()
 
 # Kernel-only C/C++ options belong on the driver target.  Keeping them out of
 # the user-mode contract test avoids contradictory MSVC switches such as

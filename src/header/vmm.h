@@ -4,6 +4,7 @@
 
 #pragma once
 #include <ntddk.h>
+#include "common.h"
 
 /*
  * vmm.h
@@ -28,3 +29,4 @@ bool IsVmxSupported();
 bool InitializeVmxFeatureContract();
 bool IsCETVmcsEnabled();
 bool IsXsavesEnabled();
+u32 GetXsaveStateSize();

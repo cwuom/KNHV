@@ -12,7 +12,9 @@ Designed for research and educational purposes, it transitions the running opera
 ## Features
 
 * **Blue Pill Architecture**: Seamlessly transitions the OS into a VM without rebooting.
-* **Compatibility checks**: Refuses to start when required VMX controls are unavailable; test only on supported Intel VT-x systems.
+* **Compatibility checks**: Refuses to start when required VMX controls or
+  state-preservation capabilities are unavailable; nested virtualization is
+  intentionally disabled.
 * **State Transparency**: Preserves full GPR and Extended State (XSave/XRstor).
 * **Modern Toolchain**: Built using **VS Code**, **CMake**, and **Ninja** with MSVC.
 
@@ -25,6 +27,24 @@ it still requires kernel-debugger validation on the target machine.  If a CPU
 is parked, unloading is intentionally blocked because that processor is still
 executing code in this image; reboot the test machine (or recover it with a
 kernel debugger) instead of forcing driver removal.
+
+The exit frame supports ordinary XSAVE on legacy Intel processors. On newer
+Windows 11 systems, XSAVES is enabled only when CPUID.(D,1), the VMX secondary
+control, the XSS mask, and the reported compacted area all agree. The host
+IA32_XSS mask is kept separately from the guest mask; guest XSS is restricted
+to the CET_U component supported by this frame. Intel PT remains host-only:
+its CPUID leaves are hidden and its RTIT MSR window is intercepted. Active
+Intel PT, CET_S, supervisor shadow stacks, and a non-zero interrupt SSP table
+are rejected before VMXON because this build does not virtualize those
+controls completely. The common Windows 11 25H2 state
+`CR4.CET=1`, `IA32_XSS=0x900`, `S_CET=0`, and zero SSP values is accepted only
+when the paired VMX CET entry/exit controls are available.
+
+The debugger log is staged by contract and processor. `[HV] XSTATE contract`
+and `[HV] VMX control contract` describe the feature gate, `CPU <n> VMCS`
+records per-processor VMX setup and launch values, and the first 16 VM-exits
+per processor include reason, RIP, RSP, qualification, and flags. Fatal or
+unsupported exits print the guest CR3/CR4 and are parked rather than resumed.
 
 ## Scope
 
@@ -88,6 +108,20 @@ but not the `km` directory or `ntddk.h`.
 
 The checked-in `CMakePresets.json` also exposes `vscode-debug` and
 `vscode-release` presets for the CMake Tools extension and command-line builds.
+
+The checked-in VS Code workspace uses CMake Tools' preset mode by default
+(`cmake.useCMakePresets: always`) with `vscode-debug` selected as both the
+configure and build preset.  This keeps an active preset available for CMake
+Tools commands and avoids the `No configure preset is active` error.  To use a
+Release build, select `vscode-release` as both presets before reconfiguring.
+The same `CMakePresets.json` remains available for command-line builds.
+
+The workspace enables CMake Tools' compile-command export and asks the
+extension to copy the generated database to the repository root after a
+successful configure.  If the C/C++ extension still reports missing
+compilation information, run
+**CMake: Delete Cache and Reconfigure** once, then select the `Nested_HV`
+configuration provider in the C/C++ status bar.
 
 ### Compilation
 The output driver `Nested_HV.sys` is generated in
