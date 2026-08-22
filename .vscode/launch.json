@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Build SYS + PDB (Debug)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\Build-Driver.ps1\" -Configuration Debug",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Build SYS + PDB (Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\Build-Driver.ps1\" -Configuration Release",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Build and Sign SYS (Debug)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\Build-And-Sign-Driver.ps1\" -Configuration Debug",
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Build and Sign SYS (Release)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\Build-And-Sign-Driver.ps1\" -Configuration Release",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

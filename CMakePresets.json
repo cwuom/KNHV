@@ -1,0 +1,77 @@
+{
+    "version": 4,
+    "configurePresets": [
+        {
+            "name": "vscode-debug",
+            "displayName": "Nested_HV Debug (unsigned)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/vscode/Debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "NESTED_HV_SIGN": "OFF"
+            }
+        },
+        {
+            "name": "vscode-release",
+            "displayName": "Nested_HV Release (unsigned)",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/vscode/Release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "NESTED_HV_SIGN": "OFF"
+            }
+        },
+        {
+            "name": "sys-debug",
+            "displayName": "Nested_HV SYS Debug",
+            "inherits": "vscode-debug",
+            "description": "Configure the x64 WDK driver target and emit Nested_HV.sys",
+            "binaryDir": "${sourceDir}/build/vscode/Debug"
+        },
+        {
+            "name": "sys-release",
+            "displayName": "Nested_HV SYS Release",
+            "inherits": "vscode-release",
+            "description": "Configure the x64 WDK driver target and emit Nested_HV.sys",
+            "binaryDir": "${sourceDir}/build/vscode/Release"
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "vscode-debug",
+            "configurePreset": "vscode-debug",
+            "configuration": "Debug",
+            "targets": [
+                "Nested_HV"
+            ]
+        },
+        {
+            "name": "vscode-release",
+            "configurePreset": "vscode-release",
+            "configuration": "Release",
+            "targets": [
+                "Nested_HV"
+            ]
+        },
+        {
+            "name": "sys-debug",
+            "displayName": "Build Nested_HV.sys (Debug)",
+            "configurePreset": "sys-debug",
+            "configuration": "Debug",
+            "targets": [
+                "Nested_HV"
+            ]
+        },
+        {
+            "name": "sys-release",
+            "displayName": "Build Nested_HV.sys (Release)",
+            "configurePreset": "sys-release",
+            "configuration": "Release",
+            "targets": [
+                "Nested_HV"
+            ]
+        }
+    ]
+}

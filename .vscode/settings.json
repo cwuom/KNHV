@@ -1,0 +1,23 @@
+{
+    "cmake.generator": "Ninja",
+    "cmake.buildDirectory": "${workspaceFolder}/build/vscode/${buildType}",
+    "cmake.configureSettings": {
+        "CMAKE_CXX_STANDARD": "17",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "NESTED_HV_SIGN": "OFF"
+    },
+    "cmake.buildBeforeRun": true,
+    "cmake.configureOnOpen": false,
+    "cmake.preferredGenerators": [
+        "Ninja",
+        "Visual Studio 18 2026",
+        "Visual Studio 17 2022"
+    ],
+    "C_Cpp.default.cppStandard": "c++17",
+    "C_Cpp.default.intelliSenseMode": "windows-msvc-x64",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/vscode/Debug/compile_commands.json",
+    "files.associations": {
+        "*.asm": "asm-intel-x86-generic"
+    }
+}

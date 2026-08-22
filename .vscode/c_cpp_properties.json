@@ -1,0 +1,45 @@
+{
+    "env": {
+        "wdkRoot": "C:/Program Files (x86)/Windows Kits/10"
+    },
+    "configurations": [
+        {
+            "name": "Windows Kernel x64",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${env:WDKContentRoot}/Include/**/km",
+                "${env:WDKContentRoot}/Include/**/shared",
+                "${env:WDKContentRoot}/Include/**/um",
+                "${env:WDKContentRoot}/Include/**/ucrt",
+                "${wdkRoot}/Include/**/km",
+                "${wdkRoot}/Include/**/shared",
+                "${wdkRoot}/Include/**/um",
+                "${wdkRoot}/Include/**/ucrt"
+            ],
+            "defines": [
+                "_AMD64_",
+                "AMD64",
+                "WINNT=1",
+                "_WIN32_WINNT=0x0A00"
+            ],
+            "compilerPath": "cl.exe",
+            "intelliSenseMode": "windows-msvc-x64",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}",
+                    "${env:WDKContentRoot}/Include/**/km",
+                    "${env:WDKContentRoot}/Include/**/shared",
+                    "${env:WDKContentRoot}/Include/**/um",
+                    "${env:WDKContentRoot}/Include/**/ucrt",
+                    "${wdkRoot}/Include/**/km",
+                    "${wdkRoot}/Include/**/shared",
+                    "${wdkRoot}/Include/**/um",
+                    "${wdkRoot}/Include/**/ucrt"
+                ]
+            }
+        }
+    ],
+    "version": 4
+}

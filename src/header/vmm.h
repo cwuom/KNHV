@@ -17,5 +17,7 @@ extern "C" NTSTATUS StartHypervisor();
 // stop the hypervisor and release all allocated resources
 extern "C" void StopHypervisor();
 
-// Optional: Check hardware support helper
-bool IsVmxHardwareSupported();
+// Hardware/firmware gate implemented in main.cpp.  The gate is deliberately
+// read-only: it never changes IA32_FEATURE_CONTROL or otherwise claims VMX
+// ownership when firmware/another hypervisor has already configured it.
+bool IsVmxSupported();

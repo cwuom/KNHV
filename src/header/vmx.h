@@ -11,6 +11,9 @@
 // ==============================================================================
 
 #define CR4_VMXE (1ULL << 13)
+#define CR4_LA57 (1ULL << 12)
+#define CR4_PCIDE (1ULL << 17)
+#define CR4_CET  (1ULL << 23)
 
 // MSR Index
 #define MSR_IA32_FEATURE_CONTROL        0x0000003A
@@ -25,17 +28,125 @@
 #define MSR_IA32_VMX_CR4_FIXED0         0x00000488
 #define MSR_IA32_VMX_CR4_FIXED1         0x00000489
 #define MSR_IA32_VMX_PROCBASED_CTLS2    0x0000048B
+#define MSR_IA32_VMX_EPT_VPID_CAP       0x0000048C
 #define MSR_IA32_VMX_TRUE_PINBASED_CTLS 0x0000048D
 #define MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x0000048E
 #define MSR_IA32_VMX_TRUE_EXIT_CTLS     0x0000048F
 #define MSR_IA32_VMX_TRUE_ENTRY_CTLS    0x00000490
 #define MSR_FS_BASE                     0xC0000100
 #define MSR_GS_BASE                     0xC0000101
+#define MSR_IA32_KERNEL_GS_BASE         0xC0000102
 #define MSR_IA32_EFER                   0xC0000080
 #define MSR_IA32_SYSENTER_CS            0x00000174
 #define MSR_IA32_SYSENTER_ESP           0x00000175
 #define MSR_IA32_SYSENTER_EIP           0x00000176
 #define MSR_IA32_PAT                    0x00000277
+// CET/XSAVES state is deliberately not virtualized by this monitor. Trap
+// accesses rather than allowing a guest write to bleed into VMX-root state.
+#define MSR_IA32_XSS                    0x00000DA0
+#define MSR_IA32_U_CET                  0x000006A0
+#define MSR_IA32_S_CET                  0x000006A2
+#define MSR_IA32_PL0_SSP                0x000006A4
+#define MSR_IA32_PL1_SSP                0x000006A5
+#define MSR_IA32_PL2_SSP                0x000006A6
+#define MSR_IA32_PL3_SSP                0x000006A7
+#define MSR_IA32_INTERRUPT_SSP_TABLE    0x000006A8
+
+// IA32_XSS state-component bits from the WDK/Intel XSTATE enumeration.
+// CET_U contains IA32_U_CET and IA32_PL3_SSP; CET_S contains supervisor
+// shadow-stack state. IPT is Intel Processor Trace state. The current
+// VM-exit frame uses ordinary XSAVE/XRSTOR and therefore cannot preserve any
+// enabled supervisor XSTATE component.
+#define IA32_XSS_IPT                        (1ULL << 8)
+#define IA32_XSS_CET_U                      (1ULL << 11)
+#define IA32_XSS_CET_S                      (1ULL << 12)
+
+// Enable bits in IA32_{U,S}_CET. Other bits are state/configuration fields,
+// not evidence that shadow-stack or IBT enforcement is currently running.
+#define IA32_CET_SH_STK_EN                  (1ULL << 0)
+#define IA32_CET_WR_SHSTK_EN                (1ULL << 1)
+#define IA32_CET_ENDBR_EN                   (1ULL << 2)
+#define IA32_CET_ENABLE_MASK                (IA32_CET_SH_STK_EN | \
+                                             IA32_CET_WR_SHSTK_EN | \
+                                             IA32_CET_ENDBR_EN)
+
+// IA32_FEATURE_CONTROL bits and VMX capability bits.
+#define IA32_FEATURE_CONTROL_LOCK                 (1ULL << 0)
+#define IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX   (1ULL << 2)
+#define VMX_BASIC_PHYSICAL_ADDRESS_32            (1ULL << 48)
+#define VMX_BASIC_TRUE_CONTROLS                  (1ULL << 55)
+#define VMX_BASIC_REVISION_MASK                  0x7FFFFFFFULL
+
+// Mandatory-one masks from Intel's VMX capability MSRs. These bits are
+// reserved/always-on and do not request a VM-exit by themselves.
+#define VMX_PINBASED_MANDATORY_ON                0x00000016UL
+#define VMX_PROCBASED_MANDATORY_ON               0x0401E172UL
+#define VMX_EXIT_MANDATORY_ON                    0x00036DFFUL
+#define VMX_ENTRY_MANDATORY_ON                   0x000011FFUL
+
+// Primary/secondary VM-execution controls used by this driver.
+#define PIN_BASED_EXTERNAL_INTERRUPT_EXITING    (1UL << 0)
+#define PIN_BASED_NMI_EXITING                  (1UL << 3)
+#define PIN_BASED_VIRTUAL_NMIS                 (1UL << 5)
+#define PIN_BASED_PREEMPTION_TIMER             (1UL << 6)
+#define PIN_BASED_POSTED_INTERRUPTS            (1UL << 7)
+#define CPU_BASED_INTR_WINDOW_EXITING            (1UL << 2)
+#define CPU_BASED_USE_TSC_OFFSETTING             (1UL << 3)
+#define CPU_BASED_USE_MSR_BITMAPS                (1UL << 28)
+#define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS    (1UL << 31)
+#define CPU_BASED_HLT_EXITING                   (1UL << 7)
+#define CPU_BASED_INVLPG_EXITING                (1UL << 9)
+#define CPU_BASED_MWAIT_EXITING                 (1UL << 10)
+#define CPU_BASED_RDPMC_EXITING                 (1UL << 11)
+#define CPU_BASED_RDTSC_EXITING                 (1UL << 12)
+#define CPU_BASED_CR3_LOAD_EXITING              (1UL << 15)
+#define CPU_BASED_CR3_STORE_EXITING             (1UL << 16)
+#define CPU_BASED_CR8_LOAD_EXITING              (1UL << 19)
+#define CPU_BASED_CR8_STORE_EXITING             (1UL << 20)
+#define CPU_BASED_TPR_SHADOW                    (1UL << 21)
+#define CPU_BASED_NMI_WINDOW_EXITING            (1UL << 22)
+#define CPU_BASED_MOV_DR_EXITING                (1UL << 23)
+#define CPU_BASED_UNCOND_IO_EXITING             (1UL << 24)
+#define CPU_BASED_USE_IO_BITMAPS                (1UL << 25)
+#define CPU_BASED_MONITOR_TRAP_FLAG             (1UL << 27)
+#define CPU_BASED_MONITOR_EXITING               (1UL << 29)
+#define CPU_BASED_PAUSE_EXITING                 (1UL << 30)
+#define SECONDARY_ENABLE_RDTSCP                  (1UL << 3)
+#define SECONDARY_ENABLE_INVPCID                 (1UL << 12)
+#define SECONDARY_ENABLE_XSAVES                  (1UL << 20)
+#define VM_EXIT_HOST_ADDRESS_SPACE_SIZE          (1UL << 9)
+#define VM_ENTRY_IA32E_MODE_GUEST                (1UL << 9)
+#define VM_EXIT_LOAD_HOST_EFER                   (1UL << 21)
+#define VM_EXIT_LOAD_HOST_PAT                    (1UL << 19)
+#define VM_ENTRY_LOAD_GUEST_EFER                 (1UL << 15)
+#define VM_ENTRY_LOAD_GUEST_PAT                  (1UL << 14)
+#define VM_ENTRY_INTR_INFO_VALID                 (1UL << 31)
+#define VM_ENTRY_INTR_INFO_DELIVER_ERROR_CODE   (1UL << 11)
+#define VM_ENTRY_INTR_TYPE_HARDWARE_EXCEPTION   (3UL << 8)
+#define VM_EXIT_REASON_EXTERNAL_INTERRUPT       1
+#define VM_EXIT_REASON_TRIPLE_FAULT              2
+#define VM_EXIT_REASON_CPUID                    10
+#define VM_EXIT_REASON_HLT                      12
+#define VM_EXIT_REASON_INVLPG                   14
+#define VM_EXIT_REASON_VMCALL                   18
+#define VM_EXIT_REASON_CR_ACCESS                28
+#define VM_EXIT_REASON_RDMSR                    31
+#define VM_EXIT_REASON_WRMSR                    32
+#define VM_EXIT_REASON_INVALID_GUEST_STATE      33
+// VMX instructions are intentionally not virtualized (nested virtualization
+// is outside this driver's scope).  If a non-root instruction reaches the
+// exit handler, inject the architectural #UD rather than treating it as an
+// unknown exit and resuming at the same RIP indefinitely.
+#define VM_EXIT_REASON_VMCLEAR                  19
+#define VM_EXIT_REASON_VMLAUNCH                 20
+#define VM_EXIT_REASON_VMPTRLD                  21
+#define VM_EXIT_REASON_VMPTRST                  22
+#define VM_EXIT_REASON_VMREAD                   23
+#define VM_EXIT_REASON_VMWRITE                  24
+#define VM_EXIT_REASON_VMRESUME                 25
+#define VM_EXIT_REASON_VMXOFF                   26
+#define VM_EXIT_REASON_VMXON                    27
+#define VM_EXIT_REASON_XSETBV                   55
 
 // VMCS Fields
 enum VmcsField : ULONG {
@@ -194,20 +305,3 @@ enum VmcsField : ULONG {
     HOST_RSP = 0x6c14,
     HOST_RIP = 0x6c16
 };
-
-// State Structure
-typedef struct VCPU_CONTEXT {
-    UINT64 VmxOnPhys;
-    PVOID  VmxOnVirt;
-
-    UINT64 VmcsPhys;
-    PVOID  VmcsVirt;
-
-    PVOID  HostStack;
-    UINT64 HostStackTop;
-
-    PVOID  MsrBitmap;
-    UINT64 MsrBitmapPhys;
-
-    BOOLEAN IsLaunched;
-} VCPU_CONTEXT, *PVCPU_CONTEXT;

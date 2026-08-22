@@ -135,14 +135,10 @@ file(GLOB WDK_LIBRARIES "${WDK_ROOT}/Lib/${WDK_LIB_VERSION}/km/${WDK_PLATFORM}/*
 foreach(LIBRARY IN LISTS WDK_LIBRARIES)
     get_filename_component(LIBRARY_NAME ${LIBRARY} NAME_WE)
     string(TOUPPER ${LIBRARY_NAME} LIBRARY_NAME)
-    add_library(WDK::${LIBRARY_NAME} INTERFACE IMPORTED
-            ../src/vmm.cpp
-            ../src/vmx.h.cpp
-            ../src/vmm.cpp
-            ../src/header/vmx.h
-            ../src/header/vmm.h
-            ../src/header/common.h
-    )
+    # Imported WDK libraries must not carry project source files. Older CMake
+    # versions accepted the extra arguments accidentally; newer versions
+    # reject them while configuring the project.
+    add_library(WDK::${LIBRARY_NAME} INTERFACE IMPORTED)
     set_property(TARGET WDK::${LIBRARY_NAME} PROPERTY INTERFACE_LINK_LIBRARIES ${LIBRARY})
 endforeach(LIBRARY)
 unset(WDK_LIBRARIES)
@@ -153,7 +149,13 @@ function(wdk_add_driver _target)
     add_executable(${_target} ${WDK_UNPARSED_ARGUMENTS})
 
     set_target_properties(${_target} PROPERTIES SUFFIX ".sys")
-    set_target_properties(${_target} PROPERTIES COMPILE_OPTIONS "${WDK_COMPILE_FLAGS}")
+    # WDK_COMPILE_FLAGS are compiler switches (/kernel, /FI..., /GR-, ...),
+    # not MASM switches.  Qualify them so CMake/Ninja does not forward these
+    # options to ml64 when the driver contains arch.asm.
+    foreach(_wdk_flag IN LISTS WDK_COMPILE_FLAGS)
+        target_compile_options(${_target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:C,CXX>:${_wdk_flag}>")
+    endforeach()
     set_target_properties(${_target} PROPERTIES COMPILE_DEFINITIONS
             "${WDK_COMPILE_DEFINITIONS};$<$<CONFIG:Debug>:${WDK_COMPILE_DEFINITIONS_DEBUG}>;_WIN32_WINNT=${WDK_WINVER}"
     )
@@ -170,10 +172,12 @@ function(wdk_add_driver _target)
 
     target_link_libraries(${_target} WDK::NTOSKRNL WDK::HAL WDK::WMILIB)
 
-    if(WDK::BUFFEROVERFLOWK)
+    if(TARGET WDK::BUFFEROVERFLOWK)
         target_link_libraries(${_target} WDK::BUFFEROVERFLOWK) # to support Windows 7 and Vista
-    else()
+    elseif(TARGET WDK::BUFFEROVERFLOWFASTFAILK)
         target_link_libraries(${_target} WDK::BUFFEROVERFLOWFASTFAILK)
+    else()
+        message(FATAL_ERROR "WDK buffer-overflow support library was not found")
     endif()
 
     if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
