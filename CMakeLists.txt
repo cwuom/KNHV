@@ -20,20 +20,6 @@ if(NOT CMAKE_ASM_MASM_COMPILER)
 endif()
 enable_language(ASM_MASM)
 
-# C/C++ compile options.  Keep these language-qualified: CMake otherwise
-# forwards them to ml64 as well, and MASM rejects C++ switches such as
-# /utf-8, /EHs-c- and /std:c++17 during the ASM_MASM build rule.
-add_compile_options(
-    "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
-    "$<$<COMPILE_LANGUAGE:C,CXX>:/EHs-c->"
-    "$<$<COMPILE_LANGUAGE:C,CXX>:/GS->"
-    # MSVC's option spelling is case-sensitive here: /Zc (lowercase c).
-    # Using /ZC makes cl parse it as /Z plus stray switches, disables
-    # extensions, and causes WDK 28000 headers to fail on anonymous structs.
-    "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:wchar_t->"
-    "$<$<COMPILE_LANGUAGE:C,CXX>:/std:c++17>"
-)
-
 # WDK path. FindWdk.cmake auto-detects the latest installed WDK. A caller can
 # select a particular kit with -DWDK_CONTENT_ROOT=... without editing files.
 set(WDK_CONTENT_ROOT "" CACHE PATH "Windows Kits root (for example C:/Program Files (x86)/Windows Kits/10)")
@@ -44,6 +30,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(WDK REQUIRED)
 
 option(NESTED_HV_SIGN "Sign the driver as a post-build step" OFF)
+option(NESTED_HV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
 set(NESTED_HV_SIGNTOOL "" CACHE FILEPATH "Path to signtool.exe (required when NESTED_HV_SIGN=ON)")
 set(NESTED_HV_SIGN_CERT "" CACHE FILEPATH "PFX containing the signing private key (required when NESTED_HV_SIGN=ON)")
 set(NESTED_HV_SIGN_PASSWORD "" CACHE STRING "PFX password (optional; avoid storing secrets in CMake cache)")
@@ -59,6 +46,21 @@ set(SOURCES
 )
 
 wdk_add_driver(Nested_HV ${SOURCES})
+
+# Kernel-only C/C++ options belong on the driver target.  Keeping them out of
+# the user-mode contract test avoids contradictory MSVC switches such as
+# /EHsc followed by /EHs-c- and /GS followed by /GS-, while the MASM source is
+# still protected by the language-qualified expressions below.
+target_compile_options(Nested_HV PRIVATE
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/EHs-c->"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/GS->"
+        # MSVC's option spelling is case-sensitive here: /Zc (lowercase c).
+        # Using /ZC makes cl parse it as /Z plus stray switches, disables
+        # extensions, and causes WDK 28000 headers to fail on anonymous structs.
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:wchar_t->"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/std:c++17>"
+)
 
 # link. WDK targets point at the selected kit, so no machine-specific library
 # directory is needed here.
@@ -101,4 +103,21 @@ if(NESTED_HV_SIGN)
             COMMENT "Signing ${PROJECT_NAME}.sys"
             VERBATIM
     )
+endif()
+
+# The contract test is a normal user-mode executable.  It intentionally does
+# not include WDK headers or execute VMX instructions; it validates the
+# kernel/assembly ABI and can optionally exercise the installed service on an
+# isolated test machine.  Keeping it as a separate target prevents
+# /kernel,/NODEFAULTLIB driver flags from leaking into the test binary.
+if(NESTED_HV_BUILD_TESTS)
+    enable_testing()
+    add_executable(Nested_HV_ContractTests tests/vmx_contract_test.cpp)
+    target_compile_definitions(Nested_HV_ContractTests PRIVATE
+            NESTED_HV_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_options(Nested_HV_ContractTests PRIVATE
+            /W4 /EHsc /GR /GS /permissive- /std:c++17)
+    target_link_libraries(Nested_HV_ContractTests PRIVATE advapi32 wintrust)
+    add_test(NAME Nested_HV_ContractTests
+            COMMAND Nested_HV_ContractTests --root "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

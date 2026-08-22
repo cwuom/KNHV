@@ -18,6 +18,10 @@ constexpr u64 VMCALL_UNLOAD    = 0xDEADBEEF;
 // GPR/GuestContext fields at offset 0x1000. Keep the limit in a shared header
 // so a future capability gate cannot silently overwrite the saved registers.
 constexpr u64 VMEXIT_XSAVE_MAX = 0x1000;
+constexpr u64 VMEXIT_FRAME_SIZE = 0x1180;
+constexpr u64 VMEXIT_HOST_XCR0_OFFSET = 0x1168;
+constexpr u64 VMEXIT_HOST_XSS_OFFSET = 0x1170;
+constexpr u64 VMEXIT_HOST_KGS_OFFSET = 0x1178;
 // Returned by GuestStartThunk after a successful VM-entry.  A distinct value
 // lets the C++ launch callback distinguish the normal guest continuation from
 // a VMLAUNCH failure (which returns VMX flags instead).
@@ -73,6 +77,18 @@ struct __declspec(align(64)) GuestContext {
     u64 GuestSysenterCs;
     u64 GuestSysenterEsp;
     u64 GuestSysenterEip;
+
+    // XCR0 is not part of VMCS state.  The VM-exit stub records it before
+    // switching the processor back to the host XCR0.  IA32_XSS is likewise
+    // per-logical-processor state and is switched around XSAVES/XRSTORS.
+    u64 GuestXcr0;
+    u64 GuestXss;
+
+    // Supervisor CET state is carried by VMCS fields, not by XSAVES.  Keep a
+    // software copy for the VMXOFF teardown path and for trapped MSR writes.
+    u64 GuestSCet;
+    u64 GuestSsp;
+    u64 GuestInterruptSspTable;
 };
 
 static_assert(offsetof(GuestContext, Rax) == 0x1000, "VM-exit GPR layout changed");
@@ -94,6 +110,12 @@ static_assert(offsetof(GuestContext, GuestCr0) == 0x10E8, "VM-exit CR0 layout ch
 static_assert(offsetof(GuestContext, GuestSysenterCs) == 0x10F0, "VM-exit SYSENTER CS layout changed");
 static_assert(offsetof(GuestContext, GuestSysenterEsp) == 0x10F8, "VM-exit SYSENTER ESP layout changed");
 static_assert(offsetof(GuestContext, GuestSysenterEip) == 0x1100, "VM-exit SYSENTER EIP layout changed");
+static_assert(offsetof(GuestContext, GuestXcr0) == 0x1108, "VM-exit XCR0 layout changed");
+static_assert(offsetof(GuestContext, GuestXss) == 0x1110, "VM-exit XSS layout changed");
+static_assert(offsetof(GuestContext, GuestSCet) == 0x1118, "VM-exit S_CET layout changed");
+static_assert(offsetof(GuestContext, GuestSsp) == 0x1120, "VM-exit SSP layout changed");
+static_assert(offsetof(GuestContext, GuestInterruptSspTable) == 0x1128,
+              "VM-exit interrupt SSP table layout changed");
 // The VM-exit frame is 0x1180 bytes.  Its final eight bytes are reserved for
 // the per-CPU host KERNEL_GS_BASE shadow (HostStackTop - 8).
 static_assert(offsetof(GuestContext, GuestSysenterEip) + sizeof(u64) <= 0x1178,
@@ -130,6 +152,13 @@ struct VcpuContext {
     // detect an odd SWAPGS and repair GUEST_GS_BASE before VMRESUME.
     u64   GuestGsBase;
     u64   GuestKernelGsBase;
+
+    // Guest IA32_XSS/XCR0 are kept per virtual CPU because neither register
+    // is represented by the VMCS.  The assembly entry/exit path switches the
+    // hardware values around the C++ handler.
+    u64   GuestXss;
+    u64   GuestXcr0;
+    u64   HostXss;
 
     // 0 = uninitialized, 1 = VMXON, 2 = guest launched, 3 = stopped,
     // 4 = failed.  LONG is used so the IPI callbacks can publish state with

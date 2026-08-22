@@ -13,9 +13,18 @@ MSR_GS_BASE     equ 0C0000101h
 MSR_KERNEL_GS_BASE equ 0C0000102h
 MSR_IA32_EFER   equ 0C0000080h
 MSR_IA32_PAT    equ 00000277h
+MSR_IA32_XSS    equ 00000DA0h
+MSR_IA32_U_CET  equ 000006A0h
+MSR_IA32_S_CET  equ 000006A2h
+MSR_IA32_PL0_SSP equ 000006A4h
+MSR_IA32_PL1_SSP equ 000006A5h
+MSR_IA32_PL2_SSP equ 000006A6h
+MSR_IA32_PL3_SSP equ 000006A7h
+MSR_IA32_INTERRUPT_SSP_TABLE equ 000006A8h
 MSR_IA32_SYSENTER_CS  equ 00000174h
 MSR_IA32_SYSENTER_ESP equ 00000175h
 MSR_IA32_SYSENTER_EIP equ 00000176h
+CR4_CET         equ 0800000h
 
 ; VMCS fields used by the launch thunk.  The values are the architectural
 ; encodings from Intel SDM Vol. 3C, Table B-1.
@@ -56,6 +65,15 @@ CTX_GUEST_CR0   equ 010E8h
 CTX_SYSENTER_CS  equ 010F0h
 CTX_SYSENTER_ESP equ 010F8h
 CTX_SYSENTER_EIP equ 01100h
+; Reserved GuestContext tail slots for the guest XCR0/XSS pair.  These are
+; intentionally outside the C++ fields currently in common.h; if the struct
+; grows, its static_asserts must keep these offsets reserved or update them
+; together with this file.
+CTX_GUEST_XCR0  equ 01108h
+CTX_GUEST_XSS   equ 01110h
+CTX_GUEST_S_CET equ 01118h
+CTX_GUEST_SSP   equ 01120h
+CTX_GUEST_INTR_SSP_TABLE equ 01128h
 
 ; The VMX host RSP is HostStackTop. The C++ preparation stores the host
 ; KERNEL_GS_BASE shadow at HostStackTop - 8, which is offset 0x1178 after the
@@ -63,6 +81,11 @@ CTX_SYSENTER_EIP equ 01100h
 ; padding after the 0x1000-byte XSAVE area and outside GuestContext fields.
 HOST_KGS_FRAME_SLOT   equ 01178h
 HOST_KGS_CONTEXT_SLOT equ 01178h
+; Host XCR0/XSS snapshots are stored immediately below the KGS shadow by the
+; launch preparation code.  They are per-CPU values and must be initialized
+; before VMLAUNCH; the VM-exit path only reads them from this fixed frame.
+HOST_XCR0_FRAME_SLOT  equ 01168h
+HOST_XSS_FRAME_SLOT   equ 01170h
 
 ; HvRestoreStateAndReturn stages state in [guest-rsp - 100h].  This area is
 ; below the active guest stack and is kept separate from the iret frame near
@@ -143,10 +166,69 @@ HvVmExitEntryPoint proc
     mov ecx, MSR_KERNEL_GS_BASE
     wrmsr
 
+    ; VMX does not virtualize XCR0 or IA32_XSS.  Capture the guest masks
+    ; before switching to the host masks used by the C++ exit handler.  The
+    ; XSAVES/XRSTORS pair is deliberately used in compacted format: CPUID.0D
+    ; subleaf 1 is validated by the feature gate and the frame is large enough
+    ; for its reported maximum size.
     xor ecx, ecx
     xgetbv
+    mov r8d, eax
+    mov r9d, edx
+    mov rdx, r9
+    shl rdx, 20h
+    or r8, rdx
+    mov [rsp + CTX_GUEST_XCR0], r8
 
+    mov ecx, MSR_IA32_XSS
+    rdmsr
+    mov r8d, eax
+    mov r9d, edx
+    mov rdx, r9
+    shl rdx, 20h
+    or r8, rdx
+    mov [rsp + CTX_GUEST_XSS], r8
+
+    ; XSAVES uses EDX:EAX as the requested state mask.  Include both XCR0 and
+    ; IA32_XSS so supervisor components (including CET_U) cannot bleed into
+    ; the host handler.  A legacy non-CET machine uses ordinary XSAVE; the
+    ; contract rejects machines that need supervisor state without XSAVES.
+    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
+    test rax, rax
+    jnz vmxSaveXsaves
+    mov rax, cr4
+    test rax, CR4_CET
+    jnz vmxSaveXsaves
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
     xsave [rsp]
+    jmp short vmxStateSaved
+
+vmxSaveXsaves:
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rdx, [rsp + CTX_GUEST_XSS]
+    or rax, rdx
+    mov rdx, rax
+    shr rdx, 20h
+    xsaves [rsp]
+
+vmxStateSaved:
+
+    ; Restore the host masks before touching any compiler-generated code.
+    ; PrepareHvCallback initializes these per-CPU slots immediately below the
+    ; host KERNEL_GS_BASE shadow.
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+
+    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
 
     ; Windows x64 ABI requires DF=0 on entry to C/C++ code.  A guest can
     ; legally run with RFLAGS.DF set when a VM-exit occurs, but that flag is
@@ -160,10 +242,41 @@ HvVmExitEntryPoint proc
     call VmExitHandler
     add rsp, 20h
 
-    xor ecx, ecx
-    xgetbv              ; load XCR0 mask into EDX:EAX
+    ; The handler ran with host XCR0/XSS.  Restore the guest masks and the
+    ; compacted state frame before inspecting the VM-exit action flags.
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
 
+    mov rax, [rsp + CTX_GUEST_XSS]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+
+    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
+    test rax, rax
+    jnz vmxRestoreXsaves
+    mov rax, cr4
+    test rax, CR4_CET
+    jnz vmxRestoreXsaves
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
     xrstor [rsp]
+    jmp short vmxStateRestored
+
+vmxRestoreXsaves:
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rdx, [rsp + CTX_GUEST_XSS]
+    or rax, rdx
+    mov rdx, rax
+    shr rdx, 20h
+    xrstors [rsp]
+
+vmxStateRestored:
     ; Windows x64 C/C++ code requires DF=0.  RFLAGS (including the guest's
     ; original DF) is restored by VMRESUME or the IRET teardown path, so this
     ; only normalizes the temporary VMX-root execution context.
@@ -223,6 +336,19 @@ vmxHalt:
     ; continuation.  Leave VMX root, clear VMXE, and park this processor
     ; without touching guest CR3 or the VM-exit context.
     cli
+    ; vmxHalt can be reached after the guest masks were restored (for example
+    ; an unsupported VM-exit or a VMRESUME failure).  Keep the park marker and
+    ; all subsequent root-mode instructions on the host XCR0/XSS contract.
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
     ; vmxResumeFailure reaches this label after the normal path has already
     ; installed the guest KERNEL_GS_BASE.  Restore the host value before the
     ; C++ marker call; otherwise GS-relative kernel accesses can fault while
@@ -471,9 +597,59 @@ restoreSpillCanonicalCompare:
     shr rdx, 20h
     wrmsr
 
-    xor ecx, ecx
-    xgetbv
+    ; The teardown path returns to the guest, so use the guest masks captured
+    ; by the VM-exit entry rather than the host masks used by C++.
+    mov rax, [r10 + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    mov rax, [r10 + CTX_GUEST_XSS]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+    mov rax, [r10 + HOST_XSS_FRAME_SLOT]
+    test rax, rax
+    jnz restoreGuestXsaves
+    mov rax, cr4
+    test rax, CR4_CET
+    jnz restoreGuestXsaves
+    mov rax, [r10 + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
     xrstor [r10]
+    jmp short restoreGuestStateDone
+
+restoreGuestXsaves:
+    mov rax, [r10 + CTX_GUEST_XCR0]
+    mov rdx, [r10 + CTX_GUEST_XSS]
+    or rax, rdx
+    mov rdx, rax
+    shr rdx, 20h
+    xrstors [r10]
+
+restoreGuestStateDone:
+
+    ; VMXOFF leaves the VM-exit host CET state active.  Restore the guest
+    ; supervisor CET fields that are represented directly in the VMCS before
+    ; leaving VMX root; the other CET XSTATE components were restored by
+    ; XRSTORS above.
+    mov ecx, MSR_IA32_S_CET
+    mov rax, [r10 + CTX_GUEST_S_CET]
+    mov rdx, rax
+    shr rdx, 20h
+    wrmsr
+    mov ecx, MSR_IA32_PL0_SSP
+    mov rax, [r10 + CTX_GUEST_SSP]
+    mov rdx, rax
+    shr rdx, 20h
+    wrmsr
+    mov ecx, MSR_IA32_INTERRUPT_SSP_TABLE
+    mov rax, [r10 + CTX_GUEST_INTR_SSP_TABLE]
+    mov rdx, rax
+    shr rdx, 20h
+    wrmsr
 
     ; VMXOFF leaves CR4.VMXE set.  Install the guest CR4/CR3 pair only after
     ; all host-context reads are complete.
@@ -513,6 +689,18 @@ restoreInvalid:
     ; processor with interrupts disabled instead of executing a guessed RET or
     ; IRET frame, which would turn the original error into a triple fault.
     cli
+    ; No guest continuation is possible here.  Restore host XCR0/XSS before
+    ; calling the park marker, whose implementation is normal kernel C++.
+    mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    mov rax, [r10 + HOST_XSS_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
     ; vmxAbort reaches this path before the normal VMRESUME epilogue restores
     ; the host KERNEL_GS_BASE.  Restore the host per-CPU value before invoking
     ; the C++ marker, whose KPCR access is GS-relative.

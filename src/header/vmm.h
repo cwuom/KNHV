@@ -21,3 +21,10 @@ extern "C" void StopHypervisor();
 // read-only: it never changes IA32_FEATURE_CONTROL or otherwise claims VMX
 // ownership when firmware/another hypervisor has already configured it.
 bool IsVmxSupported();
+
+// Probe the CET/XSAVES contract before any processor executes VMXON.  The
+// probe is read-only and returns false when the CPU cannot preserve every
+// state that the VM-exit path would touch.
+bool InitializeVmxFeatureContract();
+bool IsCETVmcsEnabled();
+bool IsXsavesEnabled();

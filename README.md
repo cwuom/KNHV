@@ -109,6 +109,32 @@ suffix, its artifact is `Nested_HV.sys`, not an executable `.exe`. The VS Code
 the build scripts; they do not start a Kernel Debugger. They emit both
 `Nested_HV.sys` and its matching `Nested_HV.pdb`.
 
+### C++ driver tests
+
+The repository includes the independent user-mode C++ target
+`Nested_HV_ContractTests`. It does not include `ntddk.h`, execute `VMXON`, or
+modify the current machine by default. It checks the Intel VMCS encodings, the
+fixed MASM/`GuestContext` offsets, paired CET controls, XSAVES/XRSTORS
+fail-closed paths, and (when an artifact is supplied) the SYS PE image and
+matching PDB. This follows the control-program pattern used by open-source
+VT-x projects such as hvpp: the normal test binary is safe, while service
+start is an explicit operation on an isolated target.
+
+```powershell
+cmake --preset sys-debug
+cmake --build --preset sys-debug
+.\build\vscode\Debug\Nested_HV_ContractTests.exe --root .
+.\build\vscode\Debug\Nested_HV_ContractTests.exe --root . --hardware
+```
+
+`--signature --driver <path> --allow-test-root` validates the embedded
+Authenticode signature while allowing the expected untrusted private test root.
+`--runtime --start` is intentionally opt-in and must only be used with KD and
+a recovery snapshot on a dedicated test machine. After the service reaches
+`RUNNING`, it executes the driver's reserved magic `CPUID` leaf as an
+end-to-end VM-exit smoke test; `--stop` only stops a service that this process
+started.
+
 ## Driver signing
 
 The Run and Debug entries **Build and Sign SYS (Debug/Release)** and the tasks

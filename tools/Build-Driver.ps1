@@ -195,7 +195,7 @@ if ($generator -eq "Ninja") {
 } else {
     $configureArgs += @("-A", "x64")
 }
-$configureArgs += "-DNESTED_HV_SIGN=OFF"
+$configureArgs += @("-DNESTED_HV_SIGN=OFF", "-DNESTED_HV_BUILD_TESTS=ON")
 if ($WdkRoot) { $configureArgs += "-DWDK_CONTENT_ROOT=$WdkRoot" }
 
 Write-Host "Configuring $generator in $BuildDirectory"

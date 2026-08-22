@@ -9,7 +9,8 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "NESTED_HV_SIGN": "OFF"
+                "NESTED_HV_SIGN": "OFF",
+                "NESTED_HV_BUILD_TESTS": "ON"
             }
         },
         {
@@ -20,7 +21,8 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "NESTED_HV_SIGN": "OFF"
+                "NESTED_HV_SIGN": "OFF",
+                "NESTED_HV_BUILD_TESTS": "ON"
             }
         },
         {
@@ -44,7 +46,8 @@
             "configurePreset": "vscode-debug",
             "configuration": "Debug",
             "targets": [
-                "Nested_HV"
+                "Nested_HV",
+                "Nested_HV_ContractTests"
             ]
         },
         {
@@ -52,7 +55,8 @@
             "configurePreset": "vscode-release",
             "configuration": "Release",
             "targets": [
-                "Nested_HV"
+                "Nested_HV",
+                "Nested_HV_ContractTests"
             ]
         },
         {
@@ -61,7 +65,8 @@
             "configurePreset": "sys-debug",
             "configuration": "Debug",
             "targets": [
-                "Nested_HV"
+                "Nested_HV",
+                "Nested_HV_ContractTests"
             ]
         },
         {
@@ -70,7 +75,8 @@
             "configurePreset": "sys-release",
             "configuration": "Release",
             "targets": [
-                "Nested_HV"
+                "Nested_HV",
+                "Nested_HV_ContractTests"
             ]
         }
     ]

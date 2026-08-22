@@ -68,7 +68,149 @@ static u64 g_HostCr3 = 0;
 static bool g_VmxRequires32BitPhysicalAddress = false;
 extern "C" volatile u8 g_LinearAddressBits = 48;
 
+// These flags are populated by InitializeVmxFeatureContract() before any
+// processor enters VMX.  They are intentionally global and immutable for the
+// lifetime of a hypervisor run: VMCS controls and the assembly save format
+// must not change after VMLAUNCH.
+static bool g_VmxFeatureContractInitialized = false;
+static bool g_VmxFeatureContractValid = false;
+static bool g_CetVmcsEnabled = false;
+static bool g_XsavesEnabled = false;
+static u64 g_SupportedXssMask = 0;
+static u32 g_XsaveStateSize = 0;
+
 static __forceinline u32 CurrentProcessorIndex();
+static __forceinline u32 ControlMsr(u64 vmxBasic, u32 legacyMsr, u32 trueMsr);
+
+bool IsCETVmcsEnabled() {
+    return g_CetVmcsEnabled;
+}
+
+bool IsXsavesEnabled() {
+    return g_XsavesEnabled;
+}
+
+static bool VmxControlAllows(u32 msr, u32 mask) {
+    ULARGE_INTEGER value{};
+    __try {
+        value.QuadPart = __readmsr(msr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    // The high dword contains bits that may be set to one.  A control is
+    // usable only when every requested bit is present there; low-dword
+    // mandatory-one bits are accepted by AdjustControls below.
+    return (value.HighPart & mask) == mask;
+}
+
+bool InitializeVmxFeatureContract() {
+    if (g_VmxFeatureContractInitialized) {
+        return g_VmxFeatureContractValid;
+    }
+    g_VmxFeatureContractInitialized = true;
+    g_VmxFeatureContractValid = false;
+    g_CetVmcsEnabled = false;
+    g_XsavesEnabled = false;
+    g_SupportedXssMask = 0;
+    g_XsaveStateSize = 0;
+
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    const u32 maxBasicLeaf = static_cast<u32>(regs[0]);
+    if (maxBasicLeaf < 1) return false;
+    __cpuidex(regs, 1, 0);
+    const u64 currentCr4 = __readcr4();
+
+    u64 hostXss = 0;
+    u64 supervisorCet = 0;
+    u64 userCet = 0;
+    __try {
+        hostXss = __readmsr(MSR_IA32_XSS);
+        supervisorCet = __readmsr(MSR_IA32_S_CET);
+        userCet = __readmsr(MSR_IA32_U_CET);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    const bool needCet = (currentCr4 & CR4_CET) != 0 ||
+                         (userCet & IA32_CET_ENABLE_MASK) != 0 ||
+                         (supervisorCet & IA32_CET_ENABLE_MASK) != 0 ||
+                         (hostXss & (IA32_XSS_CET_U | IA32_XSS_CET_S)) != 0;
+    const bool needXsaves = needCet || hostXss != 0;
+    if (!needXsaves) {
+        g_VmxFeatureContractValid = true;
+        return true;
+    }
+
+    if (maxBasicLeaf < 0xD) return false;
+    __cpuidex(regs, 0xD, 0);
+    const u64 supportedXcr0 = static_cast<u32>(regs[0]) |
+                              (static_cast<u64>(static_cast<u32>(regs[3])) << 32);
+    if ((supportedXcr0 & 0x3ULL) != 0x3ULL) return false;
+
+    __cpuidex(regs, 0xD, 1);
+    const bool xsavesInstruction = (regs[0] & (1 << 3)) != 0;
+    const u64 enumeratedXss = static_cast<u32>(regs[2]) |
+                              (static_cast<u64>(static_cast<u32>(regs[3])) << 32);
+    // CPUID.(D,1).ECX:EDX is the architectural enumeration for IA32_XSS
+    // components. Do not invent support when firmware reports zero: an
+    // XSAVES image for an unenumerated component would be incomplete and can
+    // corrupt the host on VM-exit.
+    g_SupportedXssMask = enumeratedXss & IA32_XSS_VIRTUALIZABLE_MASK;
+    if ((hostXss & ~g_SupportedXssMask) != 0 || !xsavesInstruction) return false;
+    if (needCet &&
+        (g_SupportedXssMask & (IA32_XSS_CET_U | IA32_XSS_CET_S)) !=
+            (IA32_XSS_CET_U | IA32_XSS_CET_S)) {
+        return false;
+    }
+
+    g_XsaveStateSize = static_cast<u32>(regs[1]);
+    if (g_XsaveStateSize == 0) {
+        __cpuidex(regs, 0xD, 0);
+        g_XsaveStateSize = static_cast<u32>(regs[1]);
+    }
+    // XSAVES uses the compacted XCR0|XSS layout.  Leaf D.1 EBX is the size
+    // for the currently enabled state and is therefore the relevant bound,
+    // not leaf D.0 EBX (which omits supervisor components).
+    if (g_XsaveStateSize == 0 || g_XsaveStateSize > VMEXIT_XSAVE_MAX) return false;
+
+    __try {
+        const u64 vmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
+        const u32 exitMsr = ControlMsr(vmxBasic,
+                                       MSR_IA32_VMX_EXIT_CTLS,
+                                       MSR_IA32_VMX_TRUE_EXIT_CTLS);
+        const u32 entryMsr = ControlMsr(vmxBasic,
+                                        MSR_IA32_VMX_ENTRY_CTLS,
+                                        MSR_IA32_VMX_TRUE_ENTRY_CTLS);
+        const u32 secondaryMsr = MSR_IA32_VMX_PROCBASED_CTLS2;
+        if (!VmxControlAllows(exitMsr, VM_EXIT_LOAD_CET_STATE) ||
+            !VmxControlAllows(entryMsr, VM_ENTRY_LOAD_CET_STATE) ||
+            !VmxControlAllows(secondaryMsr, SECONDARY_ENABLE_XSAVES)) {
+            return false;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+
+    // The host path executes at CPL0.  Windows 25H2 normally has CR4.CET set
+    // for user-mode CET enumeration while IA32_S_CET remains zero.  An active
+    // supervisor shadow stack would require a RDSSP-aware host entry stub;
+    // refuse it rather than guessing a host SSP and risking #CP/#DF.
+    if ((supervisorCet & IA32_CET_ENABLE_MASK) != 0) return false;
+
+    g_XsavesEnabled = true;
+    g_CetVmcsEnabled = needCet;
+    g_VmxFeatureContractValid = true;
+    DbgPrint("[HV] CET contract: VMCS=%u XSAVES=%u XSS=0x%llX XSAVE(S)=%lu\n",
+             g_CetVmcsEnabled ? 1U : 0U,
+             g_XsavesEnabled ? 1U : 0U,
+             hostXss,
+             static_cast<ULONG>(g_XsaveStateSize));
+    return true;
+}
 
 // tags for memory allocation (avoid multi-char warnings by using integers)
 constexpr u32 TAG_HV00 = 0x30305648; // 'HV00' little endian
@@ -353,9 +495,28 @@ bool HandleMsrRead(GuestContext* Ctx) {
         return true;
     }
 
-    // CET/XSS state is deliberately not part of this VMCS/XSAVE contract.
-    // Keep these accesses trapped even if a future bitmap policy changes;
-    // exposing root supervisor state can turn a guest probe into a #CP/#DF.
+    if (g_XsavesEnabled && msrIndex == MSR_IA32_XSS) {
+        const u64 value = Ctx->GuestXss;
+        Ctx->Rax = static_cast<u32>(value);
+        Ctx->Rdx = static_cast<u32>(value >> 32);
+        return true;
+    }
+    if (g_CetVmcsEnabled && msrIndex == MSR_IA32_S_CET) {
+        const u64 value = Ctx->GuestSCet;
+        Ctx->Rax = static_cast<u32>(value);
+        Ctx->Rdx = static_cast<u32>(value >> 32);
+        return true;
+    }
+    if (g_CetVmcsEnabled && msrIndex == MSR_IA32_INTERRUPT_SSP_TABLE) {
+        const u64 value = Ctx->GuestInterruptSspTable;
+        Ctx->Rax = static_cast<u32>(value);
+        Ctx->Rdx = static_cast<u32>(value >> 32);
+        return true;
+    }
+
+    // These accesses should not reach the handler when XSAVES is active (the
+    // bitmap leaves CET_U/PLx native).  Keep an explicit #GP fallback for a
+    // capability mismatch rather than exposing VMX-root state.
     if (msrIndex == MSR_IA32_XSS || msrIndex == MSR_IA32_U_CET ||
         msrIndex == MSR_IA32_S_CET || msrIndex == MSR_IA32_PL0_SSP ||
         msrIndex == MSR_IA32_PL1_SSP || msrIndex == MSR_IA32_PL2_SSP ||
@@ -471,10 +632,53 @@ bool HandleMsrWrite(GuestContext* Ctx) {
         return true;
     }
 
-    // The host entry/exit stub does not save CET shadow-stack or IA32_XSS
-    // state. A guest write would alter VMX-root state and can turn the next
-    // kernel CALL/RET into #CP/#DF. CPUID hides these facilities; reject
-    // explicit accesses rather than passing them through.
+    if (g_XsavesEnabled && msrIndex == MSR_IA32_XSS) {
+        if ((value.QuadPart & ~g_SupportedXssMask) != 0) {
+            InjectGuestException(Ctx, 13, true, 0);
+            return false;
+        }
+        Ctx->GuestXss = value.QuadPart;
+        const u32 id = CurrentProcessorIndex();
+        if (g_VcpuData && id < g_ProcessorCount) {
+            g_VcpuData[id].GuestXss = value.QuadPart;
+        }
+        return true;
+    }
+    if (g_CetVmcsEnabled && msrIndex == MSR_IA32_S_CET) {
+        // IA32_S_CET contains the low-order control/state bits plus the
+        // legacy ENDBR bitmap base in bits 10:63. Bit 9 is reserved. Reject
+        // reserved/non-canonical bitmap values before VMWRITE so malformed
+        // guest writes become #GP instead of a later VM-entry failure.
+        constexpr u64 cetAllowedMask = 0x1FFULL | ~0x3FFULL;
+        const u64 bitmapBase = value.QuadPart & ~0x3FFULL;
+        if ((value.QuadPart & ~cetAllowedMask) != 0 ||
+            (bitmapBase != 0 && !IsCanonical(bitmapBase))) {
+            InjectGuestException(Ctx, 13, true, 0);
+            return false;
+        }
+        if (!VmWriteChecked(GUEST_S_CET, value.QuadPart)) {
+            Ctx->HaltVm = 1;
+            return false;
+        }
+        Ctx->GuestSCet = value.QuadPart;
+        return true;
+    }
+    if (g_CetVmcsEnabled && msrIndex == MSR_IA32_INTERRUPT_SSP_TABLE) {
+        if (!IsCanonical(value.QuadPart) || (value.QuadPart & 0xFFFULL) != 0) {
+            InjectGuestException(Ctx, 13, true, 0);
+            return false;
+        }
+        if (!VmWriteChecked(GUEST_INTR_SSP_TABLE, value.QuadPart)) {
+            Ctx->HaltVm = 1;
+            return false;
+        }
+        Ctx->GuestInterruptSspTable = value.QuadPart;
+        return true;
+    }
+
+    // The fallback path is used only when the bitmap was configured without
+    // the corresponding state contract.  Never pass an intercepted CET MSR
+    // through to VMX root.
     if (msrIndex == MSR_IA32_XSS || msrIndex == MSR_IA32_U_CET ||
         msrIndex == MSR_IA32_S_CET || msrIndex == MSR_IA32_PL0_SSP ||
         msrIndex == MSR_IA32_PL1_SSP || msrIndex == MSR_IA32_PL2_SSP ||
@@ -517,17 +721,36 @@ static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
         return true;
     };
 
-    constexpr u32 managedMsrs[] = {
+    constexpr u32 baseManagedMsrs[] = {
         MSR_FS_BASE, MSR_GS_BASE, MSR_IA32_KERNEL_GS_BASE,
         MSR_IA32_EFER, MSR_IA32_PAT,
         MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP,
         MSR_IA32_SYSENTER_EIP,
+    };
+    for (u32 msr : baseManagedMsrs) {
+        if (!setBit(msr, false) || !setBit(msr, true)) return false;
+    }
+
+    // IA32_XSS is the selector consumed by XSAVES and has no VMCS field, so
+    // it must always be trapped.  Supervisor S_CET/IST are represented by
+    // VMCS CET fields and are trapped as well.  CET_U and the PL0..PL3 SSP
+    // MSRs are XSTATE-managed; when XSAVES is active they execute natively in
+    // the guest and are captured in the compacted save image.  On legacy
+    // hardware, keep the old fail-closed #GP behavior for every CET MSR.
+    constexpr u32 cetManagedMsrs[] = {
+        MSR_IA32_XSS, MSR_IA32_S_CET, MSR_IA32_INTERRUPT_SSP_TABLE,
+    };
+    constexpr u32 cetUnsupportedMsrs[] = {
         MSR_IA32_XSS, MSR_IA32_U_CET, MSR_IA32_S_CET,
         MSR_IA32_PL0_SSP, MSR_IA32_PL1_SSP, MSR_IA32_PL2_SSP,
         MSR_IA32_PL3_SSP, MSR_IA32_INTERRUPT_SSP_TABLE,
     };
-    for (u32 msr : managedMsrs) {
-        if (!setBit(msr, false) || !setBit(msr, true)) return false;
+    const u32* cetMsrs = g_XsavesEnabled ? cetManagedMsrs : cetUnsupportedMsrs;
+    const u32 cetCount = g_XsavesEnabled
+                             ? static_cast<u32>(RTL_NUMBER_OF(cetManagedMsrs))
+                             : static_cast<u32>(RTL_NUMBER_OF(cetUnsupportedMsrs));
+    for (u32 i = 0; i < cetCount; ++i) {
+        if (!setBit(cetMsrs[i], false) || !setBit(cetMsrs[i], true)) return false;
     }
     return true;
 }
@@ -740,6 +963,11 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     Ctx->GuestSysenterCs = HvVmRead(GUEST_SYSENTER_CS);
     Ctx->GuestSysenterEsp = HvVmRead(GUEST_SYSENTER_ESP);
     Ctx->GuestSysenterEip = HvVmRead(GUEST_SYSENTER_EIP);
+    if (g_CetVmcsEnabled) {
+        Ctx->GuestSCet = HvVmRead(GUEST_S_CET);
+        Ctx->GuestSsp = HvVmRead(GUEST_SSP);
+        Ctx->GuestInterruptSspTable = HvVmRead(GUEST_INTR_SSP_TABLE);
+    }
     // IA32_KERNEL_GS_BASE is not represented in the VMCS.  The VM-exit
     // assembly stub snapshots the guest value before restoring the host
     // per-CPU value; copy that snapshot into the teardown context so the
@@ -757,6 +985,16 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         return;
     }
     VcpuContext* vcpu = &g_VcpuData[cpuId];
+    if (g_XsavesEnabled) {
+        if ((Ctx->GuestXss & ~g_SupportedXssMask) != 0) {
+            DbgPrint("[HV] Guest IA32_XSS contains unsupported bits: 0x%llX\n",
+                     Ctx->GuestXss);
+            Ctx->HaltVm = 1;
+            return;
+        }
+        vcpu->GuestXcr0 = Ctx->GuestXcr0;
+        vcpu->GuestXss = Ctx->GuestXss;
+    }
     const u64 observedKgs = Ctx->GuestKernelGsBase;
     const u64 expectedGs = vcpu->GuestGsBase;
     const u64 expectedKgs = vcpu->GuestKernelGsBase;
@@ -829,17 +1067,43 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         // Do not advertise VMX to a guest: nested
                         // virtualization is intentionally unsupported.
                         regs[2] &= ~(1 << 5);
-                    } else if (leaf == 7 && subleaf == 0) {
-                        // CET state is not loaded/saved by this VMCS.  Hide
-                        // CET-SS/CET-IBT so a guest cannot enable CET MSRs
-                        // that would then bleed into the host on VM-exit.
+                    } else if (leaf == 7 && subleaf == 0 &&
+                               !g_CetVmcsEnabled) {
+                        // CET is exposed only when the paired VMCS CET state
+                        // and XSAVES contract is active. Otherwise hide the
+                        // feature so the guest cannot enable state that the
+                        // VM-exit path cannot preserve.
                         regs[2] &= ~(1 << 7);   // CET_SS
                         regs[3] &= ~(1 << 20);  // CET_IBT
                     } else if (leaf == 0xD && subleaf == 1) {
-                        // XSAVES/XRSTORS are intentionally disabled: the
-                        // exit stub uses ordinary XSAVE/XRSTOR and does not
-                        // virtualize IA32_XSS supervisor state.
-                        regs[0] &= ~(1 << 3);  // XSAVES
+                        if (!g_XsavesEnabled) {
+                            // Do not advertise XSAVES/XRSTORS when the
+                            // compacted supervisor-state path is unavailable.
+                            regs[0] &= ~(1 << 3);  // XSAVES
+                            regs[2] &= static_cast<int>(0xFFFFFFFFULL &
+                                                        static_cast<u32>(g_SupportedXssMask));
+                            regs[3] &= static_cast<int>(g_SupportedXssMask >> 32);
+                        } else {
+                            // Do not expose XSS components that the fixed
+                            // frame and MSR bitmap do not virtualize.
+                            regs[2] &= static_cast<int>(g_SupportedXssMask);
+                            regs[3] &= static_cast<int>(g_SupportedXssMask >> 32);
+                        }
+                    } else if (leaf == 0xD && subleaf == 8 &&
+                               (!g_XsavesEnabled ||
+                                !(g_SupportedXssMask & IA32_XSS_IPT))) {
+                        // IPT/CET supervisor XSTATE subleaves are selected by
+                        // IA32_XSS and must not be advertised without the
+                        // compacted XSAVES save/restore contract.
+                        RtlZeroMemory(regs, sizeof(regs));
+                    } else if (leaf == 0xD && subleaf == 11 &&
+                               (!g_XsavesEnabled ||
+                                !(g_SupportedXssMask & IA32_XSS_CET_U))) {
+                        RtlZeroMemory(regs, sizeof(regs));
+                    } else if (leaf == 0xD && subleaf == 12 &&
+                               (!g_XsavesEnabled ||
+                                !(g_SupportedXssMask & IA32_XSS_CET_S))) {
+                        RtlZeroMemory(regs, sizeof(regs));
                     }
                 } else {
                     RtlZeroMemory(regs, sizeof(regs));
@@ -892,6 +1156,18 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
 
         case VM_EXIT_REASON_XSETBV:
             AdvanceRip = HandleXsetbv(Ctx, vcpu);
+            break;
+
+        case VM_EXIT_REASON_XSAVES:
+        case VM_EXIT_REASON_XRSTORS:
+            // CONTROL_XSS_EXITING_BITMAP is zero when XSAVES is enabled, so
+            // these exits indicate a VMCS/control mismatch or a future CPU
+            // behavior outside this monitor's contract. Never resume at the
+            // same instruction and loop into a fatal VM-entry failure.
+            DbgPrint("[HV] Unexpected XSAVES/XRSTORS VM-exit reason %llu\n",
+                     ExitReason);
+            Ctx->HaltVm = 1;
+            AdvanceRip = false;
             break;
 
         case VM_EXIT_REASON_EXTERNAL_INTERRUPT: // external interrupt
@@ -1036,6 +1312,21 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(HOST_RSP, Vcpu->HostStackTop);
     VmWriteChecked(HOST_RIP, reinterpret_cast<u64>(HvVmExitEntryPoint));
 
+    // CET supervisor state is loaded by VM-exit/VM-entry controls rather than
+    // by XSAVES.  Keep the host and initial guest copies identical; later
+    // guest WRMSR operations update the guest VMCS fields in the exit handler.
+    if (g_CetVmcsEnabled) {
+        const u64 hostSCet = __readmsr(MSR_IA32_S_CET);
+        const u64 hostSsp = __readmsr(MSR_IA32_PL0_SSP);
+        const u64 hostInterruptSspTable =
+            __readmsr(MSR_IA32_INTERRUPT_SSP_TABLE);
+        if (!VmWriteChecked(HOST_S_CET, hostSCet) ||
+            !VmWriteChecked(HOST_SSP, hostSsp) ||
+            !VmWriteChecked(HOST_INTR_SSP_TABLE, hostInterruptSspTable)) {
+            return false;
+        }
+    }
+
 
     // ==============================================================================
     // Guest State Configuration
@@ -1103,6 +1394,18 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     u64 pat = __readmsr(MSR_IA32_PAT);
     VmWriteChecked(GUEST_PAT, pat);
     VmWriteChecked(HOST_PAT, pat);
+
+    if (g_CetVmcsEnabled) {
+        const u64 guestSCet = __readmsr(MSR_IA32_S_CET);
+        const u64 guestSsp = __readmsr(MSR_IA32_PL0_SSP);
+        const u64 guestInterruptSspTable =
+            __readmsr(MSR_IA32_INTERRUPT_SSP_TABLE);
+        if (!VmWriteChecked(GUEST_S_CET, guestSCet) ||
+            !VmWriteChecked(GUEST_SSP, guestSsp) ||
+            !VmWriteChecked(GUEST_INTR_SSP_TABLE, guestInterruptSspTable)) {
+            return false;
+        }
+    }
 
  // guest execution state
     VmWriteChecked(GUEST_ACTIVITY_STATE, 0); // 0 = Active
@@ -1177,11 +1480,11 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         __cpuidex(cpuidRegs, 7, 0);
         if (cpuidRegs[1] & (1 << 10)) secondaryRequested |= SECONDARY_ENABLE_INVPCID;
     }
-    // Do not enable XSAVES blindly.  The VM-exit stub saves the architectural
-    // XSAVE area with XSAVE/XRSTOR and does not save IA32_XSS supervisor state;
-    // enabling XSAVES without VMCS XSS fields would corrupt CET/other
-    // supervisor state on newer Windows builds.  RDTSCP/INVPCID are ordinary
-    // guest instructions and are safe to expose when the CPU advertises them.
+    if (g_XsavesEnabled) secondaryRequested |= SECONDARY_ENABLE_XSAVES;
+    // XSAVES is enabled only after InitializeVmxFeatureContract() verified the
+    // compacted save size, IA32_XSS enumeration, and paired CET controls.
+    // RDTSCP/INVPCID are ordinary guest instructions and are safe to expose
+    // when the CPU advertises them.
     __cpuidex(cpuidRegs, 0x80000000, 0);
     const u32 maxExtendedLeaf = static_cast<u32>(cpuidRegs[0]);
     if (maxExtendedLeaf >= 0x80000001) {
@@ -1237,38 +1540,30 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if (!VmWriteChecked(CONTROL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, secCtl)) return false;
 
     if (!VmWriteChecked(CONTROL_MSR_BITMAP_ADDRESS, Vcpu->MsrBitmapPhys)) return false;
+    if (g_XsavesEnabled &&
+        !VmWriteChecked(CONTROL_XSS_EXITING_BITMAP, 0)) {
+        return false;
+    }
 
     // Bit 9: Host Address Space Size (Must be 1 for x64 Host)
-    u32 exitCtl = AdjustControls(VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
-                                 VM_EXIT_LOAD_HOST_EFER |
-                                 VM_EXIT_LOAD_HOST_PAT,
-                                 exitCtlMsr);
-    if ((exitCtl & (VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
-                    VM_EXIT_LOAD_HOST_EFER |
-                    VM_EXIT_LOAD_HOST_PAT)) !=
-        (VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
-         VM_EXIT_LOAD_HOST_EFER |
-         VM_EXIT_LOAD_HOST_PAT)) return false;
-    constexpr u32 supportedExit = VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
-                                  VM_EXIT_LOAD_HOST_EFER |
-                                  VM_EXIT_LOAD_HOST_PAT;
+    u32 requestedExit = VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
+                        VM_EXIT_LOAD_HOST_EFER |
+                        VM_EXIT_LOAD_HOST_PAT;
+    if (g_CetVmcsEnabled) requestedExit |= VM_EXIT_LOAD_CET_STATE;
+    u32 exitCtl = AdjustControls(requestedExit, exitCtlMsr);
+    if ((exitCtl & requestedExit) != requestedExit) return false;
+    u32 supportedExit = requestedExit;
     if (exitCtl & ~(supportedExit | ControlMandatoryOn(exitCtlMsr))) return false;
     if (!VmWriteChecked(CONTROL_VM_EXIT_CONTROLS, exitCtl)) return false;
 
     // Bit 9: IA-32e Mode Guest (Must be 1 for x64 Guest)
-    u32 entryCtl = AdjustControls(VM_ENTRY_IA32E_MODE_GUEST |
-                                  VM_ENTRY_LOAD_GUEST_EFER |
-                                  VM_ENTRY_LOAD_GUEST_PAT,
-                                  entryCtlMsr);
-    if ((entryCtl & (VM_ENTRY_IA32E_MODE_GUEST |
-                     VM_ENTRY_LOAD_GUEST_EFER |
-                     VM_ENTRY_LOAD_GUEST_PAT)) !=
-        (VM_ENTRY_IA32E_MODE_GUEST |
-         VM_ENTRY_LOAD_GUEST_EFER |
-         VM_ENTRY_LOAD_GUEST_PAT)) return false;
-    constexpr u32 supportedEntry = VM_ENTRY_IA32E_MODE_GUEST |
-                                   VM_ENTRY_LOAD_GUEST_EFER |
-                                   VM_ENTRY_LOAD_GUEST_PAT;
+    u32 requestedEntry = VM_ENTRY_IA32E_MODE_GUEST |
+                         VM_ENTRY_LOAD_GUEST_EFER |
+                         VM_ENTRY_LOAD_GUEST_PAT;
+    if (g_CetVmcsEnabled) requestedEntry |= VM_ENTRY_LOAD_CET_STATE;
+    u32 entryCtl = AdjustControls(requestedEntry, entryCtlMsr);
+    if ((entryCtl & requestedEntry) != requestedEntry) return false;
+    u32 supportedEntry = requestedEntry;
     if (entryCtl & ~(supportedEntry | ControlMandatoryOn(entryCtlMsr))) return false;
     if (!VmWriteChecked(CONTROL_VM_ENTRY_CONTROLS, entryCtl)) return false;
 
@@ -1346,7 +1641,17 @@ extern "C" bool PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* GuestI
         const u64 hostKernelGs = __readmsr(MSR_IA32_KERNEL_GS_BASE);
         // The VM-exit stub allocates 0x1180 bytes below HOST_RSP and reserves
         // the final qword of that frame (offset 0x1178) for this shadow.
-        *reinterpret_cast<u64*>(vcpu->HostStackTop - sizeof(u64)) = hostKernelGs;
+        *reinterpret_cast<u64*>(vcpu->HostStackTop -
+                                (VMEXIT_FRAME_SIZE - VMEXIT_HOST_KGS_OFFSET)) = hostKernelGs;
+        const u64 hostXcr0 = _xgetbv(0);
+        const u64 hostXss = __readmsr(MSR_IA32_XSS);
+        // The VM-exit frame reserves these slots immediately below the host
+        // KERNEL_GS shadow.  They are read by arch.asm before any C++ code is
+        // entered, so initialize them before VMXON/VMLAUNCH.
+        *reinterpret_cast<u64*>(vcpu->HostStackTop -
+                                (VMEXIT_FRAME_SIZE - VMEXIT_HOST_XCR0_OFFSET)) = hostXcr0;
+        *reinterpret_cast<u64*>(vcpu->HostStackTop -
+                                (VMEXIT_FRAME_SIZE - VMEXIT_HOST_XSS_OFFSET)) = hostXss;
         vcpu->GuestGsBase = __readmsr(MSR_GS_BASE);
         vcpu->GuestKernelGsBase = hostKernelGs;
         // XCR0 is not saved/restored by VMX transitions.  The VM-exit stub
@@ -1354,7 +1659,10 @@ extern "C" bool PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* GuestI
         // reject guest attempts to switch to a different mask (see the
         // XSETBV exit handler) rather than letting supervisor state bleed
         // into the host C++ continuation.
-        vcpu->HostXcr0 = _xgetbv(0);
+        vcpu->HostXcr0 = hostXcr0;
+        vcpu->GuestXcr0 = hostXcr0;
+        vcpu->HostXss = hostXss;
+        vcpu->GuestXss = hostXss;
 
         vcpu->OriginalCr0 = __readcr0();
         vcpu->OriginalCr4 = __readcr4();
@@ -1498,15 +1806,28 @@ extern "C" NTSTATUS StartHypervisor() {
     }
 
     RtlZeroMemory(regs, sizeof(regs));
-    __cpuidex(regs, 0xD, 0);
-    u32 xsaveSize = static_cast<u32>(regs[1]);
-    if (xsaveSize > VMEXIT_XSAVE_MAX ||
-        xsaveSize > sizeof(GuestContext{}.FxArea)) {
-        DbgPrint("[HV] XSAVE area too small: need %lu bytes, have %lu\n",
-                 static_cast<ULONG>(xsaveSize),
-                 static_cast<ULONG>(sizeof(GuestContext{}.FxArea)));
-        DbgPrint("[HV] StartHypervisor rejected: XSAVE area exceeds the VM-exit frame\n");
-        return STATUS_NOT_SUPPORTED;
+    if (g_XsavesEnabled) {
+        // XSAVES uses the compacted XCR0|IA32_XSS layout.  CPUID.(D,1):EBX,
+        // captured by the capability contract, is the bound that applies to
+        // the VM-exit frame; leaf D.0:EBX only describes XCR0 state.
+        u32 xsaveSize = g_XsaveStateSize;
+        if (xsaveSize > VMEXIT_XSAVE_MAX ||
+            xsaveSize > sizeof(GuestContext{}.FxArea)) {
+            DbgPrint("[HV] XSAVES area too large: need %lu bytes, have %lu\n",
+                     static_cast<ULONG>(xsaveSize),
+                     static_cast<ULONG>(sizeof(GuestContext{}.FxArea)));
+            return STATUS_NOT_SUPPORTED;
+        }
+    } else {
+        __cpuidex(regs, 0xD, 0);
+        u32 xsaveSize = static_cast<u32>(regs[1]);
+        if (xsaveSize > VMEXIT_XSAVE_MAX ||
+            xsaveSize > sizeof(GuestContext{}.FxArea)) {
+            DbgPrint("[HV] XSAVE area too large: need %lu bytes, have %lu\n",
+                     static_cast<ULONG>(xsaveSize),
+                     static_cast<ULONG>(sizeof(GuestContext{}.FxArea)));
+            return STATUS_NOT_SUPPORTED;
+        }
     }
 
     __try {

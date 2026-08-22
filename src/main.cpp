@@ -106,22 +106,16 @@ bool IsVmxSupported() {
              "PL3=0x%llX IST=0x%llX\n",
              pl0Ssp, pl1Ssp, pl2Ssp, pl3Ssp, interruptSspTable);
 
-    if ((userCet & IA32_CET_ENABLE_MASK) != 0 ||
-        (supervisorCet & IA32_CET_ENABLE_MASK) != 0) {
-        return RejectVmx("CET shadow-stack/IBT enforcement is enabled but not virtualized");
+    // CR4.CET is set by Windows on CET-capable systems even when supervisor
+    // enforcement is disabled.  The runtime contract enables the VMCS CET
+    // fields and XSAVES path when needed, and rejects only combinations that
+    // cannot be preserved by the fixed VM-exit frame.
+    if (!InitializeVmxFeatureContract()) {
+        return RejectVmx("CET/XSAVES state cannot be preserved on this processor");
     }
-    if (xss != 0) {
-        if (xss & IA32_XSS_CET_U) {
-            return RejectVmx("IA32_XSS.CET_U is enabled but supervisor XSTATE is not virtualized");
-        }
-        if (xss & IA32_XSS_CET_S) {
-            return RejectVmx("IA32_XSS.CET_S is enabled but supervisor XSTATE is not virtualized");
-        }
-        return RejectVmx("IA32_XSS supervisor state is not virtualized");
-    }
-    if (currentCr4 & CR4_CET) {
-        return RejectVmx("CR4.CET is set; CET state is outside this VMCS contract");
-    }
+    DbgPrint("[HV] CET contract selected: VMCS=%u XSAVES=%u\n",
+             IsCETVmcsEnabled() ? 1U : 0U,
+             IsXsavesEnabled() ? 1U : 0U);
     if (maxBasicLeaf < 0xD) return RejectVmx("CPUID leaf 0xD is unavailable");
 
     __try {
@@ -157,7 +151,9 @@ bool IsVmxSupported() {
     }
 
     int xsaveInfo[4] = {};
-    __cpuidex(xsaveInfo, 0xD, 0);
+    // The compacted XSAVES frame is larger than the ordinary XCR0 frame on
+    // CET-capable systems. Use leaf D.1:EBX when that contract is active.
+    __cpuidex(xsaveInfo, 0xD, IsXsavesEnabled() ? 1 : 0);
     u32 xsaveSize = static_cast<u32>(xsaveInfo[1]);
     // HvVmExitEntryPoint reserves the first 0x1000 bytes of its frame for the
     // ordinary XSAVE area; the GPR/GuestContext fields begin at that exact

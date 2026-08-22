@@ -95,6 +95,91 @@
             "group": "build"
         },
         {
+            "label": "Run C++ Driver Contract Tests (Debug)",
+            "type": "process",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\Nested_HV_ContractTests.exe",
+            "args": [
+                "--root",
+                "${workspaceFolder}"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build Driver (unsigned)",
+            "problemMatcher": [],
+            "group": "test"
+        },
+        {
+            "label": "Run C++ Driver Contract Tests (Release)",
+            "type": "process",
+            "command": "${workspaceFolder}\\build\\vscode\\Release\\Nested_HV_ContractTests.exe",
+            "args": [
+                "--root",
+                "${workspaceFolder}"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build SYS + PDB (Release)",
+            "problemMatcher": [],
+            "group": "test"
+        },
+        {
+            "label": "Run C++ Hardware Probe (isolated target)",
+            "type": "process",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\Nested_HV_ContractTests.exe",
+            "args": [
+                "--root",
+                "${workspaceFolder}",
+                "--hardware"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Run C++ Driver Contract Tests (Debug)",
+            "problemMatcher": [],
+            "group": "test"
+        },
+        {
+            "label": "Run C++ Runtime Smoke Test (isolated target)",
+            "type": "process",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\Nested_HV_ContractTests.exe",
+            "args": [
+                "--root",
+                "${workspaceFolder}",
+                "--driver",
+                "${workspaceFolder}\\build\\vscode\\Debug\\Nested_HV.sys",
+                "--runtime",
+                "--start",
+                "--stop"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build and Sign SYS (Debug, auto test certificate)",
+            "problemMatcher": [],
+            "group": "test"
+        },
+        {
+            "label": "Run C++ Signature Test (Debug)",
+            "type": "process",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\Nested_HV_ContractTests.exe",
+            "args": [
+                "--root",
+                "${workspaceFolder}",
+                "--driver",
+                "${workspaceFolder}\\build\\vscode\\Debug\\Nested_HV.sys",
+                "--signature",
+                "--allow-test-root"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": "Build and Sign SYS (Debug, auto test certificate)",
+            "problemMatcher": [],
+            "group": "test"
+        },
+        {
             "label": "Build SYS + PDB (Release)",
             "type": "shell",
             "command": "powershell.exe",

@@ -27,6 +27,7 @@
 #define MSR_IA32_VMX_CR0_FIXED1         0x00000487
 #define MSR_IA32_VMX_CR4_FIXED0         0x00000488
 #define MSR_IA32_VMX_CR4_FIXED1         0x00000489
+#define MSR_IA32_VMX_VMCS_ENUM          0x0000048A
 #define MSR_IA32_VMX_PROCBASED_CTLS2    0x0000048B
 #define MSR_IA32_VMX_EPT_VPID_CAP       0x0000048C
 #define MSR_IA32_VMX_TRUE_PINBASED_CTLS 0x0000048D
@@ -41,8 +42,8 @@
 #define MSR_IA32_SYSENTER_ESP           0x00000175
 #define MSR_IA32_SYSENTER_EIP           0x00000176
 #define MSR_IA32_PAT                    0x00000277
-// CET/XSAVES state is deliberately not virtualized by this monitor. Trap
-// accesses rather than allowing a guest write to bleed into VMX-root state.
+// CET/XSAVES state is enabled only after the runtime capability contract has
+// verified the paired CET VMCS controls and XSAVES support.
 #define MSR_IA32_XSS                    0x00000DA0
 #define MSR_IA32_U_CET                  0x000006A0
 #define MSR_IA32_S_CET                  0x000006A2
@@ -54,12 +55,14 @@
 
 // IA32_XSS state-component bits from the WDK/Intel XSTATE enumeration.
 // CET_U contains IA32_U_CET and IA32_PL3_SSP; CET_S contains supervisor
-// shadow-stack state. IPT is Intel Processor Trace state. The current
-// VM-exit frame uses ordinary XSAVE/XRSTOR and therefore cannot preserve any
-// enabled supervisor XSTATE component.
+// shadow-stack state. IPT is Intel Processor Trace state. These components are
+// preserved by the compacted XSAVES/XRSTORS image used by the VM-exit frame.
 #define IA32_XSS_IPT                        (1ULL << 8)
 #define IA32_XSS_CET_U                      (1ULL << 11)
 #define IA32_XSS_CET_S                      (1ULL << 12)
+#define IA32_XSS_VIRTUALIZABLE_MASK         (IA32_XSS_IPT | \
+                                             IA32_XSS_CET_U | \
+                                             IA32_XSS_CET_S)
 
 // Enable bits in IA32_{U,S}_CET. Other bits are state/configuration fields,
 // not evidence that shadow-stack or IBT enforcement is currently running.
@@ -115,11 +118,14 @@
 #define SECONDARY_ENABLE_INVPCID                 (1UL << 12)
 #define SECONDARY_ENABLE_XSAVES                  (1UL << 20)
 #define VM_EXIT_HOST_ADDRESS_SPACE_SIZE          (1UL << 9)
+#define VM_EXIT_LOAD_CET_STATE                   (1UL << 28)
+#define VM_EXIT_CLEAR_IA32_RTIT_CTL              (1UL << 25)
 #define VM_ENTRY_IA32E_MODE_GUEST                (1UL << 9)
 #define VM_EXIT_LOAD_HOST_EFER                   (1UL << 21)
 #define VM_EXIT_LOAD_HOST_PAT                    (1UL << 19)
 #define VM_ENTRY_LOAD_GUEST_EFER                 (1UL << 15)
 #define VM_ENTRY_LOAD_GUEST_PAT                  (1UL << 14)
+#define VM_ENTRY_LOAD_CET_STATE                  (1UL << 20)
 #define VM_ENTRY_INTR_INFO_VALID                 (1UL << 31)
 #define VM_ENTRY_INTR_INFO_DELIVER_ERROR_CODE   (1UL << 11)
 #define VM_ENTRY_INTR_TYPE_HARDWARE_EXCEPTION   (3UL << 8)
@@ -147,6 +153,8 @@
 #define VM_EXIT_REASON_VMXOFF                   26
 #define VM_EXIT_REASON_VMXON                    27
 #define VM_EXIT_REASON_XSETBV                   55
+#define VM_EXIT_REASON_XSAVES                   63
+#define VM_EXIT_REASON_XRSTORS                  64
 
 // VMCS Fields
 enum VmcsField : ULONG {
@@ -179,6 +187,10 @@ enum VmcsField : ULONG {
     CONTROL_EXECUTIVE_VMCS_PTR = 0x200c,
     CONTROL_TSC_OFFSET = 0x2010,
     CONTROL_VIRTUAL_APIC_ADDRESS = 0x2012,
+    // 64-bit control field used when secondary XSAVES is enabled.  A set bit
+    // in this bitmap causes an XSAVES/XRSTORS VM-exit for the corresponding
+    // IA32_XSS state component.
+    CONTROL_XSS_EXITING_BITMAP = 0x202c,
 
     // 64-Bit Guest State
     GUEST_VMCS_LINK_PTR = 0x2800,
@@ -290,6 +302,11 @@ enum VmcsField : ULONG {
     GUEST_PENDING_DBG_EXCEPTIONS = 0x6822,
     GUEST_SYSENTER_ESP = 0x6824,
     GUEST_SYSENTER_EIP = 0x6826,
+    // CET state fields are valid only when the corresponding VM-entry/exit
+    // CET controls are supported and enabled.  They are natural-width fields.
+    GUEST_S_CET = 0x6828,
+    GUEST_SSP = 0x682a,
+    GUEST_INTR_SSP_TABLE = 0x682c,
 
     // Natural-Width Host State
     HOST_CR0 = 0x6c00,
@@ -303,5 +320,8 @@ enum VmcsField : ULONG {
     HOST_IA32_SYSENTER_ESP = 0x6c10,
     HOST_IA32_SYSENTER_EIP = 0x6c12,
     HOST_RSP = 0x6c14,
-    HOST_RIP = 0x6c16
+    HOST_RIP = 0x6c16,
+    HOST_S_CET = 0x6c18,
+    HOST_SSP = 0x6c1a,
+    HOST_INTR_SSP_TABLE = 0x6c1c
 };
