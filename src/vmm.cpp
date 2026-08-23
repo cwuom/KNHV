@@ -265,20 +265,59 @@ static bool ComputeXsaveAreaSize(u64 xcr0Mask, u64 xssMask,
         const u32 componentSize = static_cast<u32>(regs[0]);
         if (componentSize == 0) return false;
         const u32 componentFlags = static_cast<u32>(regs[2]);
-        const bool xcr0Component = (componentFlags & 0x1U) != 0;
-        const bool xssComponent = (componentFlags & 0x2U) != 0;
+        const bool xssComponent = (componentFlags & 0x1U) != 0;
+        const bool xcr0Component = !xssComponent;
         if (((xcr0Mask & bit) != 0 && !xcr0Component) ||
             ((xssMask & bit) != 0 && !xssComponent)) {
             return false;
         }
-        // Intel's compacted XSAVE format packs selected components
-        // consecutively after the 576-byte legacy/header region. CPUID.(D,n)
-        // ECX[1:0] identifies XSS/XCR0 ownership; it is not an alignment bit.
+        // Intel's compacted XSAVE format aligns selected components when
+        // CPUID.(D,n).ECX[1] requests the next 64-byte boundary
+        if ((componentFlags & 0x2U) != 0) {
+            offset = (offset + 63ULL) & ~63ULL;
+        }
         offset += componentSize;
         if (offset > MAXULONG) return false;
     }
 
     *areaSize = static_cast<u32>(offset);
+    return true;
+}
+
+    // cpuid.0d.0 reports the standard, non-compacted XSAVE layout. Keep this
+    // separate from ComputeXsaveAreaSize because its EBX offsets are not valid
+    // for the compacted XSAVES format used by the VM-exit frame
+static bool ComputeStandardXsaveAreaSize(u64 xcr0Mask, u32* areaSize) {
+    if (!areaSize) return false;
+
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    if (static_cast<u32>(regs[0]) < 0xD) return false;
+
+    __cpuidex(regs, 0xD, 0);
+    const u64 supportedXcr0 = static_cast<u32>(regs[0]) |
+                              (static_cast<u64>(static_cast<u32>(regs[3])) << 32);
+    if ((xcr0Mask & ~supportedXcr0) != 0 ||
+        (xcr0Mask & 0x3ULL) != 0x3ULL) {
+        return false;
+    }
+
+    u64 size = 576;
+    for (u32 component = 2; component < 64; ++component) {
+        const u64 bit = 1ULL << component;
+        if ((xcr0Mask & bit) == 0) continue;
+
+        __cpuidex(regs, 0xD, static_cast<int>(component));
+        const u32 componentSize = static_cast<u32>(regs[0]);
+        const u32 componentOffset = static_cast<u32>(regs[1]);
+        if (componentSize == 0 || componentOffset < 576) return false;
+
+        const u64 end = static_cast<u64>(componentOffset) + componentSize;
+        if (end > MAXULONG) return false;
+        if (end > size) size = end;
+    }
+
+    *areaSize = static_cast<u32>(size);
     return true;
 }
 
@@ -2023,20 +2062,20 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         // not advertise AVX-512/AMX components that the guest
                         // cannot enable without a dynamic XSAVE contract.
                         const u64 virtualXcr0 = vcpu->HostXcr0;
-                        u64 ignoredXssCapabilities = 0;
-                        u32 guestXsaveAreaSize = 0;
-                        if (!ComputeXsaveAreaSize(virtualXcr0, 0,
-                                                   &ignoredXssCapabilities,
-                                                   &guestXsaveAreaSize)) {
+                        u32 guestXsaveCurrentSize = 0;
+                        u32 guestXsaveMaximumSize = 0;
+                        if (!ComputeStandardXsaveAreaSize(
+                                virtualXcr0, &guestXsaveCurrentSize) ||
+                            !ComputeStandardXsaveAreaSize(
+                                virtualXcr0, &guestXsaveMaximumSize)) {
                             RtlZeroMemory(regs, sizeof(regs));
                         } else {
-                            // D.0:EBX/ECX are sizes, not feature masks. Return
-                            // the size of the fixed guest XCR0 contract in
-                            // both fields so hidden host XSTATE components do
-                            // not leak through the all-supported size.
+                            // D.0 uses the standard XSAVE layout. EBX is the
+                            // current XCR0 size and ECX is the maximum size for
+                            // the guest-supported XCR0 components.
                             regs[0] = static_cast<int>(virtualXcr0);
-                            regs[1] = static_cast<int>(guestXsaveAreaSize);
-                            regs[2] = static_cast<int>(guestXsaveAreaSize);
+                            regs[1] = static_cast<int>(guestXsaveCurrentSize);
+                            regs[2] = static_cast<int>(guestXsaveMaximumSize);
                             regs[3] = static_cast<int>(virtualXcr0 >> 32);
                         }
                     } else if (leaf == 0xD && subleaf == 1) {
@@ -2289,7 +2328,7 @@ u64 GetTssBase(const u64 GdtBase, const u16 GdtLimit, const u16 Selector) {
     const u64 high = highPart;
     base |= (high << 32);
 
-    return base;
+    return IsCanonical(base) ? base : 0;
 }
 
 // initialize the vmcs for a single virtual cpu
@@ -2720,8 +2759,10 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(CONTROL_CR0_GUEST_HOST_MASK, 0ULL);
     VmWriteChecked(CONTROL_CR0_READ_SHADOW, guestCr0);
 
-    VmWriteChecked(CONTROL_CR4_GUEST_HOST_MASK, CR4_VMXE);
-    VmWriteChecked(CONTROL_CR4_READ_SHADOW, guestCr4 & ~CR4_VMXE);
+    const u64 cr4GuestHostMask =
+        CR4_VMXE | (g_CetVmcsEnabled ? 0ULL : CR4_CET);
+    VmWriteChecked(CONTROL_CR4_GUEST_HOST_MASK, cr4GuestHostMask);
+    VmWriteChecked(CONTROL_CR4_READ_SHADOW, guestCr4 & ~cr4GuestHostMask);
 
     bool success = mutableVcpu->VmcsWriteFailed == 0;
     u64 vmcsHostCr0 = 0;

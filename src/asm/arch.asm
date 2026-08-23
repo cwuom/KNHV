@@ -489,6 +489,16 @@ HvRestoreStateAndReturn proc
     cli
     mov r10, rcx                         ; host GuestContext pointer
     mov rbx, r10
+    ; the teardown callback may clobber volatile state
+    ; restore host IA32_XSS before entering it when XSAVES is active
+    cmp byte ptr [g_XsavesEnabled], 0
+    je teardownHostXssReady
+    mov rax, [r10 + HOST_XSS_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+teardownHostXssReady:
     sub rsp, 20h
     call MarkCurrentVcpuTearingDown
     add rsp, 20h
@@ -749,9 +759,6 @@ restoreGuestXsave:
     xrstor [r10]
 
 restoreGuestStateDone:
-
-    ; Keep the guest XSS that was restored above for the final IRET context.
-
     ; The CET VMCS path is disabled for the current contract. Keep the writes
     ; conditional so a future CET implementation cannot fault on old Intel.
     cmp byte ptr [g_CetVmcsEnabled], 0
@@ -838,6 +845,9 @@ restoreInvalidHostMasksReady:
     sub rsp, 20h
     call MarkCurrentVcpuParked
     add rsp, 20h
+    ; the park callback may clobber volatile R10
+    ; restore the frame pointer before VMXOFF and the fatal diagnostic call
+    mov r10, rbx
     vmxoff
     mov rax, cr4
     btr rax, 0Dh
@@ -881,6 +891,7 @@ HvVmPtrLd proc
 HvVmPtrLd endp
 
 HvVmWrite proc
+    ; Intel syntax takes the VMCS field first and the value second
     vmwrite rcx, rdx
     pushfq
     pop rax

@@ -211,6 +211,14 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(CTX_GUEST_DR7\s+equ\s+01130h[\s\S]*CTX_GUEST_DEBUGCTL\s+equ\s+01138h)");
   CheckPattern(state, "VMREAD flags are checked", asm_source,
                R"(HvVmReadChecked proc[\s\S]{0,180}vmread r8, rcx[\s\S]{0,180}mov \[rdx\], r8)");
+  CheckPattern(state, "VMWRITE uses field then value operands", asm_source,
+               R"(HvVmWrite proc[\s\S]{0,220}vmwrite rcx, rdx)");
+  CheckPattern(state, "VMLAUNCH guest RSP uses field then value operands",
+               asm_source,
+               R"(mov ecx, VMCS_GUEST_RSP[\s\S]{0,120}vmwrite rcx, rdx)");
+  CheckPattern(state, "VMLAUNCH guest RIP uses field then value operands",
+               asm_source,
+               R"(mov ecx, VMCS_GUEST_RIP[\s\S]{0,120}vmwrite rcx, rdx)");
   Check(state, "C++ has no unchecked VMREAD path",
         vmm.find("HvVmRead(") == std::string::npos);
   CheckPattern(state, "guest debug VMREAD failures halt",
@@ -364,6 +372,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(ldtrSelector\s*!=\s*0[\s\S]{0,600}non-empty LDTR[\s\S]{0,240}return false)");
   CheckPattern(state, "GDT validation checks descriptor type", vmm,
                R"(static bool IsGdtSelectorUsable\([\s\S]{0,700}access\s*=\s*descriptor\[5\][\s\S]{0,300}access\s*&\s*0x80U[\s\S]{0,300}requireSystem)");
+  CheckPattern(state, "TSS base is canonical before VMCS write", vmm,
+               R"(base\s*\|=\s*\(high\s*<<\s*32\)[\s\S]{0,120}return\s+IsCanonical\(base\)\s*\?\s*base\s*:\s*0)");
   CheckPattern(state, "feature contract has a sticky validity result", vmm,
                R"(g_VmxFeatureContractInitialized\s*=\s*true)");
   CheckPattern(state, "production mode launches every active CPU", vmm,
@@ -531,6 +541,9 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 "HvVmxOff") != std::string::npos);
   CheckPattern(state, "teardown restores guest XSS after stopped marker", asm_source,
                R"(vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped[\s\S]{0,2100}CTX_GUEST_XSS)");
+  CheckPattern(state, "native teardown keeps guest XSS after guest state",
+               asm_source,
+               R"(restoreGuestXsave:[\s\S]{0,700}CTX_GUEST_XSS[\s\S]{0,240}MSR_IA32_XSS[\s\S]{0,160}restoreGuestStateDone:)");
   CheckPattern(state, "VmxOn stop restores host XSS", vmm,
                R"(state\s*==\s*VcpuVmxOn[\s\S]{0,500}WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->HostXss\))");
   CheckPattern(state, "stop claims ownership with a lifecycle CAS", vmm,
@@ -585,6 +598,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos);
   CheckPattern(state, "guest CR4.CET is contract gated", vmm,
                R"(crNum\s*==\s*4[\s\S]{0,260}value\s*&\s*CR4_CET[\s\S]{0,260}g_CetVmcsEnabled)");
+  CheckPattern(state, "VMCS CR4 mask traps unsupported CET", vmm,
+               R"(cr4GuestHostMask[\s\S]{0,180}g_CetVmcsEnabled[\s\S]{0,180}CONTROL_CR4_GUEST_HOST_MASK)");
   CheckPattern(state, "guest CPUID keeps optional control profile", vmm,
                R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*0[\s\S]{0,700}VmxProfileInvpcid)");
   CheckPattern(state, "guest CPUID hides PT capability", vmm,
@@ -605,13 +620,20 @@ void TestSourceContract(const fs::path& root, TestState& state) {
         vmm.find("regs[1] = static_cast<int>(guestXsaveSize)") !=
             std::string::npos);
   Check(state, "guest CPUID constrains D.0 XSAVE sizes",
-        vmm.find("ComputeXsaveAreaSize(virtualXcr0, 0") != std::string::npos &&
-            vmm.find("regs[2] = static_cast<int>(guestXsaveAreaSize)") !=
-                std::string::npos);
-  CheckPattern(state, "compacted XSAVE validates component ownership", vmm,
-               R"(const u32 componentFlags\s*=\s*static_cast<u32>\(regs\[2\]\)[\s\S]{0,260}xcr0Component[\s\S]{0,180}xssComponent[\s\S]{0,240}offset\s*\+=\s*componentSize)");
-  Check(state, "compacted XSAVE does not align components from ECX bit 1",
-        vmm.find("offset = (offset + 63ULL) & ~63ULL") == std::string::npos);
+         vmm.find("ComputeStandardXsaveAreaSize") != std::string::npos &&
+             vmm.find("guestXsaveCurrentSize") != std::string::npos &&
+             vmm.find("guestXsaveMaximumSize") != std::string::npos &&
+             vmm.find("regs[1] = static_cast<int>(guestXsaveCurrentSize)") !=
+                 std::string::npos &&
+             vmm.find("regs[2] = static_cast<int>(guestXsaveMaximumSize)") !=
+                 std::string::npos);
+  Check(state, "compacted XSAVE validates component ownership",
+        vmm.find("const u32 componentFlags") != std::string::npos &&
+            vmm.find("const bool xssComponent") != std::string::npos &&
+            vmm.find("const bool xcr0Component") != std::string::npos &&
+            vmm.find("offset += componentSize") != std::string::npos);
+  Check(state, "compacted XSAVE honors ECX bit 1 alignment",
+        vmm.find("offset = (offset + 63ULL) & ~63ULL") != std::string::npos);
   Check(state, "active CET state is rejected before VMXON",
         main.find("active user CET state is outside the safe VMX contract") !=
                 std::string::npos &&
