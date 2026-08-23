@@ -422,6 +422,8 @@ vmxResumeFailure:
     ; A failed VMRESUME means the VMCS contains invalid guest state or a
     ; malformed control field.  Ask C++ to validate the saved frame before
     ; choosing native teardown; only an invalid frame falls through to park.
+    pushfq
+    pop rbx                         ; preserve VMRESUME CF/ZF flags
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
@@ -441,6 +443,7 @@ vmxResumeFailureHostMasksReady:
     mov ecx, MSR_KERNEL_GS_BASE
     wrmsr
     mov rcx, rsp
+    mov rdx, rbx
     sub rsp, 20h
     call HandleVmResumeFailure
     add rsp, 20h
@@ -869,6 +872,15 @@ HvVmRead proc
     vmread rax, rcx
     ret
 HvVmRead endp
+
+; RCX = VMCS field, RDX = output value. RAX returns VMREAD flags.
+HvVmReadChecked proc
+    vmread r8, rcx
+    pushfq
+    pop rax
+    mov [rdx], r8
+    ret
+HvVmReadChecked endp
 
 HvLaunchGuest proc frame
     ; Keep the caller return slot at the top of a private area.  The VMXOFF

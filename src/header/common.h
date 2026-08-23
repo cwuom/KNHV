@@ -174,10 +174,11 @@ struct VcpuContext {
     // save contract is global, so mixed profiles are rejected before VMXON.
     u32   VmxProfile;
     volatile long VmcsWriteFailed;
+    volatile long VmcsReadFailed;
 
     // IA32_KERNEL_GS_BASE is not part of VMCS state and SWAPGS does not cause
-    // a VM-exit. Keep the guest GS/KGS pair in software so the exit path can
-    // detect an odd SWAPGS and repair GUEST_GS_BASE before VMRESUME.
+    // a VM-exit. Keep the guest GS/KGS values in software so the exit path can
+    // restore both architectural values without inferring SWAPGS parity.
     u64   GuestGsBase;
     u64   GuestKernelGsBase;
 
@@ -191,6 +192,24 @@ struct VcpuContext {
     u64   HostDebugctl;
     u64   GuestDr7;
     u64   GuestDebugctl;
+    // Native teardown is safe only while the guest still uses the descriptor
+    // tables and segment selectors that were active at launch.  VMX restores
+    // the host tables on exit, so a changed guest table cannot be IRETed back
+    // without an explicit table-switch contract.
+    u64   HostSegmentSelectorsLow;
+    u64   HostSegmentSelectorsHigh;
+    u64   HostGdtBase;
+    u64   HostIdtBase;
+    u64   HostTrBase;
+    u64   HostGdtLimit;
+    u64   HostIdtLimit;
+    u64   HostTrLimit;
+    u64   HostTrAr;
+    u64   HostCsLimit;
+    u64   HostSsLimit;
+    u64   HostCsAr;
+    u64   HostSsAr;
+    volatile long NativeTeardownSafe;
 
     // State is published with InterlockedExchange so lifecycle callbacks can
     // inspect it without taking a lock at IPI_LEVEL.
@@ -214,11 +233,37 @@ struct VcpuContext {
     volatile u32 LastExitReasonRaw;
     volatile u32 LastExitReasonBasic;
     volatile u32 LastExitEntryFailure;
+    volatile u64 LastLaunchFlags;
+    volatile u64 LastVmResumeFlags;
     volatile long LastExitAction;
     volatile long VmResumeAttempts;
     u64 LastExitQualification;
     u64 LastGuestRip;
     u64 LastGuestRsp;
     u64 LastRflags;
+    u64 LastGuestCr0;
+    u64 LastGuestCr3;
+    u64 LastGuestCr4;
+    u64 LastGuestCs;
+    u64 LastGuestSs;
+    u64 LastGuestTr;
+    u32 LastGuestCsAr;
+    u32 LastGuestSsAr;
+    u32 LastGuestTrAr;
+    u32 LastGuestInterruptibility;
+    u32 LastGuestActivity;
+    u32 LastVmExitIntrInfo;
+    u32 LastVmExitIntrError;
+    u32 LastIdtVectoringInfo;
+    u32 LastIdtVectoringError;
+    u64 LastGuestDr7;
+    u64 LastGuestDebugctl;
+    u64 LastGuestEfer;
+    u64 LastGuestPat;
+    u64 LastGuestXcr0;
+    u64 LastGuestXss;
+    u64 LastGuestSCet;
+    u64 LastGuestSsp;
+    u64 LastGuestInterruptSspTable;
     u64 LastVmInstructionError;
 };

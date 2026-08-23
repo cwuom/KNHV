@@ -44,6 +44,8 @@
 #define MSR_IA32_SYSENTER_EIP           0x00000176
 #define MSR_IA32_PAT                    0x00000277
 #define MSR_IA32_DEBUGCTL               0x000001D9
+#define MSR_IA32_XFD                    0x000001C4
+#define MSR_IA32_XFD_ERR                0x000001C5
 #define MSR_IA32_RTIT_OUTPUT_BASE       0x00000560
 #define MSR_IA32_RTIT_OUTPUT_MASK_PTRS  0x00000561
 #define MSR_IA32_RTIT_CTL               0x00000570
@@ -138,6 +140,30 @@
 #define CPUID_D1_XGETBV1                         (1U << 2)
 #define CPUID_D1_XSAVES                          (1U << 3)
 #define CPUID_D1_XFD                             (1U << 4)
+#define CPUID_7_EDX_FRED                         (1U << 17)
+#define IA32_DEBUGCTL_LBR                        (1ULL << 0)
+#define IA32_DEBUGCTL_BTF                        (1ULL << 1)
+#define IA32_DEBUGCTL_BUS_LOCK_DETECT            (1ULL << 2)
+#define IA32_DEBUGCTL_TR                         (1ULL << 6)
+#define IA32_DEBUGCTL_BTS                        (1ULL << 7)
+#define IA32_DEBUGCTL_BTINT                      (1ULL << 8)
+#define IA32_DEBUGCTL_BTS_OFF_OS                 (1ULL << 9)
+#define IA32_DEBUGCTL_BTS_OFF_USR                (1ULL << 10)
+#define IA32_DEBUGCTL_FREEZE_LBRS_ON_PMI        (1ULL << 11)
+#define IA32_DEBUGCTL_FREEZE_PERFMON_ON_PMI     (1ULL << 12)
+#define IA32_DEBUGCTL_FREEZE_IN_SMM              (1ULL << 14)
+#define IA32_DEBUGCTL_RTM_DEBUG                  (1ULL << 15)
+#define IA32_DEBUGCTL_ARCHITECTURAL_MASK        \
+    (IA32_DEBUGCTL_LBR | IA32_DEBUGCTL_BTF | IA32_DEBUGCTL_BUS_LOCK_DETECT | \
+     IA32_DEBUGCTL_TR | IA32_DEBUGCTL_BTS | IA32_DEBUGCTL_BTINT | \
+     IA32_DEBUGCTL_BTS_OFF_OS | IA32_DEBUGCTL_BTS_OFF_USR | \
+     IA32_DEBUGCTL_FREEZE_LBRS_ON_PMI | \
+     IA32_DEBUGCTL_FREEZE_PERFMON_ON_PMI | IA32_DEBUGCTL_FREEZE_IN_SMM | \
+     IA32_DEBUGCTL_RTM_DEBUG)
+#define EFER_SCE                                  (1ULL << 0)
+#define EFER_LME                                  (1ULL << 8)
+#define EFER_LMA                                  (1ULL << 10)
+#define EFER_NXE                                  (1ULL << 11)
 #define VM_EXIT_HOST_ADDRESS_SPACE_SIZE          (1UL << 9)
 #define VM_EXIT_LOAD_CET_STATE                   (1UL << 28)
 #define VM_EXIT_CLEAR_IA32_RTIT_CTL              (1UL << 25)

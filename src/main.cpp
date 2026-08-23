@@ -118,6 +118,9 @@ bool IsVmxSupported() {
         if ((xcr0 & ~supportedXcr0) != 0) {
             return RejectVmx("XCR0 contains an unenumerated state component");
         }
+        if ((supportedXcr0 & ~xcr0) != 0) {
+            return RejectVmx("dynamic XSTATE components are not virtualized");
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return RejectVmx("reading XCR0 faulted");
@@ -139,6 +142,17 @@ bool IsVmxSupported() {
                  static_cast<ULONG>(cpuInfo[3]), cetShadowStackEnumerated ? 1U : 0U,
                  (cpuInfo[3] & (1 << 20)) != 0 ? 1U : 0U,
                  (cpuInfo[1] & (1 << 25)) != 0 ? 1U : 0U);
+        const bool ptEnumerated = (cpuInfo[1] & (1 << 25)) != 0;
+        const bool cetIbtEnumerated = (cpuInfo[3] & (1 << 20)) != 0;
+        if (ptEnumerated) {
+            return RejectVmx("Intel PT state is not virtualized");
+        }
+        if (cetShadowStackEnumerated || cetIbtEnumerated) {
+            return RejectVmx("supervisor CET CPUID state is not virtualized");
+        }
+        if ((cpuInfo[3] & CPUID_7_EDX_FRED) != 0) {
+            return RejectVmx("FRED is enumerated but its VMX state is unsupported");
+        }
     }
     bool xsavesEnumerated = false;
     bool xrstorsEnumerated = false;
@@ -156,6 +170,9 @@ bool IsVmxSupported() {
                  static_cast<ULONG>(cpuInfo[2]), static_cast<ULONG>(cpuInfo[3]),
                  xsavesEnumerated ? 1U : 0U, xrstorsEnumerated ? 1U : 0U,
                  xfdEnumerated ? 1U : 0U);
+    }
+    if (xfdEnumerated) {
+        return RejectVmx("XFD/XFD_ERR state is not virtualized");
     }
     if (cetEnumerated || (currentCr4 & CR4_CET) != 0) {
         if (!ReadCETState(&userCet, &supervisorCet, &xss,
