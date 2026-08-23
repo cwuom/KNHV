@@ -398,7 +398,7 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(g_SupportedXssMask\s*&=\s*g_XsavesMask)");
   CheckPattern(state, "guest XSS excludes hidden IPT", vmm,
                R"(g_GuestXssWriteMask\s*=\s*g_SupportedXssMask\s*;)");
-  CheckPattern(state, "guest XSS contract exposes only CET_U", vmx,
+  CheckPattern(state, "host XSS contract names CET_U", vmx,
                R"(IA32_XSS_GUEST_KNOWN_MASK\s+IA32_XSS_CET_U)");
   CheckPattern(state, "active PT is rejected before VMX", vmm,
                R"(IA32_XSS_IPT[\s\S]{0,500}MSR_IA32_RTIT_CTL[\s\S]{0,300}ptControl\s*&\s*IA32_RTIT_CTL_TRACEEN)");
@@ -569,8 +569,9 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos);
   CheckPattern(state, "boot FRED check uses CPUID subleaf one", main,
                R"(cpuid7MaxSubleaf\s*=\s*static_cast<u32>\(cpuInfo\[0\]\)[\s\S]{0,500}__cpuidex\(cpuInfo, 7, 1\)[\s\S]{0,180}CPUID_7_1_EAX_FRED)");
-  Check(state, "driver contract tag identifies the PT policy revision",
-        main.find("PT-HIDDEN-XSTATE-V4-FRED-SUBLEAF1") != std::string::npos);
+  Check(state, "driver contract tag identifies the capability revision",
+        main.find("PT-HIDDEN-XSTATE-V5-FRED-SUBLEAF1-CET-HIDDEN") !=
+            std::string::npos);
   CheckPattern(state, "CR3 PCID no-flush is accepted", vmm,
                R"(noFlushMask\s*=\s*pcide\s*\?\s*\(1ULL\s*<<\s*63\))");
   CheckPattern(state, "NormalizeCr3 clears the no-flush hint", vmm,
@@ -584,15 +585,18 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos);
   CheckPattern(state, "guest CR4.CET is contract gated", vmm,
                R"(crNum\s*==\s*4[\s\S]{0,260}value\s*&\s*CR4_CET[\s\S]{0,260}g_CetVmcsEnabled)");
-  CheckPattern(state, "guest CET capability is not hidden after launch", vmm,
+  CheckPattern(state, "guest CPUID keeps optional control profile", vmm,
                R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*0[\s\S]{0,700}VmxProfileInvpcid)");
   CheckPattern(state, "guest CPUID hides PT capability", vmm,
-               R"(CPUID_7_EBX_INTEL_PT[\s\S]{0,120}regs\[1\]\s*&=)");
+               R"(CPUID_7_EBX_INTEL_PT[\s\S]{0,400}regs\[1\]\s*&=)");
   CheckPattern(state, "guest CPUID hides FRED capability", vmm,
                R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*1[\s\S]{0,180}regs\[0\]\s*&=[\s\S]{0,120}CPUID_7_1_EAX_FRED)");
-  Check(state, "guest CPUID keeps user CET capability contract",
-        vmm.find("CPUID_7_EBX_INTEL_PT") != std::string::npos &&
-            vmm.find("CPUID_7_ECX_CET_SHSTK") == std::string::npos);
+  CheckPattern(state, "guest CPUID hides incomplete CET capability", vmm,
+               R"(if\s*\(!kGuestCetStateVirtualized\)\s*\{[\s\S]{0,240}CPUID_7_ECX_CET_SHSTK[\s\S]{0,180}CPUID_7_EDX_CET_IBT)");
+  Check(state, "guest XSS contract hides incomplete CET state",
+        vmm.find("g_SupportedXssMask = 0") != std::string::npos &&
+            vmm.find("const u64 guestXssMask = kGuestCetStateVirtualized") !=
+                std::string::npos);
   CheckPattern(state, "guest CPUID hides Intel PT leaf", vmm,
                R"(leaf\s*==\s*0x14[\s\S]{0,160}RtlZeroMemory\(regs, sizeof\(regs\)\))");
   Check(state, "guest CPUID recomputes XSS area size",
@@ -604,13 +608,19 @@ void TestSourceContract(const fs::path& root, TestState& state) {
         vmm.find("ComputeXsaveAreaSize(virtualXcr0, 0") != std::string::npos &&
             vmm.find("regs[2] = static_cast<int>(guestXsaveAreaSize)") !=
                 std::string::npos);
+  CheckPattern(state, "compacted XSAVE validates component ownership", vmm,
+               R"(const u32 componentFlags\s*=\s*static_cast<u32>\(regs\[2\]\)[\s\S]{0,260}xcr0Component[\s\S]{0,180}xssComponent[\s\S]{0,240}offset\s*\+=\s*componentSize)");
+  Check(state, "compacted XSAVE does not align components from ECX bit 1",
+        vmm.find("offset = (offset + 63ULL) & ~63ULL") == std::string::npos);
   Check(state, "active CET state is rejected before VMXON",
-        main.find("active supervisor CET state is outside the safe VMX contract") !=
-            std::string::npos);
+        main.find("active user CET state is outside the safe VMX contract") !=
+                std::string::npos &&
+            main.find("active supervisor CET state is outside the safe VMX contract") !=
+                std::string::npos);
   CheckPattern(state, "CET_U requires XSAVES", main,
                R"(CET_U is enabled without an XSAVES CET_U component)");
-  CheckPattern(state, "CET_U MSRs can pass through with XSAVES", vmm,
-               R"(cetUserStateSupported[\s\S]{0,500}MSR_IA32_U_CET[\s\S]{0,200}MSR_IA32_PL3_SSP)");
+  CheckPattern(state, "CET_U MSRs are trapped when guest CET is hidden", vmm,
+               R"(const bool cetUserStateSupported\s*=\s*kGuestCetStateVirtualized[\s\S]{0,260}if\s*\(!cetUserStateSupported\)[\s\S]{0,220}MSR_IA32_U_CET[\s\S]{0,120}MSR_IA32_PL3_SSP)");
   CheckPattern(state, "VS Code config selects an active preset", vscode_settings,
                R"("cmake\.useCMakePresets"\s*:\s*"always")");
   CheckPattern(state, "VS Code config selects the debug configure preset",

@@ -68,12 +68,13 @@
 // CET_U contains IA32_U_CET and IA32_PL3_SSP; CET_S contains supervisor
 // shadow-stack state. IPT is Intel Processor Trace state and is not included in
 // the XSAVES frame used by this monitor. It must remain inactive while the
-// monitor runs; the guest profile exposes only CET_U.
+// monitor runs; the current guest profile hides CET until its full MSR contract
+// is implemented.
 #define IA32_XSS_IPT                        (1ULL << 8)
 #define IA32_XSS_CET_U                      (1ULL << 11)
 #define IA32_XSS_CET_S                      (1ULL << 12)
-// The host frame preserves CET_U. IPT is deliberately hidden from the guest
-// because PT MSRs and CPUID.14 are not virtualized.
+// The host frame may preserve CET_U. IPT and CET_U are hidden from the guest
+// because their complete MSR contracts are not virtualized here.
 #define IA32_XSS_GUEST_KNOWN_MASK            IA32_XSS_CET_U
 #define IA32_XSS_VIRTUALIZABLE_MASK          IA32_XSS_CET_U
 #define IA32_XSS_HOST_ALLOWED_MASK           (IA32_XSS_IPT | IA32_XSS_CET_U)

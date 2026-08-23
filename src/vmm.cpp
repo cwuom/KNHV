@@ -264,9 +264,16 @@ static bool ComputeXsaveAreaSize(u64 xcr0Mask, u64 xssMask,
         __cpuidex(regs, 0xD, static_cast<int>(component));
         const u32 componentSize = static_cast<u32>(regs[0]);
         if (componentSize == 0) return false;
-        if ((static_cast<u32>(regs[2]) & 0x2U) != 0) {
-            offset = (offset + 63ULL) & ~63ULL;
+        const u32 componentFlags = static_cast<u32>(regs[2]);
+        const bool xcr0Component = (componentFlags & 0x1U) != 0;
+        const bool xssComponent = (componentFlags & 0x2U) != 0;
+        if (((xcr0Mask & bit) != 0 && !xcr0Component) ||
+            ((xssMask & bit) != 0 && !xssComponent)) {
+            return false;
         }
+        // Intel's compacted XSAVE format packs selected components
+        // consecutively after the 576-byte legacy/header region. CPUID.(D,n)
+        // ECX[1:0] identifies XSS/XCR0 ownership; it is not an alignment bit.
         offset += componentSize;
         if (offset > MAXULONG) return false;
     }
@@ -470,6 +477,11 @@ bool InitializeVmxFeatureContract() {
     g_HostXssMask = hostXss;
     g_HostXcr0Mask = hostXcr0;
     g_SupportedXssMask = enumeratedXss & IA32_XSS_GUEST_KNOWN_MASK;
+    // CET_U is saved for host context preservation, but is not exposed to the
+    // guest until the complete CET MSR contract is implemented
+    if (!kGuestCetStateVirtualized) {
+        g_SupportedXssMask = 0;
+    }
 
 if (xsavesInstruction && xssRead &&
     VmxControlAllows(MSR_IA32_VMX_PROCBASED_CTLS2,
@@ -1471,15 +1483,14 @@ static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
     }
 
     // IA32_XSS is the selector consumed by XSAVES and has no VMCS field, so
-    // it is always trapped and kept per virtual CPU.  CET_U and PL3_SSP are
-    // part of the compacted XSTATE image and can pass through only when that
-    // image is active. Supervisor CET MSRs stay trapped because this build
-    // requires S_CET, PL0..PL2 and the interrupt SSP table to remain zero.
+    // it is always trapped and kept per virtual CPU. CET MSRs stay trapped
+    // until the complete user and supervisor CET contract is implemented.
     if (!setBit(MSR_IA32_XSS, false) || !setBit(MSR_IA32_XSS, true)) {
         return false;
     }
     const bool cetUserStateSupported =
-        g_XsavesEnabled && (g_SupportedXssMask & IA32_XSS_CET_U) != 0;
+        kGuestCetStateVirtualized && g_XsavesEnabled &&
+        (g_SupportedXssMask & IA32_XSS_CET_U) != 0;
     if (!cetUserStateSupported) {
         constexpr u32 cetUserMsrs[] = {
             MSR_IA32_U_CET, MSR_IA32_PL3_SSP,
@@ -1991,10 +2002,12 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         // virtualization is intentionally unsupported.
                         regs[2] &= ~(1 << 5);
                     } else if (leaf == 7 && subleaf == 0) {
-                        // PT is not guest-virtualized in this monitor. CET
-                        // feature bits remain visible for the user CET path;
-                        // supervisor CET activation is rejected separately.
+                        // PT and incomplete CET state are not guest-virtualized
                         regs[1] &= ~static_cast<int>(CPUID_7_EBX_INTEL_PT);
+                        if (!kGuestCetStateVirtualized) {
+                            regs[2] &= ~static_cast<int>(CPUID_7_ECX_CET_SHSTK);
+                            regs[3] &= ~static_cast<int>(CPUID_7_EDX_CET_IBT);
+                        }
                         if ((vcpu->VmxProfile & VmxProfileInvpcid) == 0) {
                             regs[1] &= ~(1 << 10);  // INVPCID
                         }
@@ -2031,8 +2044,11 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         regs[0] &= ~static_cast<int>(CPUID_D1_XFD);
                         u64 guestXssCapabilities = 0;
                         u32 guestXsaveSize = 0;
+                        const u64 guestXssMask = kGuestCetStateVirtualized
+                                                     ? g_SupportedXssMask
+                                                     : 0;
                         if (ComputeXsaveAreaSize(
-                                vcpu->HostXcr0, g_SupportedXssMask,
+                                vcpu->HostXcr0, guestXssMask,
                                 &guestXssCapabilities, &guestXsaveSize)) {
                             // EBX describes the area for the guest's
                             // permitted XCR0/XSS selection, not the host's
@@ -2047,21 +2063,24 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                             regs[0] &= ~(1 << 3);  // XSAVES
                             regs[0] &= ~(1 << 4);  // XRSTORS
                             regs[2] &= static_cast<int>(0xFFFFFFFFULL &
-                                                        static_cast<u32>(g_SupportedXssMask));
-                            regs[3] &= static_cast<int>(g_SupportedXssMask >> 32);
+                                                        static_cast<u32>(guestXssMask));
+                            regs[3] &= static_cast<int>(guestXssMask >> 32);
                         }
                         // IA32_XSS is a guest selector, so expose only the
                         // components the current virtual CPU may select. The
                         // assembly frame uses g_XsavesMask and is deliberately
                         // independent from this value.
-                        regs[2] &= static_cast<int>(g_SupportedXssMask);
-                        regs[3] &= static_cast<int>(g_SupportedXssMask >> 32);
+                        regs[2] &= static_cast<int>(guestXssMask);
+                        regs[3] &= static_cast<int>(guestXssMask >> 32);
                     } else if (leaf == 0xD && subleaf >= 2 && subleaf < 64) {
                         const u64 component = 1ULL << subleaf;
                         const bool xcr0Component =
                             (vcpu->HostXcr0 & component) != 0;
+                        const u64 guestXssMask = kGuestCetStateVirtualized
+                                                     ? g_SupportedXssMask
+                                                     : 0;
                         const bool xssComponent =
-                            (g_SupportedXssMask & component) != 0;
+                            (guestXssMask & component) != 0;
                         if (!xcr0Component && !xssComponent) {
                             RtlZeroMemory(regs, sizeof(regs));
                         } else if (subleaf == 12 &&

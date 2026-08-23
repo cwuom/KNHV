@@ -12,7 +12,7 @@
 extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
 
 static constexpr const char* kDriverContractTag =
-    "PT-HIDDEN-XSTATE-V4-FRED-SUBLEAF1";
+    "PT-HIDDEN-XSTATE-V5-FRED-SUBLEAF1-CET-HIDDEN";
 
 static bool RejectVmx(const char* reason) {
     DbgPrint("[HV] VMX gate rejected: %s\n", reason);
@@ -263,10 +263,12 @@ bool IsVmxSupported() {
         return RejectVmx("XSAVE/CET state cannot be preserved on this processor");
     }
 
-    // Windows 11 25H2 commonly leaves CR4.CET set while supervisor shadow
-    // stacks are inactive.  The monitor can preserve CET_U through XSAVES and
-    // the supervisor VMCS fields, but it deliberately does not implement an
-    // active supervisor shadow stack or an interrupt SSP table.
+    // Windows 11 25H2 commonly leaves CR4.CET set while CET state is inactive.
+    // The host frame can preserve a selected CET_U component, but this build
+    // does not expose or virtualize active user or supervisor CET state.
+    if ((userCet & IA32_CET_ENABLE_MASK) != 0 || pl3Ssp != 0) {
+        return RejectVmx("active user CET state is outside the safe VMX contract");
+    }
     if ((supervisorCet & IA32_CET_ENABLE_MASK) != 0 ||
         supervisorCet != 0 || pl0Ssp != 0 || pl1Ssp != 0 ||
         pl2Ssp != 0 || interruptSspTable != 0) {

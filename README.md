@@ -41,10 +41,13 @@ machine or recover it with KD rather than forcing removal.
 The exit frame supports ordinary XSAVE on legacy Intel processors. On newer
 Windows 11 systems, XSAVES is enabled only when CPUID.(D,1), the VMX secondary
 control, the XSS mask, and the reported compacted area all agree. The host
-IA32_XSS mask is kept separately from the guest mask; guest XSS is restricted
-to the CET_U component supported by this frame. Intel PT remains host-only:
+IA32_XSS mask is kept separately from the guest mask. The host frame can
+preserve the CET_U component when Windows has selected it, but this build does
+not expose CET capabilities or CET_U XSTATE to the guest until the complete
+user and supervisor CET MSR contract is implemented. Intel PT remains host-only:
 its CPUID leaves are hidden and its RTIT MSR window is intercepted. Active
-Intel PT, CET_S, supervisor shadow stacks, and a non-zero interrupt SSP table
+user or supervisor CET, Intel PT, supervisor shadow stacks, and a non-zero
+interrupt SSP table
 are rejected before VMXON because this build does not virtualize those
 controls completely. The common Windows 11 25H2 state
 `CR4.CET=1`, `IA32_XSS=0x900`, `S_CET=0`, and zero SSP values is accepted only
