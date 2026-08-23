@@ -408,6 +408,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->GuestXss\)[\s\S]{0,1000}VMCS ready; entering VMLAUNCH)");
   CheckPattern(state, "each CPU validates local XCR0 contract", vmm,
              R"(localSupportedXcr0[\s\S]{0,2200}localXcr0\s*=\s*_xgetbv\(0\)[\s\S]{0,1200}localXcr0\s*&\s*~localSupportedXcr0)");
+  Check(state, "local CPUID-only XSTATE components do not reject XCR0",
+        vmm.find("(localSupportedXcr0 & ~localXcr0)") == std::string::npos);
   CheckPattern(state, "each CPU validates XRSTORS", vmm,
                R"(g_XsavesEnabled\s*\)[\s\S]{0,400}localXsaveFeatures\s*&\s*CPUID_D1_XSAVES)");
   CheckPattern(state, "each CPU validates complete XSS mask", vmm,
@@ -526,8 +528,16 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(ptEnumerated[\s\S]{0,180}Intel PT state is not virtualized)");
   CheckPattern(state, "unsupported supervisor CET fails before VMXON", main,
                R"(cetShadowStackEnumerated[\s\S]{0,260}supervisor CET CPUID state is not virtualized)");
-  CheckPattern(state, "dynamic XSTATE fails before VMXON", main,
-               R"(supportedXcr0\s*&\s*~xcr0[\s\S]{0,120}dynamic XSTATE components are not virtualized)");
+  Check(state, "CPUID-only XSTATE components do not reject XCR0",
+        main.find("dynamic XSTATE components are not virtualized") ==
+            std::string::npos &&
+            main.find("hostXcr0 & ~supportedXcr0") == std::string::npos);
+  Check(state, "VMX gate failure is not reported as a BIOS-only failure",
+        main.find("VMX capability gate rejected; see the preceding reason") !=
+            std::string::npos &&
+        main.find("VMX not supported or disabled in BIOS") == std::string::npos);
+  CheckPattern(state, "XCR0 must be a CPUID-supported subset", vmm,
+               R"(hostXcr0\s*&\s*~supportedXcr0)");
   CheckPattern(state, "unsupported XSS fails before VMXON", vmm,
                R"(enumeratedXss\s*&\s*~IA32_XSS_GUEST_KNOWN_MASK)");
   Check(state, "FRED is rejected before VMXON",

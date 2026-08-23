@@ -118,9 +118,10 @@ bool IsVmxSupported() {
         if ((xcr0 & ~supportedXcr0) != 0) {
             return RejectVmx("XCR0 contains an unenumerated state component");
         }
-        if ((supportedXcr0 & ~xcr0) != 0) {
-            return RejectVmx("dynamic XSTATE components are not virtualized");
-        }
+        // CPUID.0D.0 enumerates every XCR0 component the processor can
+        // support, not only the components enabled by the running OS. The
+        // VM-exit frame is sized from the live XCR0 below, so unsupported
+        // future components must not reject a normal XCR0 such as 0x7.
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         return RejectVmx("reading XCR0 faulted");
@@ -291,7 +292,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     DbgPrint("[HV] Driver Entry.\n");
 
     if (!IsVmxSupported()) {
-        DbgPrint("[HV] VMX not supported or disabled in BIOS.\n");
+        DbgPrint("[HV] VMX capability gate rejected; see the preceding reason.\n");
         return STATUS_NOT_SUPPORTED;
     }
 

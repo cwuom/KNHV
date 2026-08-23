@@ -409,7 +409,6 @@ bool InitializeVmxFeatureContract() {
     const u64 supportedXcr0 = static_cast<u32>(regs[0]) |
                               (static_cast<u64>(static_cast<u32>(regs[3])) << 32);
     if ((supportedXcr0 & 0x3ULL) != 0x3ULL ||
-        (supportedXcr0 & ~hostXcr0) != 0 ||
         (hostXcr0 & ~supportedXcr0) != 0 ||
         (hostXcr0 & 0x3ULL) != 0x3ULL) {
         return false;
@@ -2825,7 +2824,6 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             return 0;
         }
         if ((localXcr0 & ~localSupportedXcr0) != 0 ||
-            (localSupportedXcr0 & ~localXcr0) != 0 ||
             (localXcr0 & 0x3ULL) != 0x3ULL ||
             localXcr0 != g_HostXcr0Mask ||
             static_cast<u32>(localCpuid[1]) > VMEXIT_XSAVE_MAX) {
