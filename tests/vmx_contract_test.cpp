@@ -205,10 +205,28 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(cmp byte ptr \[g_CetVmcsEnabled\], 0[\s\S]{0,100}je restoreGuestCetDone)");
   CheckPattern(state, "host XCR0 is installed before handler", asm_source,
                R"(HOST_XCR0_FRAME_SLOT[\s\S]{0,1200}call VmExitHandler)");
-  CheckPattern(state, "fatal path parks after VMXOFF", asm_source,
-               R"(vmxHalt:[\s\S]{0,1800}call MarkCurrentVcpuParked[\s\S]{0,300}vmxoff)");
   const std::size_t halt_begin = asm_source.find("vmxHalt:");
   const std::size_t halt_end = asm_source.find("vmxResumeFailure:");
+  CheckPattern(state, "fatal path parks after VMXOFF", asm_source,
+               R"(vmxHalt:[\s\S]{0,1800}call MarkCurrentVcpuParked[\s\S]{0,300}vmxoff)");
+  CheckPattern(state, "VMRESUME failure is validated in C++", asm_source,
+               R"(vmxResumeFailure:[\s\S]{0,900}call HandleVmResumeFailure)");
+  CheckPattern(state, "fatal path triggers the dedicated bugcheck", asm_source,
+               R"(vmxHalt:[\s\S]{0,2200}call HvFatalBugCheck)");
+  CheckPattern(state, "fatal bugcheck uses the saved exit snapshot", vmm,
+               R"(HvFatalBugCheck\(GuestContext\* c\)[\s\S]{0,700}LastExitReason[\s\S]{0,220}KeBugCheckEx)");
+  CheckPattern(state, "native teardown publishes stopped after VMXOFF", asm_source,
+               R"(HvRestoreStateAndReturn proc[\s\S]{0,7000}vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped)");
+  CheckPattern(state, "native teardown has an intermediate lifecycle state", vmm,
+               R"(MarkCurrentVcpuTearingDown[\s\S]{0,500}VcpuTearingDown)");
+  CheckPattern(state, "stop callback leaves a tearing down CPU alone", vmm,
+               R"(state == VcpuTearingDown[\s\S]{0,220}return 0)");
+  CheckPattern(state, "live scan retains a tearing down CPU", vmm,
+               R"(state == VcpuLaunched \|\| state == VcpuVmxOn[\s\S]{0,180}VcpuTearingDown)");
+  Check(state, "fatal assembly does not VMREAD after VMXOFF",
+        halt_begin != std::string::npos && halt_end > halt_begin &&
+            asm_source.substr(halt_begin, halt_end - halt_begin).find("HvVmRead") ==
+                std::string::npos);
   Check(state, "fatal path keeps interrupts disabled",
         halt_begin != std::string::npos && halt_end > halt_begin &&
             asm_source.substr(halt_begin, halt_end - halt_begin).find("sti") ==
@@ -227,26 +245,44 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "XSAVES/XRSTORS exits recover natively", vmm,
                R"(case VM_EXIT_REASON_XSAVES[\s\S]{0,300}case VM_EXIT_REASON_XRSTORS[\s\S]{0,900}RequestSafeExit\s*\(Ctx\))");
   CheckPattern(state, "VM-entry injection is cleared per exit", vmm,
-               R"(VmExitHandler\(GuestContext\* Ctx\)[\s\S]{0,1300}CONTROL_VM_ENTRY_INTR_INFO_FIELD, 0[\s\S]{0,300}CONTROL_VM_ENTRY_EXCEPTION_ERROR_CODE, 0)");
+               R"(VmExitHandler\(GuestContext\* Ctx\)[\s\S]{0,2200}CONTROL_VM_ENTRY_INTR_INFO_FIELD, 0[\s\S]{0,300}CONTROL_VM_ENTRY_EXCEPTION_ERROR_CODE, 0)");
   const std::size_t setup_begin = vmm.find("bool SetupVmcs(");
   const std::size_t setup_end = vmm.find(
       "// ==============================================================================\n// Launch Logic", setup_begin);
-  Check(state, "IPI launch enables guest interrupts",
-         setup_begin != std::string::npos && setup_end > setup_begin &&
-             vmm.substr(setup_begin, setup_end - setup_begin).find(
-                 "u64 guestRflags = GetRflags()") != std::string::npos &&
-             vmm.substr(setup_begin, setup_end - setup_begin).find(
-                 "guestRflags |= (1ULL << 9)") != std::string::npos &&
-             vmm.substr(setup_begin, setup_end - setup_begin).find(
-                 "guestRflags &= ~((1ULL << 17)") != std::string::npos &&
-             vmm.substr(setup_begin, setup_end - setup_begin).find(
-                 "guestRflags &= ~((1ULL << 9)") == std::string::npos);
+  Check(state, "IPI launch preserves callback interrupt state",
+        setup_begin != std::string::npos && setup_end > setup_begin &&
+            vmm.substr(setup_begin, setup_end - setup_begin).find(
+                "u64 guestRflags = GetRflags()") != std::string::npos &&
+            vmm.substr(setup_begin, setup_end - setup_begin).find(
+                "guestRflags &= ~((1ULL << 17)") != std::string::npos &&
+            vmm.substr(setup_begin, setup_end - setup_begin).find(
+                "guestRflags &= ~((1ULL << 9)") == std::string::npos &&
+            vmm.substr(setup_begin, setup_end - setup_begin).find(
+                "Preserve the callback's interrupt flag") != std::string::npos);
   CheckPattern(state, "unload VMCALL logs the IRET contract", vmm,
                R"(unload VMCALL: cpu=.*GuestRip|unload VMCALL decision: cpu=)");
   CheckPattern(state, "non-empty LDTR fails closed", vmm,
                R"(ldtrSelector\s*!=\s*0[\s\S]{0,600}non-empty LDTR[\s\S]{0,240}return false)");
   CheckPattern(state, "feature contract has a sticky validity result", vmm,
                R"(g_VmxFeatureContractInitialized\s*=\s*true)");
+  CheckPattern(state, "production mode launches every active CPU", vmm,
+               R"(kDebugSingleCpu\s*=\s*false)");
+  CheckPattern(state, "IPI broadcast is single and all-processor", vmm,
+               R"(BroadcastToAllProcessorGroups\([\s\S]{0,500}return callback \? KeIpiGenericCall\(callback, 0\) : 0)");
+  CheckPattern(state, "CPU generation profile has explicit branches", vmm,
+               R"(VmxProfileLegacyControls[\s\S]{0,900}VmxProfileTrueControls[\s\S]{0,900}VmxProfileXsaves[\s\S]{0,900}VmxProfileRdtscp[\s\S]{0,900}VmxProfileInvpcid)");
+  CheckPattern(state, "CPU generation profile checks optional controls", vmm,
+               R"(BuildVmxCapabilityProfile\([\s\S]{0,1800}VmxProfileTertiaryControls)");
+  CheckPattern(state, "CPU generation selects explicit VMX control branches", vmm,
+               R"(SelectVmxControlGeneration[\s\S]{0,700}VmxGenerationLegacy[\s\S]{0,700}VmxGenerationTrueTertiary)");
+  CheckPattern(state, "CPU generation controls use the local profile", vmm,
+               R"(const u32 profile\s*=\s*Vcpu->VmxProfile[\s\S]{0,500}VmxProfileInvpcid[\s\S]{0,500}VmxProfileRdtscp)");
+  CheckPattern(state, "legacy CPUs hide unsupported optional instructions", vmm,
+               R"(VmxProfileInvpcid[\s\S]{0,260}regs\[1\]\s*&=\s*~\(1\s*<<\s*10\)[\s\S]{0,900}VmxProfileRdtscp[\s\S]{0,260}regs\[3\]\s*&=\s*~\(1\s*<<\s*27\))");
+  CheckPattern(state, "each CPU rejects a generation profile mismatch", vmm,
+               R"(immutableProfileMask[\s\S]{0,500}g_VmxCapabilityProfile[\s\S]{0,500}VcpuFailed)");
+  CheckPattern(state, "feature control is never provisioned by the driver", vmm,
+               R"(EnsureFeatureControlForVmx\([\s\S]{0,500}return \(featureControl & required\) == required)");
   CheckPattern(state, "feature contract resets only while idle", vmm,
                R"(if\s*\(g_VcpuData\s*==\s*nullptr\)[\s\S]{0,500}g_VmxFeatureContractInitialized\s*=\s*false)");
   CheckPattern(state, "CPUID XSS mask is restricted to the guest contract", vmm,
@@ -280,7 +316,32 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "diagnostic launch log includes VMCS state", vmm,
                R"(VMCS ready; entering VMLAUNCH[\s\S]{0,240}revision=0x%X)");
   CheckPattern(state, "launch state is published by the success marker", vmm,
-               R"(MarkCurrentVcpuLaunched[\s\S]{0,600}State[\s\S]{0,120}VcpuLaunched)");
+               R"(MarkCurrentVcpuLaunched[\s\S]{0,900}State[\s\S]{0,140}VcpuLaunched)");
+  const std::size_t launch_marker_begin = vmm.find(
+      "extern \"C\" void MarkCurrentVcpuLaunched()");
+  const std::size_t launch_marker_end = vmm.find(
+      "extern \"C\" void MarkCurrentVcpuParked()", launch_marker_begin);
+  Check(state, "launch marker uses VMX stage and atomic VmxOn publication",
+        launch_marker_begin != std::string::npos &&
+            launch_marker_end > launch_marker_begin &&
+            vmm.substr(launch_marker_begin,
+                       launch_marker_end - launch_marker_begin)
+                    .find("InterlockedCompareExchange(&vcpu->LaunchStage, 5, 4)") !=
+                std::string::npos &&
+            vmm.substr(launch_marker_begin,
+                       launch_marker_end - launch_marker_begin)
+                    .find("VcpuLaunched,\n                                                         VcpuVmxOn") !=
+                std::string::npos);
+  Check(state, "launch marker does not inspect guest CR4.VMXE",
+        launch_marker_begin != std::string::npos &&
+            launch_marker_end > launch_marker_begin &&
+            vmm.substr(launch_marker_begin,
+                       launch_marker_end - launch_marker_begin)
+                    .find("__readcr4()") == std::string::npos);
+  CheckPattern(state, "unresolved launch states are detected", vmm,
+               R"(HasUnresolvedVcpu[\s\S]{0,550}state == VcpuFailed[\s\S]{0,550}return true)");
+  CheckPattern(state, "unresolved launch states quarantine teardown", vmm,
+               R"(HasParkedVcpu\(\)\s*\|\|\s*HasLiveVcpu\(\)\s*\|\|\s*HasUnresolvedVcpu\(\)[\s\S]{0,350}kHvLifecycleQuarantined)");
   CheckPattern(state, "launch starts in the intermediate state", vmm,
                R"(InterlockedCompareExchange\(&vcpu->State,[\s\S]{0,120}VcpuStarting)");
   const std::size_t prepare_begin = vmm.find(
@@ -311,6 +372,9 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 "movdqu xmm6, xmmword ptr [rsp + 080h]") != std::string::npos);
   CheckPattern(state, "launch reserves teardown stack space", asm_source,
                R"(HvLaunchGuest proc[\s\S]{0,420}sub rsp, 200h[\s\S]{0,300}VMCS_GUEST_RSP[\s\S]{0,700}vmlaunch[\s\S]{0,300}add rsp, 200h)");
+  CheckPattern(state, "guest launch RSP points at the wrapper return slot",
+               asm_source,
+               R"(HvLaunchGuest proc[\s\S]{0,520}add rax, 1F8h[\s\S]{0,260}VMCS_GUEST_RSP)");
   const std::size_t launch_begin = asm_source.find("HvLaunchGuest proc frame");
   const std::size_t launch_end = asm_source.find("HvLaunchGuest endp", launch_begin);
   Check(state, "launch has VMXE guard",
@@ -341,12 +405,14 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 "vmxInstructionFailure") != std::string::npos &&
             vmm.substr(abort_begin, abort_end - abort_begin).find(
                 "HvVmxOff") != std::string::npos);
-  const std::size_t teardown_begin = asm_source.find("restoreGuestStateDone:");
-  const std::size_t teardown_end = asm_source.find("vmxoff", teardown_begin);
-  Check(state, "teardown preserves guest XSS before VMXOFF",
-        teardown_begin != std::string::npos && teardown_end > teardown_begin &&
-            asm_source.substr(teardown_begin, teardown_end - teardown_begin)
-                .find("HOST_XSS_FRAME_SLOT") == std::string::npos);
+  CheckPattern(state, "teardown restores guest XSS after stopped marker", asm_source,
+               R"(vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped[\s\S]{0,1800}CTX_GUEST_XSS)");
+  CheckPattern(state, "VmxOn stop restores host XSS", vmm,
+               R"(state\s*==\s*VcpuVmxOn[\s\S]{0,500}WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->HostXss\))");
+  CheckPattern(state, "stop claims ownership with a lifecycle CAS", vmm,
+               R"(StopHypervisorInternal\([\s\S]{0,500}InterlockedCompareExchange\(&g_HvLifecycle[\s\S]{0,220}kHvLifecycleStopping)");
+  CheckPattern(state, "quarantine is not overwritten by idle cleanup", vmm,
+               R"(HasParkedVcpu\(\)[\s\S]{0,300}kHvLifecycleQuarantined[\s\S]{0,120}return)");
   CheckPattern(state, "guest CPUID hides VMX", vmm,
                R"(leaf\s*==\s*1[\s\S]{0,300}regs\[2\]\s*&=\s*~\(1\s*<<\s*5\))");
   CheckPattern(state, "guest CPUID hides incomplete CET", vmm,

@@ -54,6 +54,10 @@ extern "C" {
     void AbortHvLaunch(u64 Rflags);
     void MarkCurrentVcpuLaunched();
     void MarkCurrentVcpuParked();
+    void MarkCurrentVcpuTearingDown();
+    void MarkCurrentVcpuStopped();
+    ULONG HandleVmResumeFailure(GuestContext* Ctx);
+    __declspec(noreturn) void HvFatalBugCheck(GuestContext* Ctx);
 }
 
 // ==============================================================================
@@ -63,6 +67,11 @@ VcpuContext* g_VcpuData = nullptr;
 u32 g_ProcessorCount = 0;
 static volatile LONG g_HvLifecycle = 0;
 static volatile LONG g_HvImagePinned = 0;
+static constexpr LONG kHvLifecycleIdle = 0;
+static constexpr LONG kHvLifecycleStarting = 1;
+static constexpr LONG kHvLifecycleRunning = 2;
+static constexpr LONG kHvLifecycleStopping = 3;
+static constexpr LONG kHvLifecycleQuarantined = 4;
 static u64 g_VmxBasic = 0;
 // VMX host CR3 must always reference the kernel/system address space.  A
 // KeIpiGenericCall callback may run while the interrupted thread belongs to a
@@ -88,6 +97,42 @@ static u64 g_EnumeratedXssMask = 0;
 static u64 g_SupportedXssMask = 0;
 static u64 g_HostXssMask = 0;
 static u32 g_XsaveStateSize = 0;
+
+// VMX control and state-save capabilities vary across Intel generations. The
+// assembly path can use only one immutable contract during a run, so every CPU
+// must expose the same profile selected by the boot CPU.
+enum VmxCapabilityProfile : u32 {
+    VmxProfileLegacyControls = 1U << 0,
+    VmxProfileTrueControls = 1U << 1,
+    VmxProfileSecondaryControls = 1U << 2,
+    VmxProfileXsaves = 1U << 3,
+    VmxProfileCetVmcs = 1U << 4,
+    VmxProfileNoHardwareErrorCode = 1U << 5,
+    VmxProfileRdtscp = 1U << 6,
+    VmxProfileInvpcid = 1U << 7,
+    VmxProfileTertiaryControls = 1U << 8,
+};
+static u32 g_VmxCapabilityProfile = 0;
+
+enum VmxControlGeneration : u32 {
+    VmxGenerationLegacy = 0,
+    VmxGenerationTrue = 1,
+    VmxGenerationTrueSecondary = 2,
+    VmxGenerationTrueTertiary = 3,
+};
+
+static VmxControlGeneration SelectVmxControlGeneration(u32 profile) {
+    if ((profile & VmxProfileTrueControls) == 0) {
+        return VmxGenerationLegacy;
+    }
+    if ((profile & VmxProfileTertiaryControls) != 0) {
+        return VmxGenerationTrueTertiary;
+    }
+    if ((profile & VmxProfileSecondaryControls) != 0) {
+        return VmxGenerationTrueSecondary;
+    }
+    return VmxGenerationTrue;
+}
 // Detailed per-CPU launch and ordinary VM-exit messages are opt-in. DbgPrint
 // at IPI_LEVEL or with a kernel debugger attached can stop every processor;
 // fatal and contract-failure messages remain unconditional.
@@ -108,11 +153,10 @@ static constexpr long kExitActionAbort = 2;
 static constexpr long kExitActionHalt = 3;
 static constexpr long kExitActionInject = 4;
 
-// Bring-up/debug switch: only this logical processor executes VMXON/VMLAUNCH.
-// Other processors return from the IPI callback without touching VMX state.
-// Keep this enabled until a single CPU can repeatedly load/unload without
-// dropping KDNET or bugchecking; then set kDebugSingleCpu to false.
-static constexpr bool kDebugSingleCpu = true;
+// Production mode launches the same validated VMX contract on every active
+// logical processor. Set this only in a dedicated bring-up build when a
+// debugger must isolate one processor deliberately.
+static constexpr bool kDebugSingleCpu = false;
 static constexpr u32  kDebugCpuIndex = 0;
 
 static __forceinline bool ShouldLaunchOnThisProcessor(u32 id) {
@@ -126,6 +170,55 @@ static __forceinline u32 ExpectedLaunchProcessorCount() {
 static __forceinline u32 CurrentProcessorIndex();
 static __forceinline u32 ControlMsr(u64 vmxBasic, u32 legacyMsr, u32 trueMsr);
 static __forceinline bool IsCanonical(u64 value);
+static bool ReadMsrSafe(u32 msr, u64* value);
+
+static u32 BuildVmxCapabilityProfile(u64 vmxBasic, bool xsaves,
+                                     bool cetVmcs) {
+    u32 profile = (vmxBasic & VMX_BASIC_TRUE_CONTROLS) != 0
+                      ? VmxProfileTrueControls
+                      : VmxProfileLegacyControls;
+    u64 secondaryControls = 0;
+    if (ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS2, &secondaryControls) &&
+        secondaryControls != 0) {
+        profile |= VmxProfileSecondaryControls;
+    }
+    if (xsaves) profile |= VmxProfileXsaves;
+    if (cetVmcs) profile |= VmxProfileCetVmcs;
+    if ((vmxBasic & VMX_BASIC_NO_HW_ERROR_CODE) != 0) {
+        profile |= VmxProfileNoHardwareErrorCode;
+    }
+
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    const u32 maxBasicLeaf = static_cast<u32>(regs[0]);
+    if (maxBasicLeaf >= 7) {
+        __cpuidex(regs, 7, 0);
+        if ((regs[1] & (1 << 10)) != 0) {
+            profile |= VmxProfileInvpcid;
+        }
+    }
+    __cpuidex(regs, 0x80000000, 0);
+    const u32 maxExtendedLeaf = static_cast<u32>(regs[0]);
+    if (maxExtendedLeaf >= 0x80000001) {
+        __cpuidex(regs, 0x80000001, 0);
+        if ((regs[3] & (1 << 27)) != 0) {
+            profile |= VmxProfileRdtscp;
+        }
+    }
+
+    u64 primaryControls = 0;
+    const u32 primaryMsr = ControlMsr(vmxBasic,
+                                      MSR_IA32_VMX_PROCBASED_CTLS,
+                                      MSR_IA32_VMX_TRUE_PROCBASED_CTLS);
+    if (ReadMsrSafe(primaryMsr, &primaryControls) &&
+        (primaryControls >> 32 & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) != 0) {
+        u64 tertiaryControls = 0;
+        if (ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS3, &tertiaryControls)) {
+            profile |= VmxProfileTertiaryControls;
+        }
+    }
+    return profile;
+}
 
 // CPUID.0D.1:EBX describes only the state selected by the current XCR0 and
 // IA32_XSS values.  The VM-exit frame instead uses one immutable XSAVES mask,
@@ -211,18 +304,10 @@ static bool EnsureFeatureControlForVmx() {
     if (!ReadMsrSafe(MSR_IA32_FEATURE_CONTROL, &featureControl)) return false;
     const u64 required = IA32_FEATURE_CONTROL_LOCK |
                          IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX;
-    if ((featureControl & IA32_FEATURE_CONTROL_LOCK) != 0) {
-        return (featureControl & required) == required;
-    }
-
-    // Some firmware leaves this MSR unlocked until the first VMX owner. Set
-    // only the two non-SMX VMX bits and the lock bit; preserve every other
-    // firmware-selected option and verify the write before VMXON.
-    const u64 provisioned = featureControl | required;
-    if (!WriteMsrSafe(MSR_IA32_FEATURE_CONTROL, provisioned)) return false;
-    u64 verified = 0;
-    return ReadMsrSafe(MSR_IA32_FEATURE_CONTROL, &verified) &&
-           (verified & required) == required;
+    // This MSR is package firmware policy and the lock bit is irreversible
+    // until reset. A late-launch driver must never claim it on behalf of the
+    // platform; an unlocked or incomplete policy is rejected before VMXON.
+    return (featureControl & required) == required;
 }
 
 static __forceinline bool IsIntelPtMsr(u32 msr) {
@@ -268,6 +353,7 @@ bool InitializeVmxFeatureContract() {
         g_SupportedXssMask = 0;
         g_HostXssMask = 0;
         g_XsaveStateSize = 0;
+        g_VmxCapabilityProfile = 0;
     }
     if (g_VmxFeatureContractInitialized) {
         return g_VmxFeatureContractValid;
@@ -281,11 +367,16 @@ bool InitializeVmxFeatureContract() {
     g_SupportedXssMask = 0;
     g_HostXssMask = 0;
     g_XsaveStateSize = 0;
+    g_VmxCapabilityProfile = 0;
 
     int regs[4] = {};
     __cpuid(regs, 0);
     const u32 maxBasicLeaf = static_cast<u32>(regs[0]);
     if (maxBasicLeaf < 0xD) return false;
+
+    u64 vmxBasic = 0;
+    if (!ReadMsrSafe(MSR_IA32_VMX_BASIC, &vmxBasic)) return false;
+    g_VmxCapabilityProfile = BuildVmxCapabilityProfile(vmxBasic, false, false);
 
     const u64 currentCr4 = __readcr4();
     u64 hostXcr0 = 0;
@@ -404,8 +495,6 @@ if (xsavesInstruction && xssRead &&
     // is inactive.  In that state VMX still requires the paired CET
     // entry/exit controls and valid zeroed VMCS CET fields.
     if ((currentCr4 & CR4_CET) != 0) {
-        u64 vmxBasic = 0;
-        if (!ReadMsrSafe(MSR_IA32_VMX_BASIC, &vmxBasic)) return false;
         if ((vmxBasic & VMX_BASIC_NO_HW_ERROR_CODE) == 0) return false;
         const u32 exitMsr = ControlMsr(vmxBasic,
                                        MSR_IA32_VMX_EXIT_CTLS,
@@ -420,8 +509,12 @@ if (xsavesInstruction && xssRead &&
         g_CetVmcsEnabled = 1;
     }
 
-    DbgPrint("[HV] VMX control contract: CET_VMCS=%u XSAVES=%u\n",
-             g_CetVmcsEnabled ? 1U : 0U, g_XsavesEnabled ? 1U : 0U);
+    g_VmxCapabilityProfile = BuildVmxCapabilityProfile(
+        vmxBasic, g_XsavesEnabled != 0, g_CetVmcsEnabled != 0);
+
+    DbgPrint("[HV] VMX control contract: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
+             g_VmxCapabilityProfile, g_CetVmcsEnabled ? 1U : 0U,
+             g_XsavesEnabled ? 1U : 0U);
 
     g_VmxFeatureContractValid = true;
     return true;
@@ -561,6 +654,41 @@ static __forceinline void RequestSafeExit(GuestContext* c) {
     }
 }
 
+// VMRESUME can fail after the normal epilogue has restored the guest register
+// set but before hardware re-enters non-root mode.  Return through the native
+// teardown path only when the saved context passes the same conservative checks
+// used by HvRestoreStateAndReturn; otherwise retain the quarantine path.
+extern "C" ULONG HandleVmResumeFailure(GuestContext* c) {
+    if (c && IsValidGuestState(c) &&
+        (!g_XsavesEnabled ||
+         (c->GuestXss & ~g_SupportedXssMask) == 0)) {
+        c->AbortVm = 1;
+        c->HaltVm = 0;
+        return 1;
+    }
+    if (c) c->HaltVm = 1;
+    return 0;
+}
+
+// A frame that cannot pass native teardown validation has no safe instruction
+// pointer or stack. Fail fast with a debugger-visible dump instead of waiting
+// for CLOCK_WATCHDOG_TIMEOUT to obscure the original VMX failure.
+extern "C" __declspec(noreturn) void HvFatalBugCheck(GuestContext* c) {
+    constexpr ULONG kHvFatalBugCheck = 0x200;
+    const ULONG_PTR cpu = CurrentProcessorIndex();
+    ULONG_PTR reason = 0;
+    if (c && g_VcpuData && cpu < g_ProcessorCount) {
+        // VMXOFF has already ended VMX operation on this path.  Use the
+        // per-CPU snapshot instead of issuing an invalid post-VMX VMREAD
+        // while collecting bugcheck parameters
+        reason = static_cast<ULONG_PTR>(g_VcpuData[cpu].LastExitReason);
+    }
+    const ULONG_PTR rip = c ? static_cast<ULONG_PTR>(c->GuestRip) : 0;
+    const ULONG_PTR rsp = c ? static_cast<ULONG_PTR>(c->GuestRsp) : 0;
+    KeBugCheckEx(kHvFatalBugCheck, cpu, reason, rip, rsp);
+    __assume(0);
+}
+
 static __forceinline u32 CurrentProcessorIndex() {
     PROCESSOR_NUMBER number{};
     KeGetCurrentProcessorNumberEx(&number);
@@ -575,8 +703,26 @@ extern "C" void MarkCurrentVcpuLaunched() {
     const u32 id = CurrentProcessorIndex();
     if (id < g_ProcessorCount) {
         VcpuContext* vcpu = &g_VcpuData[id];
-        InterlockedExchange(&vcpu->LaunchStage, 5);
-        InterlockedExchange(&vcpu->State, VcpuLaunched);
+        // CR4.VMXE is owned by VMX root. Intel defines MOV from CR4 in
+        // VMX non-root through the CR4 read shadow, so the guest-visible bit
+        // is deliberately zero even after a successful VMLAUNCH.
+        if (InterlockedCompareExchange(&vcpu->LaunchStage, 5, 4) != 4) {
+            HV_VERBOSE_PRINT("[HV] CPU %u launch marker saw unexpected stage=%ld "
+                             "state=%ld; retaining VMX state\n", id,
+                             vcpu->LaunchStage, vcpu->State);
+            return;
+        }
+        // The success marker is the only publisher of VcpuLaunched. A failed
+        // or concurrent teardown must never be overwritten by this callback.
+        const long previous = InterlockedCompareExchange(&vcpu->State,
+                                                         VcpuLaunched,
+                                                         VcpuVmxOn);
+        if (previous != VcpuVmxOn) {
+            HV_VERBOSE_PRINT("[HV] CPU %u launch marker could not publish: "
+                             "state=%ld stage=%ld; retaining VMX state\n", id,
+                             previous, vcpu->LaunchStage);
+            return;
+        }
     }
 }
 
@@ -589,6 +735,34 @@ extern "C" void MarkCurrentVcpuParked() {
     if (id < g_ProcessorCount) {
         InterlockedExchange(&g_VcpuData[id].LaunchStage, 7);
         InterlockedExchange(&g_VcpuData[id].State, VcpuParked);
+    }
+}
+
+extern "C" void MarkCurrentVcpuTearingDown() {
+    if (!g_VcpuData) return;
+    const u32 id = CurrentProcessorIndex();
+    if (id < g_ProcessorCount) {
+        VcpuContext* vcpu = &g_VcpuData[id];
+        const long state = vcpu->State;
+        if (state == VcpuLaunched || state == VcpuVmxOn ||
+            state == VcpuStarting) {
+            InterlockedExchange(&vcpu->LaunchStage, 8);
+            InterlockedExchange(&vcpu->State, VcpuTearingDown);
+        }
+    }
+}
+
+extern "C" void MarkCurrentVcpuStopped() {
+    if (!g_VcpuData) return;
+    const u32 id = CurrentProcessorIndex();
+    if (id < g_ProcessorCount) {
+        VcpuContext* vcpu = &g_VcpuData[id];
+        const long state = vcpu->State;
+        if (state == VcpuTearingDown || state == VcpuLaunched ||
+            state == VcpuVmxOn) {
+            InterlockedExchange(&vcpu->LaunchStage, 9);
+            InterlockedExchange(&vcpu->State, VcpuStopped);
+        }
     }
 }
 // ==============================================================================
@@ -1273,6 +1447,9 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         return;
     }
     VcpuContext* vcpu = &g_VcpuData[cpuId];
+    // Capture the reason before any VMCS write can fail and route directly to
+    // the fatal path.  The snapshot remains available after VMXOFF.
+    vcpu->LastExitReason = static_cast<long>(ExitReason);
     const long exitCount = InterlockedIncrement(&vcpu->VmExitCount);
     // Keep the first exits verbose and retain power-of-two checkpoints so a
     // long-running guest still leaves a bounded, useful trace in KD.
@@ -1309,7 +1486,6 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     Ctx->GuestSysenterCs = HvVmRead(GUEST_SYSENTER_CS);
     Ctx->GuestSysenterEsp = HvVmRead(GUEST_SYSENTER_ESP);
     Ctx->GuestSysenterEip = HvVmRead(GUEST_SYSENTER_EIP);
-    vcpu->LastExitReason = static_cast<long>(ExitReason);
     vcpu->LastExitQualification = HvVmRead(EXIT_QUALIFICATION);
     vcpu->LastGuestRip = Ctx->GuestRip;
     vcpu->LastGuestRsp = Ctx->GuestRsp;
@@ -1423,6 +1599,9 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         // Intel PT and supervisor CET are host-only until the
                         // complete supervisor CET transition contract exists.
                         regs[1] &= ~(1 << 25);  // Intel PT
+                        if ((vcpu->VmxProfile & VmxProfileInvpcid) == 0) {
+                            regs[1] &= ~(1 << 10);  // INVPCID
+                        }
                         const bool cetGuestSupported =
                             kGuestCetStateVirtualized && g_CetVmcsEnabled &&
                             g_XsavesEnabled &&
@@ -1430,6 +1609,10 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         if (!cetGuestSupported) {
                             regs[2] &= ~(1 << 7);   // CET_SS
                             regs[3] &= ~(1 << 20);  // CET_IBT
+                        }
+                    } else if (leaf == 0x80000001U) {
+                        if ((vcpu->VmxProfile & VmxProfileRdtscp) == 0) {
+                            regs[3] &= ~(1 << 27);  // RDTSCP
                         }
                     } else if (leaf == 0x14) {
                         // Leaf 0x14 enumerates Intel Processor Trace. Returning
@@ -1559,13 +1742,14 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         case VM_EXIT_REASON_TRIPLE_FAULT: // triple fault
         case VM_EXIT_REASON_INVALID_GUEST_STATE: // invalid guest state
             // There is no architectural continuation for these exits.  Park
-            // the processor after VMXOFF rather than re-entering an invalid
-            // guest state and creating another reset/triple-fault cascade.
+            // the processor only when the saved state is not safe for native
+            // teardown. A valid late-launch frame can leave VMX and resume the
+            // interrupted Windows context without creating a watchdog park.
             HV_VERBOSE_PRINT("[HV] FATAL VM-exit cpu=%u count=%ld reason=%llu "
                              "rip=0x%llX rsp=0x%llX cr3=0x%llX cr4=0x%llX\n",
                              cpuId, exitCount, ExitReason, Ctx->GuestRip,
                              Ctx->GuestRsp, Ctx->GuestCr3, Ctx->GuestCr4);
-            Ctx->HaltVm = 1;
+            RequestSafeExit(Ctx);
             AdvanceRip = false;
             break;
 
@@ -1877,12 +2061,13 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         !IsCanonical(reinterpret_cast<u64>(GuestSp))) return false;
     VmWriteChecked(GUEST_RIP, reinterpret_cast<u64>(GuestIp));
     VmWriteChecked(GUEST_RSP, reinterpret_cast<u64>(GuestSp));
-    // KeIpiGenericCall invokes this callback with IF cleared. The guest starts
-    // on the callback continuation and then returns to ordinary kernel code;
-    // it must be interruptible or the clock/IPI path will stop making progress
+    // Preserve the callback's interrupt flag. KeIpiGenericCall invokes the
+    // callback at IPI_LEVEL, and the VMX guest must retain the interrupted
+    // Windows context until the wrapper returns to the dispatcher. Intel only
+    // requires RFLAGS.IF=1 when an external interrupt is being injected; this
+    // monitor injects none during the launch handoff.
     u64 guestRflags = GetRflags();
     const u64 callbackRflags = guestRflags;
-    guestRflags |= (1ULL << 9);                 // IF
     guestRflags |= (1ULL << 1);                 // architectural fixed bit
     guestRflags &= ~((1ULL << 17) |             // VM (invalid in long mode)
                       (1ULL << 19) |             // VIF
@@ -1902,18 +2087,30 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // VM Execution Controls
     // ==============================================================================
 
-    const u32 pinCtlMsr = ControlMsr(Vcpu->VmxBasic,
-                                     MSR_IA32_VMX_PINBASED_CTLS,
-                                     MSR_IA32_VMX_TRUE_PINBASED_CTLS);
-    const u32 procCtlMsr = ControlMsr(Vcpu->VmxBasic,
-                                      MSR_IA32_VMX_PROCBASED_CTLS,
-                                      MSR_IA32_VMX_TRUE_PROCBASED_CTLS);
-    const u32 exitCtlMsr = ControlMsr(Vcpu->VmxBasic,
-                                      MSR_IA32_VMX_EXIT_CTLS,
-                                      MSR_IA32_VMX_TRUE_EXIT_CTLS);
-    const u32 entryCtlMsr = ControlMsr(Vcpu->VmxBasic,
-                                       MSR_IA32_VMX_ENTRY_CTLS,
-                                       MSR_IA32_VMX_TRUE_ENTRY_CTLS);
+    const VmxControlGeneration generation =
+        SelectVmxControlGeneration(Vcpu->VmxProfile);
+    u32 pinCtlMsr = 0;
+    u32 procCtlMsr = 0;
+    u32 exitCtlMsr = 0;
+    u32 entryCtlMsr = 0;
+    switch (generation) {
+        case VmxGenerationLegacy:
+            pinCtlMsr = MSR_IA32_VMX_PINBASED_CTLS;
+            procCtlMsr = MSR_IA32_VMX_PROCBASED_CTLS;
+            exitCtlMsr = MSR_IA32_VMX_EXIT_CTLS;
+            entryCtlMsr = MSR_IA32_VMX_ENTRY_CTLS;
+            break;
+        case VmxGenerationTrue:
+        case VmxGenerationTrueSecondary:
+        case VmxGenerationTrueTertiary:
+            pinCtlMsr = MSR_IA32_VMX_TRUE_PINBASED_CTLS;
+            procCtlMsr = MSR_IA32_VMX_TRUE_PROCBASED_CTLS;
+            exitCtlMsr = MSR_IA32_VMX_TRUE_EXIT_CTLS;
+            entryCtlMsr = MSR_IA32_VMX_TRUE_ENTRY_CTLS;
+            break;
+        default:
+            return false;
+    }
 
     u32 pinCtl = AdjustControls(0, pinCtlMsr);
     // Intel requires a few reserved pin bits to be one (normally 0x16).
@@ -1938,23 +2135,23 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // does not see RDTSCP/INVPCID/XSAVES in CPUID and then receive #UD in the
     // guest because VMX secondary controls were left disabled.
     u32 secondaryRequested = 0;
-    int cpuidRegs[4] = {};
-    __cpuid(cpuidRegs, 0);
-    const int maxBasicLeaf = cpuidRegs[0];
-    if (maxBasicLeaf >= 7) {
-        __cpuidex(cpuidRegs, 7, 0);
-        if (cpuidRegs[1] & (1 << 10)) secondaryRequested |= SECONDARY_ENABLE_INVPCID;
+    const u32 profile = Vcpu->VmxProfile;
+    const bool hasSecondaryControls =
+        (profile & VmxProfileSecondaryControls) != 0;
+    if (hasSecondaryControls) {
+        if ((profile & VmxProfileInvpcid) != 0) {
+            secondaryRequested |= SECONDARY_ENABLE_INVPCID;
+        }
+        if ((profile & VmxProfileRdtscp) != 0) {
+            secondaryRequested |= SECONDARY_ENABLE_RDTSCP;
+        }
     }
-    if (g_XsavesEnabled) secondaryRequested |= SECONDARY_ENABLE_XSAVES;
-    // XSAVES is enabled only after InitializeVmxFeatureContract() verified the
-    // compacted save size, IA32_XSS enumeration, and paired CET controls.
-    // RDTSCP/INVPCID are ordinary guest instructions and are safe to expose
-    // when the CPU advertises them.
-    __cpuidex(cpuidRegs, 0x80000000, 0);
-    const u32 maxExtendedLeaf = static_cast<u32>(cpuidRegs[0]);
-    if (maxExtendedLeaf >= 0x80000001) {
-        __cpuidex(cpuidRegs, 0x80000001, 0);
-        if (cpuidRegs[3] & (1 << 27)) secondaryRequested |= SECONDARY_ENABLE_RDTSCP;
+    if (g_XsavesEnabled) {
+        if (!hasSecondaryControls ||
+            (profile & VmxProfileXsaves) == 0) {
+            return false;
+        }
+        secondaryRequested |= SECONDARY_ENABLE_XSAVES;
     }
 
     // MSR handling is part of the supported VM-exit contract. CPUID is
@@ -2010,6 +2207,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // encode mandatory-one bits in the low half; those bits must be written
     // even when this monitor does not request optional tertiary features.
     if (procCtl & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) {
+        if ((profile & VmxProfileTertiaryControls) == 0) return false;
         u64 tertiaryCtl = 0;
         __try {
             tertiaryCtl = AdjustControls64(0, MSR_IA32_VMX_PROCBASED_CTLS3);
@@ -2293,6 +2491,19 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                          g_XsavesEnabled ? localXss : 0ULL,
                          g_CetVmcsEnabled ? 1U : 0U);
         vcpu->VmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
+        vcpu->VmxProfile = BuildVmxCapabilityProfile(
+            vcpu->VmxBasic, g_XsavesEnabled != 0, g_CetVmcsEnabled != 0);
+        constexpr u32 immutableProfileMask =
+            VmxProfileXsaves | VmxProfileCetVmcs;
+        if ((vcpu->VmxProfile & immutableProfileMask) !=
+            (g_VmxCapabilityProfile & immutableProfileMask)) {
+            HV_VERBOSE_PRINT("[HV] CPU %u VMX generation profile mismatch: "
+                             "local=0x%X expected=0x%X immutable=0x%X\n", id,
+                             vcpu->VmxProfile, g_VmxCapabilityProfile,
+                             immutableProfileMask);
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
         vcpu->RevisionId = static_cast<u32>(vcpu->VmxBasic) &
                            VMX_BASIC_REVISION_MASK;
         const u64 vcpuRegionSize = (vcpu->VmxBasic >> 32) & 0x1FFFULL;
@@ -2490,7 +2701,7 @@ ULONG_PTR StopHvCallback(ULONG_PTR Context) {
     HV_VERBOSE_PRINT("[HV] CPU %u stop callback: state=%ld vmexits=%ld\n", id, state,
                      vcpu->VmExitCount);
     if (state == VcpuStopped || state == VcpuFailed || state == VcpuParked ||
-        state == VcpuUninitialized) {
+        state == VcpuTearingDown || state == VcpuUninitialized) {
         return 0;
     }
     if (state == VcpuStarting) {
@@ -2518,6 +2729,9 @@ ULONG_PTR StopHvCallback(ULONG_PTR Context) {
         if (state == VcpuVmxOn) {
             __writecr0(vcpu->OriginalCr0);
             __writecr4(vcpu->OriginalCr4);
+            if (g_XsavesEnabled) {
+                (void)WriteMsrSafe(MSR_IA32_XSS, vcpu->HostXss);
+            }
         }
         InterlockedExchange(&vcpu->State, VcpuStopped);
     }
@@ -2534,14 +2748,32 @@ ULONG_PTR StopHvCallback(ULONG_PTR Context) {
 
 // ==============================================================================
 // Public API
-// ==============================================================================
+// ===============================================================================
+
+static void StopHypervisorInternal(bool startRollback);
+
+// KeIpiGenericCall already sends one synchronized IPI to every active
+// processor, including processors in all processor groups. Calling it once is
+// important: repeating the broadcast per group would invoke VMXON/VMLAUNCH a
+// second time on processors that already own a live VMCS.
+static ULONG_PTR BroadcastToAllProcessorGroups(
+    PKIPI_BROADCAST_WORKER callback) {
+    return callback ? KeIpiGenericCall(callback, 0) : 0;
+}
 
 extern "C" NTSTATUS StartHypervisor() {
-    if (InterlockedCompareExchange(&g_HvLifecycle, 1, 0) != 0) {
+    if (g_HvImagePinned != 0 || g_VcpuData != nullptr) {
+        return STATUS_DEVICE_BUSY;
+    }
+    if (InterlockedCompareExchange(&g_HvLifecycle,
+                                   kHvLifecycleStarting,
+                                   kHvLifecycleIdle) != kHvLifecycleIdle) {
         return STATUS_DEVICE_BUSY;
     }
     auto rejectStart = [](NTSTATUS status) -> NTSTATUS {
-        InterlockedExchange(&g_HvLifecycle, 0);
+        InterlockedCompareExchange(&g_HvLifecycle,
+                                    kHvLifecycleIdle,
+                                    kHvLifecycleStarting);
         return status;
     };
     // Keep this exported entry point safe even if a future caller bypasses
@@ -2551,8 +2783,9 @@ extern "C" NTSTATUS StartHypervisor() {
         DbgPrint("[HV] StartHypervisor rejected by the VMX capability gate\n");
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
-    DbgPrint("[HV] StartHypervisor: contract CET_VMCS=%u XSAVES=%u\n",
-             g_CetVmcsEnabled ? 1U : 0U, g_XsavesEnabled ? 1U : 0U);
+    DbgPrint("[HV] StartHypervisor: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
+             g_VmxCapabilityProfile, g_CetVmcsEnabled ? 1U : 0U,
+             g_XsavesEnabled ? 1U : 0U);
 
     int regs[4] = {};
     __cpuidex(regs, 0x80000000, 0);
@@ -2664,9 +2897,7 @@ extern "C" NTSTATUS StartHypervisor() {
                          g_VcpuData[i].VmcsVirt ? 1U : 0U,
                          g_VcpuData[i].MsrBitmapVirt ? 1U : 0U,
                          g_VcpuData[i].HostStack ? 1U : 0U);
-                InterlockedExchange(&g_HvLifecycle, 3);
-                StopHypervisor();
-                InterlockedExchange(&g_HvLifecycle, 0);
+                StopHypervisorInternal(true);
                 return STATUS_INSUFFICIENT_RESOURCES;
         }
         DbgPrint("[HV] CPU %u allocations: vmxon_pa=0x%llX vmcs_pa=0x%llX "
@@ -2676,7 +2907,7 @@ extern "C" NTSTATUS StartHypervisor() {
                  reinterpret_cast<u64>(g_VcpuData[i].HostStack));
     }
 
-    KeIpiGenericCall(EnableHvCallback, 0);
+    BroadcastToAllProcessorGroups(EnableHvCallback);
 
     const u32 expected = ExpectedLaunchProcessorCount();
     u32 ok = 0;
@@ -2706,13 +2937,11 @@ extern "C" NTSTATUS StartHypervisor() {
         DbgPrint("[HV] StartHypervisor rejected: only %u/%u expected processors entered VMX\n",
                 ok, expected);
 
-        InterlockedExchange(&g_HvLifecycle, 3);
-        StopHypervisor();
-        InterlockedExchange(&g_HvLifecycle, 0);
+        StopHypervisorInternal(true);
         return STATUS_NOT_SUPPORTED;
     }
 
-    InterlockedExchange(&g_HvLifecycle, 2);
+    InterlockedExchange(&g_HvLifecycle, kHvLifecycleRunning);
     return STATUS_SUCCESS;
 }
 
@@ -2720,6 +2949,40 @@ static bool HasParkedVcpu() {
     if (!g_VcpuData) return false;
     for (u32 i = 0; i < g_ProcessorCount; ++i) {
         if (g_VcpuData[i].State == VcpuParked) return true;
+    }
+    return false;
+}
+
+static bool HasLiveVcpu() {
+    if (!g_VcpuData) return false;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        const long state = g_VcpuData[i].State;
+        if (state == VcpuLaunched || state == VcpuVmxOn ||
+            state == VcpuStarting || state == VcpuTearingDown ||
+            state == VcpuParked) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A failed launch can still leave VMX active when control returned through an
+// exception or an unexpected assembly path. Treat every non-terminal state as
+// live so teardown never frees a VMCS or host stack that hardware may use.
+static bool HasUnresolvedVcpu() {
+    if (!g_VcpuData) return false;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        const long state = g_VcpuData[i].State;
+        const long stage = g_VcpuData[i].LaunchStage;
+        if (state == VcpuFailed && stage >= 4 && stage < 6) {
+            // A failed marker before AbortHvLaunch can still be reached while
+            // the processor remains in VMX non-root operation.
+            return true;
+        }
+        if (state != VcpuStopped && state != VcpuFailed &&
+            state != VcpuUninitialized) {
+            return true;
+        }
     }
     return false;
 }
@@ -2736,63 +2999,82 @@ static void PinImageForParkedCpu() {
     HV_VERBOSE_PRINT("[HV] parked CPU quarantined; driver image pinned\n");
 }
 
-extern "C" void StopHypervisor() {
+static void StopHypervisorInternal(bool startRollback) {
+    const LONG expected = startRollback ? kHvLifecycleStarting
+                                        : kHvLifecycleRunning;
+    if (InterlockedCompareExchange(&g_HvLifecycle,
+                                   kHvLifecycleStopping,
+                                   expected) != expected) {
+        // Only the start owner or the single public stop owner may tear down
+        // VMX state. Concurrent callers leave the owner's rendezvous intact.
+        return;
+    }
+
     if (!g_VcpuData) {
-        InterlockedCompareExchange(&g_HvLifecycle, 0, 3);
+        g_ProcessorCount = 0;
+        g_HostCr3 = 0;
+        g_VmxBasic = 0;
+        g_VmxRequires32BitPhysicalAddress = false;
+        InterlockedExchange(&g_HvLifecycle, kHvLifecycleIdle);
         return;
     }
-    const long lifecycle = g_HvLifecycle;
-    if (lifecycle == 1) {
-        // A concurrent stop must not race a callback that is still preparing
-        // VMX state. The owner of the start operation performs its own rollback.
+
+    // A parked CPU has no native continuation. Keep all code and VMX storage
+    // resident until a debugger or reboot removes the quarantine.
+    if (HasParkedVcpu()) {
+        PinImageForParkedCpu();
+        InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
         return;
     }
-    if (lifecycle == 2) {
-        InterlockedCompareExchange(&g_HvLifecycle, 3, 2);
-    } else if (lifecycle == 0) {
-        InterlockedCompareExchange(&g_HvLifecycle, 3, 0);
+
+    // Broadcast the unload VMCALL. A fatal path publishes VcpuParked before
+    // its final VMXOFF, so the post-rendezvous scan closes the park race.
+    BroadcastToAllProcessorGroups(StopHvCallback);
+
+    if (HasParkedVcpu() || HasLiveVcpu() || HasUnresolvedVcpu()) {
+        PinImageForParkedCpu();
+        InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
+        return;
     }
-    {
-        // A parked processor has IF=0 and remains on the private VMX stack;
-        // KeIpiGenericCall cannot wait for a callback from it. Detect this
-        // state before broadcasting the normal unload VMCALL.
-        if (HasParkedVcpu()) {
-            PinImageForParkedCpu();
-            InterlockedExchange(&g_HvLifecycle, 4);
-            return;
-        }
-        // broadcast unload signal
-        KeIpiGenericCall(StopHvCallback, 0);
 
-        if (HasParkedVcpu()) {
-            PinImageForParkedCpu();
-            InterlockedExchange(&g_HvLifecycle, 4);
-            return;
+    for (u32 i = 0; i < g_ProcessorCount; i++) {
+        if (g_VcpuData[i].VmxOnVirt) {
+            MmFreeContiguousMemory(g_VcpuData[i].VmxOnVirt);
         }
-
-        for (u32 i = 0; i < g_ProcessorCount; i++) {
-            const long state = g_VcpuData[i].State;
-            if (state == VcpuLaunched || state == VcpuVmxOn ||
-                state == VcpuStarting ||
-                state == VcpuParked) {
-                // Do not free VMXON/VMCS/host-stack memory while a CPU may
-                // still execute from it.  Leaking here is safer than a
-                // deterministic use-after-free triple fault.
-                HV_VERBOSE_PRINT("[HV] Refusing to free live VMX state on CPU %u "
-                                 "(state %ld)\n", i, state);
-                return;
-            }
+        if (g_VcpuData[i].VmcsVirt) {
+            MmFreeContiguousMemory(g_VcpuData[i].VmcsVirt);
         }
-
-        // free memory
-        for (u32 i = 0; i < g_ProcessorCount; i++) {
-            if (g_VcpuData[i].VmxOnVirt) MmFreeContiguousMemory(g_VcpuData[i].VmxOnVirt);
-            if (g_VcpuData[i].VmcsVirt)  MmFreeContiguousMemory(g_VcpuData[i].VmcsVirt);
-            if (g_VcpuData[i].MsrBitmapVirt) MmFreeContiguousMemory(g_VcpuData[i].MsrBitmapVirt);
-            if (g_VcpuData[i].HostStack) ExFreePoolWithTag(g_VcpuData[i].HostStack, TAG_HVST);
+        if (g_VcpuData[i].MsrBitmapVirt) {
+            MmFreeContiguousMemory(g_VcpuData[i].MsrBitmapVirt);
         }
-        ExFreePoolWithTag(g_VcpuData, TAG_HV00);
-        g_VcpuData = nullptr;
-        InterlockedExchange(&g_HvLifecycle, 0);
+        if (g_VcpuData[i].HostStack) {
+            ExFreePoolWithTag(g_VcpuData[i].HostStack, TAG_HVST);
+        }
     }
+    ExFreePoolWithTag(g_VcpuData, TAG_HV00);
+    g_VcpuData = nullptr;
+    g_ProcessorCount = 0;
+    g_HostCr3 = 0;
+    g_VmxBasic = 0;
+    g_VmxRequires32BitPhysicalAddress = false;
+    InterlockedExchange(&g_HvLifecycle, kHvLifecycleIdle);
+}
+
+extern "C" void StopHypervisor() {
+    StopHypervisorInternal(false);
+}
+
+extern "C" bool IsHypervisorStopComplete() {
+    return g_VcpuData == nullptr && g_HvLifecycle == kHvLifecycleIdle;
+}
+
+extern "C" bool IsHypervisorQuarantined() {
+    return g_HvLifecycle == kHvLifecycleQuarantined ||
+           g_HvImagePinned != 0;
+}
+
+extern "C" void QuarantineHypervisorImage() {
+    if (!g_VcpuData) return;
+    PinImageForParkedCpu();
+    InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
 }

@@ -17,6 +17,9 @@ extern "C" NTSTATUS StartHypervisor();
 
 // stop the hypervisor and release all allocated resources
 extern "C" void StopHypervisor();
+extern "C" bool IsHypervisorStopComplete();
+extern "C" bool IsHypervisorQuarantined();
+extern "C" void QuarantineHypervisorImage();
 
 // Hardware/firmware gate implemented in main.cpp.  The gate is deliberately
 // read-only: it never changes IA32_FEATURE_CONTROL or otherwise claims VMX

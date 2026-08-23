@@ -15,18 +15,28 @@ Designed for research and educational purposes, it transitions the running opera
 * **Compatibility checks**: Refuses to start when required VMX controls or
   state-preservation capabilities are unavailable; nested virtualization is
   intentionally disabled.
+* **All-core production mode**: Launches the validated contract on every
+  active logical processor by default; the single-CPU switch is reserved for
+  explicit bring-up builds.
+* **Generation-aware VMX contract**: Selects legacy/true controls and the
+  available secondary, tertiary, XSAVES, CET, RDTSCP, and INVPCID capabilities
+  per processor. A heterogeneous profile is rejected before VMXON instead of
+  running different VM-exit ABIs at the same time.
 * **State Transparency**: Preserves full GPR and Extended State (XSave/XRstor).
 * **Modern Toolchain**: Built using **VS Code**, **CMake**, and **Ninja** with MSVC.
 
 The VMX setup is deliberately conservative: it refuses VM-entry when the CPU
 forces an execution/interrupt control that this non-nested monitor does not
 emulate, and it never attempts to recover from a VMRESUME/invalid-guest-state
-failure by guessing a return frame.  Such a fatal path parks the affected
-logical processor after VMXOFF; this is safer than escalating into a reset, but
-it still requires kernel-debugger validation on the target machine.  If a CPU
-is parked, unloading is intentionally blocked because that processor is still
-executing code in this image; reboot the test machine (or recover it with a
-kernel debugger) instead of forcing driver removal.
+failure by guessing a return frame.  A VMRESUME failure first validates the
+saved native context.  If the frame is not provably safe, the driver restores
+the host XCR0/XSS/KERNEL_GS_BASE snapshot and raises the dedicated bugcheck
+`0x200`; its parameters contain the CPU, saved VM-exit reason, guest RIP, and
+guest RSP.  This intentionally stops the machine while the original fault is
+still visible in KD instead of waiting for a watchdog timeout.  If a callback
+ever cannot prove that every processor left VMX, unload is quarantined and the
+driver image and VMX allocations remain resident; reboot the isolated test
+machine or recover it with KD rather than forcing removal.
 
 The exit frame supports ordinary XSAVE on legacy Intel processors. On newer
 Windows 11 systems, XSAVES is enabled only when CPUID.(D,1), the VMX secondary
@@ -41,10 +51,12 @@ controls completely. The common Windows 11 25H2 state
 when the paired VMX CET entry/exit controls are available.
 
 The debugger log is staged by contract and processor. `[HV] XSTATE contract`
-and `[HV] VMX control contract` describe the feature gate, `CPU <n> VMCS`
-records per-processor VMX setup and launch values, and the first 16 VM-exits
-per processor include reason, RIP, RSP, qualification, and flags. Fatal or
-unsupported exits print the guest CR3/CR4 and are parked rather than resumed.
+and `[HV] VMX control contract` describe the feature gate and selected
+generation profile, `CPU <n> VMCS` records per-processor VMX setup and launch
+values, and the first 16 VM-exits per processor include reason, RIP, RSP,
+qualification, and flags. Fatal or unsupported exits print the guest CR3/CR4;
+only a context that passes the native teardown checks is resumed, while an
+unsafe context takes the documented bugcheck path.
 
 ## Scope
 

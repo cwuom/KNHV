@@ -7,6 +7,10 @@ extern PrepareHvCallback:proc
 extern AbortHvLaunch:proc
 extern MarkCurrentVcpuLaunched:proc
 extern MarkCurrentVcpuParked:proc
+extern MarkCurrentVcpuTearingDown:proc
+extern MarkCurrentVcpuStopped:proc
+extern HandleVmResumeFailure:proc
+extern HvFatalBugCheck:proc
 extern g_LinearAddressBits:byte
 extern g_CetVmcsEnabled:byte
 extern g_XsavesEnabled:byte
@@ -139,8 +143,8 @@ HvVmExitEntryPoint proc
     ; before allocating the private frame so an IRQ cannot enter the kernel
     ; while RSP still points at the VMX host stack.
     cli
-    ; 1180h is 64-byte aligned and leaves room for the full GuestContext plus
-    ; the reserved host KERNEL_GS_BASE shadow at frame offset 0x1178.
+    ; 1180h is this driver's fixed frame size and is independent of VMCS
+    ; encodings; the capability gate keeps the XSAVE area below 1000h.
     sub rsp, 1180h
 
     mov [rsp + 1000h], rax
@@ -385,6 +389,10 @@ vmxHaltHostMasksReady:
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
+    mov rcx, rsp
+    sub rsp, 20h
+    call HvFatalBugCheck
+    add rsp, 20h
     ; Keep interrupts disabled while parked. The current RSP is the private
     ; VMX stack, not a Windows thread stack, so an IRQ here could enter the
     ; kernel on an invalid stack and create a second fault.
@@ -394,10 +402,34 @@ vmxHaltLoop:
 
 vmxResumeFailure:
     ; A failed VMRESUME means the VMCS contains invalid guest state or a
-    ; malformed control field.  There is no architecturally defined guest
-    ; continuation in this case; attempting IRET with the partially-invalid
-    ; VMCS is exactly the path that turns an entry failure into a triple fault.
-    ; Leave VMX root and park the processor instead.
+    ; malformed control field.  Ask C++ to validate the saved frame before
+    ; choosing native teardown; only an invalid frame falls through to park.
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    cmp byte ptr [g_XsavesEnabled], 0
+    je vmxResumeFailureHostMasksReady
+    mov rax, [rsp + HOST_XSS_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_XSS
+    wrmsr
+vmxResumeFailureHostMasksReady:
+    mov rax, [rsp + HOST_KGS_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_KERNEL_GS_BASE
+    wrmsr
+    mov rcx, rsp
+    sub rsp, 20h
+    call HandleVmResumeFailure
+    add rsp, 20h
+    cmp qword ptr [rsp + CTX_HALT_VM], 0
+    jne vmxHalt
+    cmp qword ptr [rsp + CTX_ABORT_VM], 0
+    jne vmxAbort
     jmp vmxHalt
 HvVmExitEntryPoint endp
 
@@ -416,6 +448,11 @@ HvRestoreStateAndReturn proc
     ; vector through the host IDT while executing under guest address space.
     cli
     mov r10, rcx                         ; host GuestContext pointer
+    mov rbx, r10
+    sub rsp, 20h
+    call MarkCurrentVcpuTearingDown
+    add rsp, 20h
+    mov r10, rbx
 
     mov r11, [r10 + CTX_GUEST_RSP]
     mov r12, [r10 + CTX_GUEST_CS]
@@ -574,8 +611,20 @@ restoreSpillCanonicalCompare:
     mov [r9 + RST_GUEST_CS], r12
     mov [r9 + RST_GUEST_SS], r13
     mov [r9 + RST_FRAME_RSP], r8
+    mov rsi, r8
+    mov rbp, r9
 
-    ; Restore VMX-managed MSRs while r10 still references host context.
+    ; Leave VMX while all host MSRs and the host page table are still active.
+    vmxoff
+    mov r10, rbx
+    sub rsp, 20h
+    call MarkCurrentVcpuStopped
+    add rsp, 20h
+    mov r10, rbx
+    mov r9, rbp
+    mov r8, rsi
+
+    ; Restore VMX-managed MSRs after the lifecycle marker has run.
     mov ecx, MSR_FS_BASE
     mov rax, [r10 + CTX_GUEST_FS]
     mov rdx, rax
@@ -654,9 +703,7 @@ restoreGuestXsave:
 
 restoreGuestStateDone:
 
-    ; VMXOFF returns to the original Windows context. Keep the guest XSS that
-    ; was restored above; it may differ from the host value after Windows has
-    ; dynamically changed IA32_XSS while the monitor was active.
+    ; Keep the guest XSS that was restored above for the final IRET context.
 
     ; The CET VMCS path is disabled for the current contract. Keep the writes
     ; conditional so a future CET implementation cannot fault on old Intel.
@@ -679,9 +726,8 @@ restoreGuestStateDone:
     wrmsr
 restoreGuestCetDone:
 
-    ; VMXOFF leaves CR4.VMXE set.  Install the guest CR4/CR3 pair only after
-    ; all host-context reads are complete.
-    vmxoff
+    ; VMXOFF leaves CR4.VMXE set. Install the guest CR4/CR3 pair only after
+    ; all host-context reads and lifecycle callbacks are complete.
     mov rax, [r9 + RST_CR0]
     mov cr0, rax
     mov rax, [r9 + RST_CR4]
@@ -749,6 +795,10 @@ restoreInvalidHostMasksReady:
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
+    mov rcx, r10
+    sub rsp, 20h
+    call HvFatalBugCheck
+    add rsp, 20h
     ; Keep interrupts disabled while parked for the same private-stack reason
     ; as the VM-exit fatal path above.
 restoreInvalidLoop:
@@ -810,8 +860,13 @@ HvLaunchGuest proc frame
     test rax, CR4_VMXE
     jz launchNotVmx
 
+    ; GuestStartThunk executes a RET.  The call to HvLaunchGuest has already
+    ; pushed the wrapper continuation at [RSP+200h-8]; point guest RSP at that
+    ; return slot so the successful VM-entry returns to enableHvDone exactly
+    ; as the original call would.  Using [RSP+200h] skips the return address and
+    ; transfers control through an uninitialized shadow-space value.
     mov rax, rsp
-    add rax, 200h
+    add rax, 1F8h
     mov ecx, VMCS_GUEST_RSP
     mov rdx, rax
     vmwrite rcx, rdx

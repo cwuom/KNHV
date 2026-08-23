@@ -14,6 +14,7 @@ using u8  = unsigned __int8;
 // constants
 constexpr u64 HYPERVISOR_MAGIC = 0x13371337;
 constexpr u64 VMCALL_UNLOAD    = 0xDEADBEEF;
+// these offsets belong to this software frame, not to CPU-specific VMCS fields
 // HvVmExitEntryPoint reserves the first 0x1000 bytes for XSAVE and starts the
 // GPR/GuestContext fields at offset 0x1000. Keep the limit in a shared header
 // so a future capability gate cannot silently overwrite the saved registers.
@@ -22,6 +23,13 @@ constexpr u64 VMEXIT_FRAME_SIZE = 0x1180;
 constexpr u64 VMEXIT_HOST_XCR0_OFFSET = 0x1168;
 constexpr u64 VMEXIT_HOST_XSS_OFFSET = 0x1170;
 constexpr u64 VMEXIT_HOST_KGS_OFFSET = 0x1178;
+static_assert(VMEXIT_XSAVE_MAX <= VMEXIT_FRAME_SIZE, "XSAVE frame exceeds VM-exit frame");
+static_assert(VMEXIT_HOST_XCR0_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
+              "host XCR0 slot exceeds VM-exit frame");
+static_assert(VMEXIT_HOST_XSS_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
+              "host XSS slot exceeds VM-exit frame");
+static_assert(VMEXIT_HOST_KGS_OFFSET + sizeof(u64) == VMEXIT_FRAME_SIZE,
+              "host KGS slot must terminate VM-exit frame");
 // Returned by GuestStartThunk after a successful VM-entry.  A distinct value
 // lets the C++ launch callback distinguish the normal guest continuation from
 // a VMLAUNCH failure (which returns VMX flags instead).
@@ -40,6 +48,8 @@ enum VcpuState : long {
     // Fatal VM-exit/restore path parked this processor after VMXOFF.  Its
     // host stack and the driver image must remain resident.
     VcpuParked        = 6,
+    // native teardown has left the guest path and is completing VMXOFF
+    VcpuTearingDown   = 7,
 };
 
 struct __declspec(align(64)) GuestContext {
@@ -148,7 +158,9 @@ struct VcpuContext {
     u64   OriginalCr4;
     u64   VmxBasic;
     u32   RevisionId;
-    u32   Reserved;
+    // Capability profile selected for this logical processor.  The assembly
+    // save contract is global, so mixed profiles are rejected before VMXON.
+    u32   VmxProfile;
     volatile long VmcsWriteFailed;
 
     // IA32_KERNEL_GS_BASE is not part of VMCS state and SWAPGS does not cause

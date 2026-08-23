@@ -210,13 +210,11 @@ bool IsVmxSupported() {
         // or another type-1 monitor.  A driver that cannot prove VMXON is
         // already permitted must fail closed before allocating VMX state.
         DbgPrint("[HV] IA32_FEATURE_CONTROL=0x%llX\n", featureControl);
-        if ((featureControl & IA32_FEATURE_CONTROL_LOCK) != 0 &&
-            (featureControl & IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX) == 0) {
-            return RejectVmx("VMXON outside SMX is disabled by IA32_FEATURE_CONTROL");
-        }
-        if ((featureControl & IA32_FEATURE_CONTROL_LOCK) == 0) {
-            DbgPrint("[HV] IA32_FEATURE_CONTROL is unlocked; each CPU will "
-                     "provision LOCK|VMXON_OUTSIDE_SMX before VMXON\n");
+        if ((featureControl & (IA32_FEATURE_CONTROL_LOCK |
+                               IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) !=
+            (IA32_FEATURE_CONTROL_LOCK |
+             IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) {
+            return RejectVmx("IA32_FEATURE_CONTROL does not already permit VMXON");
         }
 
         const u64 vmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
@@ -257,7 +255,16 @@ void DriverUnload(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);
     DbgPrint("[HV] Unloading...\n");
     StopHypervisor();
-    DbgPrint("[HV] Stopped.\n");
+    if (IsHypervisorStopComplete()) {
+        DbgPrint("[HV] Stopped.\n");
+    } else if (IsHypervisorQuarantined()) {
+        DbgPrint("[HV] Stop quarantined live VMX state; reboot or KD recovery "
+                 "is required and the image remains pinned.\n");
+    } else {
+        QuarantineHypervisorImage();
+        DbgPrint("[HV] Stop did not reach a terminal state; refusing to claim "
+                 "that the monitor stopped.\n");
+    }
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
