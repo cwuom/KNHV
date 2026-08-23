@@ -181,12 +181,31 @@ HvVmExitEntryPoint proc
     shl rdx, 20h
     or rax, rdx
     mov [rsp + CTX_GUEST_KGS], rax
+    xor r10d, r10d
     mov ecx, VMCS_GUEST_DR7
     vmread rax, rcx
+    pushfq
+    pop rdx
+    test dl, 041h
+    jz vmxGuestDr7ReadReady
+    xor eax, eax
+    mov r10d, 1
+vmxGuestDr7ReadReady:
     mov [rsp + CTX_GUEST_DR7], rax
     mov ecx, VMCS_GUEST_DEBUGCTL
     vmread rax, rcx
+    pushfq
+    pop rdx
+    test dl, 041h
+    jz vmxGuestDebugctlReadReady
+    xor eax, eax
+    mov r10d, 1
+vmxGuestDebugctlReadReady:
     mov [rsp + CTX_GUEST_DEBUGCTL], rax
+    test r10d, r10d
+    jz vmxDebugStateReady
+    mov qword ptr [rsp + CTX_HALT_VM], 1
+vmxDebugStateReady:
     mov rax, [rsp + HOST_KGS_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
@@ -867,11 +886,6 @@ HvVmWrite proc
     pop rax
     ret
 HvVmWrite endp
-
-HvVmRead proc
-    vmread rax, rcx
-    ret
-HvVmRead endp
 
 ; RCX = VMCS field, RDX = output value. RAX returns VMREAD flags.
 HvVmReadChecked proc

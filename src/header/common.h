@@ -237,6 +237,7 @@ struct VcpuContext {
     volatile u64 LastVmResumeFlags;
     volatile long LastExitAction;
     volatile long VmResumeAttempts;
+    u64 LastExitInstructionLength;
     u64 LastExitQualification;
     u64 LastGuestRip;
     u64 LastGuestRsp;

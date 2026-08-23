@@ -28,7 +28,6 @@ extern "C" {
     u64 HvVmClear(u64* Phys);
     u64 HvVmPtrLd(u64* Phys);
     u64 HvVmWrite(u64 Field, u64 Value);
-    u64  HvVmRead(u64 Field);
     u64 HvVmReadChecked(u64 Field, u64* Value);
 
     u64 HvLaunchGuest();
@@ -99,6 +98,7 @@ static u64 g_EnumeratedXssMask = 0;
 static u64 g_SupportedXssMask = 0;
 static u64 g_HostXssMask = 0;
 static u64 g_HostXcr0Mask = 0;
+static u64 g_DebugctlMask = IA32_DEBUGCTL_ARCHITECTURAL_MASK;
 static u32 g_XsaveStateSize = 0;
 
 // VMX control and state-save capabilities vary across Intel generations. The
@@ -178,6 +178,7 @@ static __forceinline u32 CurrentProcessorIndex();
 static __forceinline u32 ControlMsr(u64 vmxBasic, u32 legacyMsr, u32 trueMsr);
 static __forceinline bool IsCanonical(u64 value);
 static bool ReadMsrSafe(u32 msr, u64* value);
+static u64 GetDebugctlCapabilityMask();
 static bool UpdateNativeTeardownContract(VcpuContext* vcpu);
 
 static u32 BuildVmxCapabilityProfile(u64 vmxBasic, bool xsaves,
@@ -357,6 +358,7 @@ bool InitializeVmxFeatureContract() {
         g_SupportedXssMask = 0;
         g_HostXssMask = 0;
         g_HostXcr0Mask = 0;
+        g_DebugctlMask = kDebugctlArchitecturalMask;
         g_XsaveStateSize = 0;
         g_VmxCapabilityProfile = 0;
     }
@@ -372,6 +374,7 @@ bool InitializeVmxFeatureContract() {
     g_SupportedXssMask = 0;
     g_HostXssMask = 0;
     g_HostXcr0Mask = 0;
+    g_DebugctlMask = GetDebugctlCapabilityMask();
     g_XsaveStateSize = 0;
     g_VmxCapabilityProfile = 0;
 
@@ -601,7 +604,21 @@ static __forceinline bool IsValidPatValue(u64 value) {
 }
 
 static __forceinline bool IsValidDebugctl(u64 value) {
-    return (value & ~kDebugctlArchitecturalMask) == 0;
+    return (value & ~g_DebugctlMask) == 0;
+}
+
+static u64 GetDebugctlCapabilityMask() {
+    u64 mask = kDebugctlArchitecturalMask;
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    if (static_cast<u32>(regs[0]) < 7) {
+        return mask & ~IA32_DEBUGCTL_BUS_LOCK_DETECT;
+    }
+    __cpuidex(regs, 7, 0);
+    if ((static_cast<u32>(regs[3]) & (1U << 24)) == 0) {
+        mask &= ~IA32_DEBUGCTL_BUS_LOCK_DETECT;
+    }
+    return mask;
 }
 
 static __forceinline bool IsValidCr3(u64 value, u64 cr4 = __readcr4()) {
@@ -1012,6 +1029,11 @@ bool HandleVmCall(GuestContext* Ctx) {
     // calling convention: rcx = magic, rdx = command
     if ((Ctx->GuestCs & 3U) == 0 &&
         Ctx->Rcx == HYPERVISOR_MAGIC && Ctx->Rdx == VMCALL_UNLOAD) {
+        u64 exitLength = 0;
+        const u32 cpuId = CurrentProcessorIndex();
+        if (g_VcpuData && cpuId < g_ProcessorCount) {
+            exitLength = g_VcpuData[cpuId].LastExitInstructionLength;
+        }
         HV_VERBOSE_PRINT("[HV] unload VMCALL: cpu=%u rip=0x%llX rsp=0x%llX "
                          "rflags=0x%llX IF=%u cs=0x%llX ss=0x%llX\n",
                          CurrentProcessorIndex(), Ctx->GuestRip, Ctx->GuestRsp,
@@ -1023,7 +1045,7 @@ bool HandleVmCall(GuestContext* Ctx) {
         RequestSafeExit(Ctx);
         HV_VERBOSE_PRINT("[HV] unload VMCALL decision: cpu=%u abort=%llu halt=%llu "
                          "next_rip=0x%llX\n", CurrentProcessorIndex(), Ctx->AbortVm,
-                         Ctx->HaltVm, Ctx->GuestRip + HvVmRead(VM_EXIT_INSTRUCTION_LEN));
+                         Ctx->HaltVm, Ctx->GuestRip + exitLength);
         return true;
     }
     // The unload token is a ring-0 service call.  A guest CPL3 attempt must
@@ -1039,13 +1061,13 @@ bool HandleMsrRead(GuestContext* Ctx) {
     // VMX entry/exit state owns these MSRs.  Read the guest copy rather than
     // exposing the host copy while executing in VMX root mode.
     if (msrIndex == MSR_FS_BASE) {
-        const u64 value = HvVmRead(GUEST_FS_BASE);
+        const u64 value = Ctx->GuestFsBase;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
     }
     if (msrIndex == MSR_GS_BASE) {
-        const u64 value = HvVmRead(GUEST_GS_BASE);
+        const u64 value = Ctx->GuestGsBase;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
@@ -1057,13 +1079,13 @@ bool HandleMsrRead(GuestContext* Ctx) {
         return true;
     }
     if (msrIndex == MSR_IA32_EFER) {
-        const u64 value = HvVmRead(GUEST_EFER);
+        const u64 value = Ctx->GuestEfer;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
     }
     if (msrIndex == MSR_IA32_PAT) {
-        const u64 value = HvVmRead(GUEST_PAT);
+        const u64 value = Ctx->GuestPat;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
@@ -1075,19 +1097,19 @@ bool HandleMsrRead(GuestContext* Ctx) {
         return true;
     }
     if (msrIndex == MSR_IA32_SYSENTER_CS) {
-        const u64 value = HvVmRead(GUEST_SYSENTER_CS);
+        const u64 value = Ctx->GuestSysenterCs;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
     }
     if (msrIndex == MSR_IA32_SYSENTER_ESP) {
-        const u64 value = HvVmRead(GUEST_SYSENTER_ESP);
+        const u64 value = Ctx->GuestSysenterEsp;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
     }
     if (msrIndex == MSR_IA32_SYSENTER_EIP) {
-        const u64 value = HvVmRead(GUEST_SYSENTER_EIP);
+        const u64 value = Ctx->GuestSysenterEip;
         Ctx->Rax = static_cast<u32>(value);
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
@@ -1185,7 +1207,7 @@ bool HandleMsrWrite(GuestContext* Ctx) {
         return true;
     }
     if (msrIndex == MSR_IA32_EFER) {
-        const u64 oldValue = HvVmRead(GUEST_EFER);
+        const u64 oldValue = Ctx->GuestEfer;
         // This late-launch monitor cannot virtualize the long-mode transition
         // bits. Preserve every non-writable bit exactly and inject #GP instead
         // of silently rewriting an illegal architectural request.
@@ -1717,6 +1739,7 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     vcpu->LastExitReasonRaw = rawExitReason;
     vcpu->LastExitReasonBasic = basicExitReason;
     vcpu->LastExitEntryFailure = entryFailure ? 1U : 0U;
+    vcpu->LastExitInstructionLength = ExitLen;
     if (entryFailure) {
         // A VM-entry failure is not a running guest exit. The VMCS guest
         // fields cannot be used to manufacture an IRET continuation here.
@@ -2001,8 +2024,8 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
             if (logExit) {
             HV_VERBOSE_PRINT("[HV] CR access cpu=%u count=%ld qual=0x%llX "
                              "cr3=0x%llX cr4=0x%llX\n", cpuId, exitCount,
-                             HvVmRead(EXIT_QUALIFICATION), HvVmRead(GUEST_CR3),
-                             HvVmRead(GUEST_CR4));
+                             vcpu->LastExitQualification, Ctx->GuestCr3,
+                             Ctx->GuestCr4);
             }
             AdvanceRip = HandleCrAccess(Ctx);
             break;
@@ -2070,7 +2093,7 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
             HV_VERBOSE_PRINT("[HV] UNSUPPORTED VM-exit cpu=%u count=%ld reason=%llu "
                              "rip=0x%llX rsp=0x%llX qual=0x%llX\n",
                              cpuId, exitCount, ExitReason, Ctx->GuestRip,
-                             Ctx->GuestRsp, HvVmRead(EXIT_QUALIFICATION));
+                             Ctx->GuestRsp, vcpu->LastExitQualification);
             RequestSafeExit(Ctx);
             AdvanceRip = false;
             break;
@@ -2597,37 +2620,74 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(CONTROL_CR4_GUEST_HOST_MASK, CR4_VMXE);
     VmWriteChecked(CONTROL_CR4_READ_SHADOW, guestCr4 & ~CR4_VMXE);
 
-    const bool success = mutableVcpu->VmcsWriteFailed == 0;
+    bool success = mutableVcpu->VmcsWriteFailed == 0;
+    u64 vmcsHostCr0 = 0;
+    u64 vmcsHostCr3 = 0;
+    u64 vmcsHostCr4 = 0;
+    u64 vmcsHostRip = 0;
+    u64 vmcsHostRsp = 0;
+    u64 vmcsHostCs = 0;
+    u64 vmcsHostSs = 0;
+    u64 vmcsHostTr = 0;
+    u64 vmcsGuestCr0 = 0;
+    u64 vmcsGuestCr3 = 0;
+    u64 vmcsGuestCr4 = 0;
+    u64 vmcsGuestRip = 0;
+    u64 vmcsGuestRsp = 0;
+    u64 vmcsGuestRflags = 0;
+    u64 vmcsGuestCs = 0;
+    u64 vmcsGuestSs = 0;
+    u64 vmcsGuestSCet = 0;
+    u64 vmcsGuestSsp = 0;
+    u64 vmcsGuestInterruptSspTable = 0;
+    if (success) {
+        success =
+            VmReadChecked(HOST_CR0, &vmcsHostCr0) &&
+            VmReadChecked(HOST_CR3, &vmcsHostCr3) &&
+            VmReadChecked(HOST_CR4, &vmcsHostCr4) &&
+            VmReadChecked(HOST_RIP, &vmcsHostRip) &&
+            VmReadChecked(HOST_RSP, &vmcsHostRsp) &&
+            VmReadChecked(HOST_CS_SELECTOR, &vmcsHostCs) &&
+            VmReadChecked(HOST_SS_SELECTOR, &vmcsHostSs) &&
+            VmReadChecked(HOST_TR_SELECTOR, &vmcsHostTr) &&
+            VmReadChecked(GUEST_CR0, &vmcsGuestCr0) &&
+            VmReadChecked(GUEST_CR3, &vmcsGuestCr3) &&
+            VmReadChecked(GUEST_CR4, &vmcsGuestCr4) &&
+            VmReadChecked(GUEST_RIP, &vmcsGuestRip) &&
+            VmReadChecked(GUEST_RSP, &vmcsGuestRsp) &&
+            VmReadChecked(GUEST_RFLAGS, &vmcsGuestRflags) &&
+            VmReadChecked(GUEST_CS_SELECTOR, &vmcsGuestCs) &&
+            VmReadChecked(GUEST_SS_SELECTOR, &vmcsGuestSs);
+        if (success && g_CetVmcsEnabled) {
+            success =
+                VmReadChecked(GUEST_S_CET, &vmcsGuestSCet) &&
+                VmReadChecked(GUEST_SSP, &vmcsGuestSsp) &&
+                VmReadChecked(GUEST_INTR_SSP_TABLE,
+                              &vmcsGuestInterruptSspTable);
+        }
+    }
     HV_VERBOSE_PRINT("[HV] CPU %u VMCS setup %s: guest_cr3=0x%llX "
                      "guest_rsp=0x%llX guest_rip=0x%llX guest_rflags=0x%llX "
                      "pin=0x%08X proc=0x%08X sec=0x%08X exit=0x%08X "
                      "entry=0x%08X cet=%u xsaves=%u\n", cpuId,
-                     success ? "succeeded" : "FAILED", __readcr3(),
-                     reinterpret_cast<u64>(GuestSp),
-                     reinterpret_cast<u64>(GuestIp), guestRflags, pinCtl,
-                     procCtl, secCtl, exitCtl, entryCtl,
+                     success ? "succeeded" : "FAILED", vmcsGuestCr3,
+                     vmcsGuestRsp, vmcsGuestRip, vmcsGuestRflags,
+                     pinCtl, procCtl, secCtl, exitCtl, entryCtl,
                      g_CetVmcsEnabled ? 1U : 0U, g_XsavesEnabled ? 1U : 0U);
     if (success) {
         HV_VERBOSE_PRINT("[HV] CPU %u VMCS host: cr0=0x%llX cr3=0x%llX "
                          "cr4=0x%llX rip=0x%llX rsp=0x%llX cs=0x%llX "
                          "ss=0x%llX tr=0x%llX\n", cpuId,
-                         HvVmRead(HOST_CR0), HvVmRead(HOST_CR3),
-                         HvVmRead(HOST_CR4), HvVmRead(HOST_RIP),
-                         HvVmRead(HOST_RSP), HvVmRead(HOST_CS_SELECTOR),
-                         HvVmRead(HOST_SS_SELECTOR),
-                         HvVmRead(HOST_TR_SELECTOR));
+                         vmcsHostCr0, vmcsHostCr3, vmcsHostCr4, vmcsHostRip,
+                         vmcsHostRsp, vmcsHostCs, vmcsHostSs, vmcsHostTr);
         HV_VERBOSE_PRINT("[HV] CPU %u VMCS guest: cr0=0x%llX cr3=0x%llX "
                          "cr4=0x%llX rip=0x%llX rsp=0x%llX rflags=0x%llX "
                          "cs=0x%llX ss=0x%llX cet=0x%llX ssp=0x%llX "
-                         "ist=0x%llX\n", cpuId, HvVmRead(GUEST_CR0),
-                         HvVmRead(GUEST_CR3), HvVmRead(GUEST_CR4),
-                         HvVmRead(GUEST_RIP), HvVmRead(GUEST_RSP),
-                         HvVmRead(GUEST_RFLAGS), HvVmRead(GUEST_CS_SELECTOR),
-                         HvVmRead(GUEST_SS_SELECTOR),
-                         g_CetVmcsEnabled ? HvVmRead(GUEST_S_CET) : 0ULL,
-                         g_CetVmcsEnabled ? HvVmRead(GUEST_SSP) : 0ULL,
-                         g_CetVmcsEnabled ? HvVmRead(GUEST_INTR_SSP_TABLE)
-                                           : 0ULL);
+                         "ist=0x%llX\n", cpuId, vmcsGuestCr0, vmcsGuestCr3,
+                         vmcsGuestCr4, vmcsGuestRip, vmcsGuestRsp,
+                         vmcsGuestRflags, vmcsGuestCs, vmcsGuestSs,
+                         vmcsGuestSCet, vmcsGuestSsp,
+                         vmcsGuestInterruptSspTable);
     }
     return success;
 }
@@ -2684,6 +2744,13 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         __cpuidex(localCpuid, 1, 0);
         if ((localCpuid[2] & (1 << 5)) == 0 ||
             (localCpuid[2] & (1 << 31)) != 0) {
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
+        if (GetDebugctlCapabilityMask() != g_DebugctlMask) {
+            HV_VERBOSE_PRINT("[HV] CPU %u DEBUGCTL capability mismatch: "
+                             "local=0x%llX expected=0x%llX\n", id,
+                             GetDebugctlCapabilityMask(), g_DebugctlMask);
             InterlockedExchange(&vcpu->State, VcpuFailed);
             return 0;
         }
@@ -2969,10 +3036,14 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                                      : vmclearFlags;
         if (!VmxOk(vmclearFlags) || !VmxOk(vmptrldFlags) ||
             !SetupVmcs(vcpu, GuestSp, GuestIp)) {
+            u64 instructionError = 0;
+            if (VmxOk(vmptrldFlags) &&
+                !VmReadChecked(VM_INSTRUCTION_ERROR, &instructionError)) {
+                instructionError = ~0ULL;
+            }
             HV_VERBOSE_PRINT("[HV] CPU %u VMCS setup failed: vmclear=0x%llX "
                              "vmptrld=0x%llX instruction_error=0x%llX\n", id,
-                             vmclearFlags, vmptrldFlags,
-                             VmxOk(vmptrldFlags) ? HvVmRead(VM_INSTRUCTION_ERROR) : 0ULL);
+                             vmclearFlags, vmptrldFlags, instructionError);
             HvVmxOff();
             __writecr0(vcpu->OriginalCr0);
             __writecr4(vcpu->OriginalCr4);

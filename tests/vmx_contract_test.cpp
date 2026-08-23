@@ -211,6 +211,11 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(CTX_GUEST_DR7\s+equ\s+01130h[\s\S]*CTX_GUEST_DEBUGCTL\s+equ\s+01138h)");
   CheckPattern(state, "VMREAD flags are checked", asm_source,
                R"(HvVmReadChecked proc[\s\S]{0,180}vmread r8, rcx[\s\S]{0,180}mov \[rdx\], r8)");
+  Check(state, "C++ has no unchecked VMREAD path",
+        vmm.find("HvVmRead(") == std::string::npos);
+  CheckPattern(state, "guest debug VMREAD failures halt",
+               asm_source,
+               R"(VMCS_GUEST_DR7[\s\S]{0,240}test dl, 041h[\s\S]{0,360}VMCS_GUEST_DEBUGCTL[\s\S]{0,240}test dl, 041h[\s\S]{0,260}CTX_HALT_VM)");
   CheckPattern(state, "VM-exit uses XSAVES", asm_source,
                R"(\bxsaves\s+\[rsp\])");
   CheckPattern(state, "VM-exit uses XRSTORS", asm_source,
@@ -304,11 +309,16 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos);
   CheckPattern(state, "EFER illegal mode changes inject #GP", vmm,
                R"(kWritableEferBits\s*=\s*EFER_SCE\s*\|\s*EFER_NXE[\s\S]{0,300}InjectGuestException\(Ctx,\s*13)");
-  Check(state, "CR writes synchronize the teardown snapshot",
-        vmm.find("c->GuestCr0 = newCr0") != std::string::npos &&
-            vmm.find("c->GuestCr4 = actualCr4") != std::string::npos);
-  CheckPattern(state, "MSR writes synchronize the teardown snapshot", vmm,
-               R"(Ctx->GuestFsBase\s*=\s*value\.QuadPart[\s\S]{0,1800}Ctx->GuestEfer\s*=\s*newValue[\s\S]{0,700}Ctx->GuestPat\s*=\s*value\.QuadPart)");
+  Check(state, "CR0 writes synchronize the teardown snapshot",
+        vmm.find("c->GuestCr0 = newCr0") != std::string::npos);
+  Check(state, "CR4 writes synchronize the teardown snapshot",
+        vmm.find("c->GuestCr4 = actualCr4") != std::string::npos);
+  Check(state, "FS/GS MSR writes synchronize the teardown snapshot",
+        vmm.find("Ctx->GuestFsBase = value.QuadPart") != std::string::npos &&
+            vmm.find("Ctx->GuestGsBase = value.QuadPart") != std::string::npos);
+  Check(state, "EFER/PAT MSR writes synchronize the teardown snapshot",
+        vmm.find("Ctx->GuestEfer = newValue") != std::string::npos &&
+            vmm.find("Ctx->GuestPat = value.QuadPart") != std::string::npos);
   Check(state, "GS/KGS state uses authoritative snapshots",
         vmm.find("expectedKgs") == std::string::npos &&
             vmm.find("observedKgs") == std::string::npos &&
@@ -522,11 +532,12 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(crNum\s*==\s*4[\s\S]{0,260}value\s*&\s*CR4_CET[\s\S]{0,260}g_CetVmcsEnabled)");
   CheckPattern(state, "guest CET capability is not hidden after launch", vmm,
                R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*0[\s\S]{0,700}VmxProfileInvpcid)");
-  Check(state, "inactive CET still requires a stable CPUID contract",
+  Check(state, "inactive CET CPUID is rejected before VMXON",
         main.find("supervisor CET CPUID state is not virtualized") !=
-                std::string::npos &&
-            main.find("active supervisor CET state is outside the safe VMX contract") !=
-                std::string::npos);
+            std::string::npos);
+  Check(state, "active CET state is rejected before VMXON",
+        main.find("active supervisor CET state is outside the safe VMX contract") !=
+            std::string::npos);
   CheckPattern(state, "CET_U requires XSAVES", main,
                R"(CET_U is enabled without an XSAVES CET_U component)");
   CheckPattern(state, "CET_U MSRs can pass through with XSAVES", vmm,
