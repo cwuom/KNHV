@@ -66,18 +66,27 @@
 
 // IA32_XSS state-component bits from the WDK/Intel XSTATE enumeration.
 // CET_U contains IA32_U_CET and IA32_PL3_SSP; CET_S contains supervisor
-// shadow-stack state. IPT is Intel Processor Trace state. These components are
-// preserved by the complete compacted XSAVES/XRSTORS image used by the VM-exit
-// frame.
+// shadow-stack state. IPT is Intel Processor Trace state and is not included in
+// the XSAVES frame used by this monitor. It must remain inactive while the
+// monitor runs; the guest profile exposes only CET_U.
 #define IA32_XSS_IPT                        (1ULL << 8)
 #define IA32_XSS_CET_U                      (1ULL << 11)
 #define IA32_XSS_CET_S                      (1ULL << 12)
-// The fixed XSAVES frame preserves the complete enumerated XSS state. Keep the
-// IPT component in the guest selector contract as well; PT MSRs remain trapped
-// so a guest cannot alter host tracing state through the VMX root path. CET_S
-// remains outside the guest contract until all supervisor CET MSRs are virtualized.
-#define IA32_XSS_GUEST_KNOWN_MASK            (IA32_XSS_IPT | IA32_XSS_CET_U)
-#define IA32_XSS_VIRTUALIZABLE_MASK          IA32_XSS_GUEST_KNOWN_MASK
+// The host frame preserves CET_U. IPT is deliberately hidden from the guest
+// because PT MSRs and CPUID.14 are not virtualized.
+#define IA32_XSS_GUEST_KNOWN_MASK            IA32_XSS_CET_U
+#define IA32_XSS_VIRTUALIZABLE_MASK          IA32_XSS_CET_U
+#define IA32_XSS_HOST_ALLOWED_MASK           (IA32_XSS_IPT | IA32_XSS_CET_U)
+
+// VMX_MISC[14] means that Intel PT may trace after VMXON. It does not by itself
+// provide guest PT virtualization; the guest profile below remains PT-hidden.
+#define VMX_MISC_INTEL_PT                    (1ULL << 14)
+#define IA32_RTIT_CTL_TRACEEN                (1ULL << 0)
+
+// CPUID feature bits hidden from a guest when their VMX state is not exposed.
+#define CPUID_7_EBX_INTEL_PT                 (1U << 25)
+#define CPUID_7_ECX_CET_SHSTK                (1U << 7)
+#define CPUID_7_EDX_CET_IBT                  (1U << 20)
 
 // Enable bits in IA32_{U,S}_CET. Other bits are state/configuration fields,
 // not evidence that shadow-stack or IBT enforcement is currently running.

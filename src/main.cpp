@@ -16,6 +16,17 @@ static bool RejectVmx(const char* reason) {
     return false;
 }
 
+static bool ReadMsrSafe(u32 msr, u64* value) {
+    if (!value) return false;
+    __try {
+        *value = __readmsr(msr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
 static bool ReadCETState(u64* userCet,
                          u64* supervisorCet,
                          u64* xss,
@@ -134,24 +145,55 @@ bool IsVmxSupported() {
     bool cetShadowStackEnumerated = false;
     if (maxBasicLeaf >= 7) {
         __cpuidex(cpuInfo, 7, 0);
-        cetShadowStackEnumerated = (cpuInfo[2] & (1 << 7)) != 0;
+        cetShadowStackEnumerated =
+            (static_cast<u32>(cpuInfo[2]) & CPUID_7_ECX_CET_SHSTK) != 0;
         cetEnumerated = cetShadowStackEnumerated ||
-                        (cpuInfo[3] & (1 << 20)) != 0;
+                        (static_cast<u32>(cpuInfo[3]) & CPUID_7_EDX_CET_IBT) != 0;
+        const bool ptEnumerated =
+            (static_cast<u32>(cpuInfo[1]) & CPUID_7_EBX_INTEL_PT) != 0;
+        const bool cetIbtEnumerated =
+            (static_cast<u32>(cpuInfo[3]) & CPUID_7_EDX_CET_IBT) != 0;
+        const bool fredEnumerated =
+            (static_cast<u32>(cpuInfo[3]) & CPUID_7_EDX_FRED) != 0;
         DbgPrint("[HV] CPUID.7.0: EBX=0x%08X ECX=0x%08X EDX=0x%08X "
                  "CET_SS=%u CET_IBT=%u PT=%u\n",
                  static_cast<ULONG>(cpuInfo[1]), static_cast<ULONG>(cpuInfo[2]),
                  static_cast<ULONG>(cpuInfo[3]), cetShadowStackEnumerated ? 1U : 0U,
-                 (cpuInfo[3] & (1 << 20)) != 0 ? 1U : 0U,
-                 (cpuInfo[1] & (1 << 25)) != 0 ? 1U : 0U);
-        const bool ptEnumerated = (cpuInfo[1] & (1 << 25)) != 0;
-        const bool cetIbtEnumerated = (cpuInfo[3] & (1 << 20)) != 0;
+                 cetIbtEnumerated ? 1U : 0U, ptEnumerated ? 1U : 0U);
         if (ptEnumerated) {
-            return RejectVmx("Intel PT state is not virtualized");
+            u64 vmxMisc = 0;
+            u64 ptControl = 0;
+            if (!ReadMsrSafe(MSR_IA32_VMX_MISC, &vmxMisc) ||
+                !ReadMsrSafe(MSR_IA32_RTIT_CTL, &ptControl)) {
+                return RejectVmx("reading Intel PT capability state faulted");
+            }
+            DbgPrint("[HV] Intel PT policy: VMX_MISC=0x%llX post_vmxon=%u "
+                     "RTIT_CTL=0x%llX guest=hidden\n",
+                     vmxMisc, (vmxMisc & VMX_MISC_INTEL_PT) != 0 ? 1U : 0U,
+                     ptControl);
+            if ((ptControl & IA32_RTIT_CTL_TRACEEN) != 0) {
+                return RejectVmx("Intel PT tracing is active and not virtualized");
+            }
         }
-        if (cetShadowStackEnumerated || cetIbtEnumerated) {
-            return RejectVmx("supervisor CET CPUID state is not virtualized");
+        if (maxBasicLeaf >= 0x14) {
+            __cpuidex(cpuInfo, 0x14, 0);
+            DbgPrint("[HV] CPUID.14.0: EAX=0x%08X EBX=0x%08X ECX=0x%08X "
+                     "EDX=0x%08X guest=hidden\n",
+                     static_cast<ULONG>(cpuInfo[0]),
+                     static_cast<ULONG>(cpuInfo[1]),
+                     static_cast<ULONG>(cpuInfo[2]),
+                     static_cast<ULONG>(cpuInfo[3]));
+            if (static_cast<u32>(cpuInfo[0]) >= 1) {
+                __cpuidex(cpuInfo, 0x14, 1);
+                DbgPrint("[HV] CPUID.14.1: EAX=0x%08X EBX=0x%08X ECX=0x%08X "
+                         "EDX=0x%08X\n",
+                         static_cast<ULONG>(cpuInfo[0]),
+                         static_cast<ULONG>(cpuInfo[1]),
+                         static_cast<ULONG>(cpuInfo[2]),
+                         static_cast<ULONG>(cpuInfo[3]));
+            }
         }
-        if ((cpuInfo[3] & CPUID_7_EDX_FRED) != 0) {
+        if (fredEnumerated) {
             return RejectVmx("FRED is enumerated but its VMX state is unsupported");
         }
     }
@@ -173,7 +215,17 @@ bool IsVmxSupported() {
                  xfdEnumerated ? 1U : 0U);
     }
     if (xfdEnumerated) {
-        return RejectVmx("XFD/XFD_ERR state is not virtualized");
+        u64 xfd = 0;
+        u64 xfdError = 0;
+        if (!ReadMsrSafe(MSR_IA32_XFD, &xfd) ||
+            !ReadMsrSafe(MSR_IA32_XFD_ERR, &xfdError)) {
+            return RejectVmx("reading XFD state faulted");
+        }
+        DbgPrint("[HV] XFD policy: IA32_XFD=0x%llX IA32_XFD_ERR=0x%llX "
+                 "guest=hidden\n", xfd, xfdError);
+        if (xfd != 0 || xfdError != 0) {
+            return RejectVmx("active XFD state is not virtualized");
+        }
     }
     if (cetEnumerated || (currentCr4 & CR4_CET) != 0) {
         if (!ReadCETState(&userCet, &supervisorCet, &xss,

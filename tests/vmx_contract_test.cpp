@@ -391,19 +391,21 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "VMX region allocation follows VMX BASIC", vmm,
                R"(g_VmxRequires32BitPhysicalAddress\s*=\s*\([\s\S]{0,180}VMX_BASIC_PHYSICAL_ADDRESS_32)");
   CheckPattern(state, "CPUID XSS mask is restricted to the guest contract", vmm,
-               R"(g_SupportedXssMask\s*=\s*enumeratedXss\s*&\s*IA32_XSS_VIRTUALIZABLE_MASK)");
+               R"(g_SupportedXssMask\s*=\s*enumeratedXss\s*&\s*IA32_XSS_GUEST_KNOWN_MASK)");
   CheckPattern(state, "XSAVES fixed mask follows host XSS", vmm,
-               R"(g_XsavesMask\s*=\s*g_XsavesEnabled\s*\?\s*g_HostXssMask\s*:\s*0)");
+               R"(g_XsavesMask\s*=\s*g_XsavesEnabled[\s\S]{0,120}g_HostXssMask\s*&\s*IA32_XSS_VIRTUALIZABLE_MASK)");
   CheckPattern(state, "guest XSS stays inside fixed frame mask", vmm,
                R"(g_SupportedXssMask\s*&=\s*g_XsavesMask)");
-  CheckPattern(state, "guest XSS contract preserves IPT and CET_U", vmx,
-               R"(IA32_XSS_GUEST_KNOWN_MASK\s+\(IA32_XSS_IPT\s*\|\s*IA32_XSS_CET_U\))");
+  CheckPattern(state, "passive host IPT selector is retained separately", vmm,
+               R"(g_GuestXssWriteMask\s*=\s*g_SupportedXssMask[\s\S]{0,160}enumeratedXss\s*&\s*IA32_XSS_IPT)");
+  CheckPattern(state, "guest XSS contract exposes only CET_U", vmx,
+               R"(IA32_XSS_GUEST_KNOWN_MASK\s+IA32_XSS_CET_U)");
   CheckPattern(state, "active PT is rejected before VMX", vmm,
-               R"(IA32_XSS_IPT[\s\S]{0,500}MSR_IA32_RTIT_CTL[\s\S]{0,300}ptControl\s*!=\s*0)");
+               R"(IA32_XSS_IPT[\s\S]{0,500}MSR_IA32_RTIT_CTL[\s\S]{0,300}ptControl\s*&\s*IA32_RTIT_CTL_TRACEEN)");
   CheckPattern(state, "guest XSS is separated from host XSS", vmm,
-               R"(vcpu->HostXss\s*=\s*hostXss[\s\S]{0,260}vcpu->GuestXss\s*=\s*hostXss\s*&\s*g_SupportedXssMask)");
+               R"(vcpu->HostXss\s*=\s*hostXss[\s\S]{0,260}vcpu->GuestXss\s*=\s*hostXss\s*&\s*g_GuestXssWriteMask)");
   CheckPattern(state, "guest XSS writes keep a fixed frame mask", vmm,
-               R"(g_XsavesEnabled\s*&&\s*msrIndex\s*==\s*MSR_IA32_XSS[\s\S]{0,520}g_SupportedXssMask[\s\S]{0,220}Ctx->GuestXss\s*=\s*value\.QuadPart)");
+               R"(g_XsavesEnabled\s*&&\s*msrIndex\s*==\s*MSR_IA32_XSS[\s\S]{0,520}g_GuestXssWriteMask[\s\S]{0,220}Ctx->GuestXss\s*=\s*value\.QuadPart)");
   CheckPattern(state, "guest XSS is installed before launch", vmm,
                R"(WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->GuestXss\)[\s\S]{0,1000}VMCS ready; entering VMLAUNCH)");
   CheckPattern(state, "each CPU validates local XCR0 contract", vmm,
@@ -418,6 +420,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(const u64 localCr4\s*=\s*__readcr4\(\)[\s\S]{0,900}localCet\s*=\s*\(localCr4\s*&\s*CR4_CET\)[\s\S]{0,900}localCet\s*!=\s*\(g_CetVmcsEnabled\s*!=\s*0\))");
   CheckPattern(state, "PT MSR window is intercepted", vmm,
                R"(MSR_IA32_RTIT_OUTPUT_BASE[\s\S]{0,220}0x58FU[\s\S]{0,220}setBit\(msr, false\))");
+  CheckPattern(state, "XFD MSRs are intercepted", vmm,
+               R"(MSR_IA32_XFD, MSR_IA32_XFD_ERR[\s\S]{0,180}setBit\(msr, false\))");
   CheckPattern(state, "diagnostic VM-exit log is rate limited", vmm,
                R"(InterlockedIncrement\(&vcpu->VmExitCount\)[\s\S]{0,600}exitCount\s*<=\s*16)");
   CheckPattern(state, "diagnostic launch log includes VMCS state", vmm,
@@ -524,10 +528,15 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(HasParkedVcpu\(\)[\s\S]{0,300}kHvLifecycleQuarantined[\s\S]{0,120}return)");
   CheckPattern(state, "guest CPUID hides VMX", vmm,
                R"(leaf\s*==\s*1[\s\S]{0,300}regs\[2\]\s*&=\s*~\(1\s*<<\s*5\))");
-  CheckPattern(state, "unsupported PT fails before VMXON", main,
-               R"(ptEnumerated[\s\S]{0,180}Intel PT state is not virtualized)");
-  CheckPattern(state, "unsupported supervisor CET fails before VMXON", main,
-               R"(cetShadowStackEnumerated[\s\S]{0,260}supervisor CET CPUID state is not virtualized)");
+  CheckPattern(state, "PT gate reads VMX post-VMXON capability", main,
+               R"(ptEnumerated[\s\S]{0,500}ReadMsrSafe\(MSR_IA32_VMX_MISC[\s\S]{0,500}VMX_MISC_INTEL_PT)");
+  CheckPattern(state, "active PT fails before VMXON", main,
+               R"(ptControl[\s\S]{0,180}IA32_RTIT_CTL_TRACEEN[\s\S]{0,160}Intel PT tracing is active)");
+  Check(state, "PT enumeration alone does not reject VMX",
+        main.find("Intel PT state is not virtualized") == std::string::npos);
+  Check(state, "inactive supervisor CET enumeration does not reject VMX",
+        main.find("supervisor CET CPUID state is not virtualized") ==
+            std::string::npos);
   Check(state, "CPUID-only XSTATE components do not reject XCR0",
         main.find("dynamic XSTATE components are not virtualized") ==
             std::string::npos &&
@@ -538,14 +547,14 @@ void TestSourceContract(const fs::path& root, TestState& state) {
         main.find("VMX not supported or disabled in BIOS") == std::string::npos);
   CheckPattern(state, "XCR0 must be a CPUID-supported subset", vmm,
                R"(hostXcr0\s*&\s*~supportedXcr0)");
-  CheckPattern(state, "unsupported XSS fails before VMXON", vmm,
-               R"(enumeratedXss\s*&\s*~IA32_XSS_GUEST_KNOWN_MASK)");
+  CheckPattern(state, "active unsupported XSS fails before VMXON", vmm,
+               R"(hostXss\s*&\s*~IA32_XSS_HOST_ALLOWED_MASK)");
   Check(state, "FRED is rejected before VMXON",
         main.find("CPUID_7_EDX_FRED") != std::string::npos &&
             main.find("FRED is enumerated") != std::string::npos);
   Check(state, "XFD is rejected before VMXON",
         main.find("xfdEnumerated") != std::string::npos &&
-            main.find("XFD/XFD_ERR state is not virtualized") !=
+            main.find("active XFD state is not virtualized") !=
                 std::string::npos);
   CheckPattern(state, "CR3 PCID no-flush is accepted", vmm,
                R"(noFlushMask\s*=\s*pcide\s*\?\s*\(1ULL\s*<<\s*63\))");
@@ -562,9 +571,18 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(crNum\s*==\s*4[\s\S]{0,260}value\s*&\s*CR4_CET[\s\S]{0,260}g_CetVmcsEnabled)");
   CheckPattern(state, "guest CET capability is not hidden after launch", vmm,
                R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*0[\s\S]{0,700}VmxProfileInvpcid)");
-  Check(state, "inactive CET CPUID is rejected before VMXON",
-        main.find("supervisor CET CPUID state is not virtualized") !=
-            std::string::npos);
+  CheckPattern(state, "guest CPUID hides PT capability", vmm,
+               R"(CPUID_7_EBX_INTEL_PT[\s\S]{0,120}regs\[1\]\s*&=)");
+  Check(state, "guest CPUID keeps user CET capability contract",
+        vmm.find("CPUID_7_EBX_INTEL_PT") != std::string::npos &&
+            vmm.find("CPUID_7_ECX_CET_SHSTK") == std::string::npos);
+  CheckPattern(state, "guest CPUID hides Intel PT leaf", vmm,
+               R"(leaf\s*==\s*0x14[\s\S]{0,160}RtlZeroMemory\(regs, sizeof\(regs\)\))");
+  Check(state, "guest CPUID recomputes XSS area size",
+        vmm.find("ComputeXsaveAreaSize(") != std::string::npos &&
+            vmm.find("guestXsaveSize") != std::string::npos &&
+            vmm.find("regs[1] = static_cast<int>(guestXsaveSize)") !=
+                std::string::npos);
   Check(state, "active CET state is rejected before VMXON",
         main.find("active supervisor CET state is outside the safe VMX contract") !=
             std::string::npos);
