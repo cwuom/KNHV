@@ -335,13 +335,23 @@ u32 GetXsaveStateSize() {
 }
 
 static bool IsGdtSelectorUsable(u64 gdtBase, u16 gdtLimit, u16 selector,
-                                bool allowNull) {
+                                bool allowNull, bool requireSystem,
+                                bool requireCode) {
     if (selector == 0) return allowNull;
-    if ((selector & 0x4U) != 0 || (selector & 0xFFF8U) > gdtLimit) {
+    if ((selector & 0x7U) != 0 || (selector & 0xFFF8U) > gdtLimit ||
+        !IsCanonical(gdtBase)) {
         return false;
     }
-    if (!IsCanonical(gdtBase)) return false;
-    return true;
+    const auto descriptor = reinterpret_cast<const u8*>(gdtBase +
+                                                         (selector & 0xFFF8U));
+    const u8 access = descriptor[5];
+    const u8 type = access & 0x0FU;
+    if ((access & 0x80U) == 0) return false;
+    if ((access & 0x60U) != 0) return false;
+    if (requireSystem) return (type == 9U || type == 0xBU) &&
+                                  (gdtLimit - (selector & 0xFFF8U)) >= 15U;
+    if ((access & 0x10U) == 0) return false;
+    return requireCode ? (type & 0x8U) != 0 : (type & 0x8U) == 0;
 }
 
 bool InitializeVmxFeatureContract() {
@@ -1026,6 +1036,7 @@ static u64 AdjustControls64(u64 ctl, u32 msr) {
 
 // handle hypervisor unload requests
 bool HandleVmCall(GuestContext* Ctx) {
+    if (!Ctx) return false;
     // calling convention: rcx = magic, rdx = command
     if ((Ctx->GuestCs & 3U) == 0 &&
         Ctx->Rcx == HYPERVISOR_MAGIC && Ctx->Rdx == VMCALL_UNLOAD) {
@@ -1050,11 +1061,16 @@ bool HandleVmCall(GuestContext* Ctx) {
     }
     // The unload token is a ring-0 service call.  A guest CPL3 attempt must
     // not be allowed to select the native teardown path.
-    InjectGuestException(Ctx, 6, false);
+    InjectGuestException(Ctx, 13, true, 0);
     return false;
 }
 
 bool HandleMsrRead(GuestContext* Ctx) {
+    if (!Ctx) return false;
+    if ((Ctx->GuestCs & 3U) != 0) {
+        InjectGuestException(Ctx, 13, true, 0);
+        return false;
+    }
     // RDMSR: reads the MSR specified by ECX into EDX:EAX
     u32 msrIndex = static_cast<u32>(Ctx->Rcx);
 
@@ -1168,6 +1184,11 @@ bool HandleMsrRead(GuestContext* Ctx) {
 }
 
 bool HandleMsrWrite(GuestContext* Ctx) {
+    if (!Ctx) return false;
+    if ((Ctx->GuestCs & 3U) != 0) {
+        InjectGuestException(Ctx, 13, true, 0);
+        return false;
+    }
     // WRMSR: writes the value in EDX:EAX to the MSR specified by ECX
     u32 msrIndex = static_cast<u32>(Ctx->Rcx);
     ULARGE_INTEGER value;
@@ -1531,6 +1552,11 @@ static __forceinline bool SetGpr(GuestContext* c, u8 reg, u64 v) {
 }
 
 static bool HandleCrAccess(GuestContext* c) {
+    if (!c) return false;
+    if ((c->GuestCs & 3U) != 0) {
+        InjectGuestException(c, 13, true, 0);
+        return false;
+    }
     u64 qual = 0;
     if (!VmReadChecked(EXIT_QUALIFICATION, &qual)) {
         c->HaltVm = 1;
@@ -1665,6 +1691,10 @@ static bool HandleCrAccess(GuestContext* c) {
 // receive the architectural #GP(0) without executing XSETBV in VMX root.
 static bool HandleXsetbv(GuestContext* c, const VcpuContext* vcpu) {
     if (!c || !vcpu) return false;
+    if ((c->GuestCs & 3U) != 0) {
+        InjectGuestException(c, 13, true, 0);
+        return false;
+    }
 
     // If the live mask has already diverged, the assembly prologue could not
     // have been given a host-compatible XSAVE layout.  Do not attempt another
@@ -2221,15 +2251,15 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     const u64 guestCr3 = NormalizeCr3(__readcr3(), hostCr4);
 
     if (!IsCanonical(gdtBase) || !IsCanonical(idtBase) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, csSelector, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, ssSelector, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, dsSelector, true) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, esSelector, true) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, fsSelector, true) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, gsSelector, true) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, trSelector, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, csSelector, false, false, true) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, ssSelector, false, false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, dsSelector, true, false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, esSelector, true, false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, fsSelector, true, false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, gsSelector, true, false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, trSelector, false, true, false) ||
         (ldtrSelector != 0 &&
-         !IsGdtSelectorUsable(gdtBase, gdtLimit, ldtrSelector, false)) ||
+         !IsGdtSelectorUsable(gdtBase, gdtLimit, ldtrSelector, false, true, false)) ||
         !IsValidArchitecturalCr3(hostCr3, hostCr4) ||
         !IsValidArchitecturalCr3(guestCr3, hostCr4) ||
         tssBase == 0) {

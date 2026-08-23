@@ -309,6 +309,24 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos);
   CheckPattern(state, "EFER illegal mode changes inject #GP", vmm,
                R"(kWritableEferBits\s*=\s*EFER_SCE\s*\|\s*EFER_NXE[\s\S]{0,300}InjectGuestException\(Ctx,\s*13)");
+  const std::size_t msr_read_begin = vmm.find("bool HandleMsrRead(");
+  const std::size_t msr_write_begin = vmm.find("bool HandleMsrWrite(");
+  Check(state, "privileged MSR exits reject CPL3",
+        msr_read_begin != std::string::npos && msr_write_begin > msr_read_begin &&
+            vmm.substr(msr_read_begin, msr_write_begin - msr_read_begin).find(
+                "Ctx->GuestCs & 3U") != std::string::npos &&
+            vmm.substr(msr_write_begin, 900).find("Ctx->GuestCs & 3U") !=
+                std::string::npos &&
+            vmm.substr(msr_read_begin, msr_write_begin - msr_read_begin).find(
+                "InjectGuestException(Ctx, 13, true, 0)") != std::string::npos &&
+            vmm.substr(msr_write_begin, 900).find(
+                "InjectGuestException(Ctx, 13, true, 0)") != std::string::npos);
+  CheckPattern(state, "CR access rejects CPL3", vmm,
+               R"(static bool HandleCrAccess\(GuestContext\* c\)[\s\S]{0,220}c->GuestCs\s*&\s*3U\)[\s\S]{0,120}InjectGuestException\(c,\s*13,\s*true,\s*0)");
+  CheckPattern(state, "XSETBV rejects CPL3", vmm,
+               R"(static bool HandleXsetbv\(GuestContext\* c,[\s\S]{0,220}c->GuestCs\s*&\s*3U\)[\s\S]{0,120}InjectGuestException\(c,\s*13,\s*true,\s*0)");
+  CheckPattern(state, "CPL3 VMCALL injects GP", vmm,
+               R"(The unload token is a ring-0 service call[\s\S]{0,180}InjectGuestException\(Ctx,\s*13,\s*true,\s*0)");
   Check(state, "CR0 writes synchronize the teardown snapshot",
         vmm.find("c->GuestCr0 = newCr0") != std::string::npos);
   Check(state, "CR4 writes synchronize the teardown snapshot",
@@ -344,6 +362,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(unload VMCALL: cpu=.*GuestRip|unload VMCALL decision: cpu=)");
   CheckPattern(state, "non-empty LDTR fails closed", vmm,
                R"(ldtrSelector\s*!=\s*0[\s\S]{0,600}non-empty LDTR[\s\S]{0,240}return false)");
+  CheckPattern(state, "GDT validation checks descriptor type", vmm,
+               R"(static bool IsGdtSelectorUsable\([\s\S]{0,700}access\s*=\s*descriptor\[5\][\s\S]{0,300}access\s*&\s*0x80U[\s\S]{0,300}requireSystem)");
   CheckPattern(state, "feature contract has a sticky validity result", vmm,
                R"(g_VmxFeatureContractInitialized\s*=\s*true)");
   CheckPattern(state, "production mode launches every active CPU", vmm,
