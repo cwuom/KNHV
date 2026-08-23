@@ -543,7 +543,7 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped[\s\S]{0,2100}CTX_GUEST_XSS)");
   CheckPattern(state, "native teardown keeps guest XSS after guest state",
                asm_source,
-               R"(restoreGuestXsave:[\s\S]{0,700}CTX_GUEST_XSS[\s\S]{0,240}MSR_IA32_XSS[\s\S]{0,160}restoreGuestStateDone:)");
+               R"(xrstors\s+\[r10\][\s\S]{0,260}CTX_GUEST_XSS[\s\S]{0,240}MSR_IA32_XSS[\s\S]{0,160}restoreGuestStateDone:)");
   CheckPattern(state, "VmxOn stop restores host XSS", vmm,
                R"(state\s*==\s*VcpuVmxOn[\s\S]{0,500}WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->HostXss\))");
   CheckPattern(state, "stop claims ownership with a lifecycle CAS", vmm,
