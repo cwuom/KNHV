@@ -11,6 +11,9 @@
 
 extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
 
+static constexpr const char* kDriverContractTag =
+    "PT-HIDDEN-XSTATE-V4-FRED-SUBLEAF1";
+
 static bool RejectVmx(const char* reason) {
     DbgPrint("[HV] VMX gate rejected: %s\n", reason);
     return false;
@@ -153,13 +156,21 @@ bool IsVmxSupported() {
             (static_cast<u32>(cpuInfo[1]) & CPUID_7_EBX_INTEL_PT) != 0;
         const bool cetIbtEnumerated =
             (static_cast<u32>(cpuInfo[3]) & CPUID_7_EDX_CET_IBT) != 0;
-        const bool fredEnumerated =
-            (static_cast<u32>(cpuInfo[3]) & CPUID_7_EDX_FRED) != 0;
+        const u32 cpuid7MaxSubleaf = static_cast<u32>(cpuInfo[0]);
+        bool fredEnumerated = false;
         DbgPrint("[HV] CPUID.7.0: EBX=0x%08X ECX=0x%08X EDX=0x%08X "
                  "CET_SS=%u CET_IBT=%u PT=%u\n",
                  static_cast<ULONG>(cpuInfo[1]), static_cast<ULONG>(cpuInfo[2]),
                  static_cast<ULONG>(cpuInfo[3]), cetShadowStackEnumerated ? 1U : 0U,
                  cetIbtEnumerated ? 1U : 0U, ptEnumerated ? 1U : 0U);
+        if (cpuid7MaxSubleaf >= 1) {
+            __cpuidex(cpuInfo, 7, 1);
+            fredEnumerated =
+                (static_cast<u32>(cpuInfo[0]) & CPUID_7_1_EAX_FRED) != 0;
+            DbgPrint("[HV] CPUID.7.1: EAX=0x%08X FRED=%u\n",
+                     static_cast<ULONG>(cpuInfo[0]),
+                     fredEnumerated ? 1U : 0U);
+        }
         if (ptEnumerated) {
             u64 vmxMisc = 0;
             u64 ptControl = 0;
@@ -341,7 +352,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     UNREFERENCED_PARAMETER(RegistryPath);
     g_HvDriverObject = DriverObject;
 
-    DbgPrint("[HV] Driver Entry.\n");
+    DbgPrint("[HV] Driver Entry. contract=%s\n", kDriverContractTag);
 
     if (!IsVmxSupported()) {
         DbgPrint("[HV] VMX capability gate rejected; see the preceding reason.\n");

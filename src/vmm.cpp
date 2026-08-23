@@ -514,10 +514,10 @@ if (xsavesInstruction && xssRead &&
     // the guest selector must stay within the immutable frame mask. A guest
     // XSS bit that XSAVES does not capture would leak state across VM-exits
     g_SupportedXssMask &= g_XsavesMask;
-    // IPT remains accepted as a passive selector because this is a late
-    // launch. Its MSRs are trapped and its CPUID capability remains hidden.
-    g_GuestXssWriteMask = g_SupportedXssMask |
-                          (enumeratedXss & IA32_XSS_IPT);
+    // IPT is host-only in this build. Keep the guest selector inside the
+    // same mask advertised by CPUID so a hidden PT component cannot be
+    // selected through IA32_XSS.
+    g_GuestXssWriteMask = g_SupportedXssMask;
 
     if (g_XsaveStateSize == 0 || g_XsaveStateSize > VMEXIT_XSAVE_MAX) {
         return false;
@@ -1998,6 +1998,9 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         if ((vcpu->VmxProfile & VmxProfileInvpcid) == 0) {
                             regs[1] &= ~(1 << 10);  // INVPCID
                         }
+                    } else if (leaf == 7 && subleaf == 1) {
+                        // fred is not virtualized by this monitor
+                        regs[0] &= ~static_cast<int>(CPUID_7_1_EAX_FRED);
                     } else if (leaf == 0x80000001U) {
                         if ((vcpu->VmxProfile & VmxProfileRdtscp) == 0) {
                             regs[3] &= ~(1 << 27);  // RDTSCP
@@ -2007,8 +2010,22 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                         // not advertise AVX-512/AMX components that the guest
                         // cannot enable without a dynamic XSAVE contract.
                         const u64 virtualXcr0 = vcpu->HostXcr0;
-                        regs[0] &= static_cast<int>(virtualXcr0);
-                        regs[3] &= static_cast<int>(virtualXcr0 >> 32);
+                        u64 ignoredXssCapabilities = 0;
+                        u32 guestXsaveAreaSize = 0;
+                        if (!ComputeXsaveAreaSize(virtualXcr0, 0,
+                                                   &ignoredXssCapabilities,
+                                                   &guestXsaveAreaSize)) {
+                            RtlZeroMemory(regs, sizeof(regs));
+                        } else {
+                            // D.0:EBX/ECX are sizes, not feature masks. Return
+                            // the size of the fixed guest XCR0 contract in
+                            // both fields so hidden host XSTATE components do
+                            // not leak through the all-supported size.
+                            regs[0] = static_cast<int>(virtualXcr0);
+                            regs[1] = static_cast<int>(guestXsaveAreaSize);
+                            regs[2] = static_cast<int>(guestXsaveAreaSize);
+                            regs[3] = static_cast<int>(virtualXcr0 >> 32);
+                        }
                     } else if (leaf == 0xD && subleaf == 1) {
                         // XFD/XFD_ERR are not part of the saved guest state.
                         regs[0] &= ~static_cast<int>(CPUID_D1_XFD);
@@ -2804,7 +2821,8 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         // capability MSRs do not match the boot processor.
         int localCpuid[4] = {};
         __cpuid(localCpuid, 0);
-        if (localCpuid[0] < 0xD) {
+        const u32 localMaxBasicLeaf = static_cast<u32>(localCpuid[0]);
+        if (localMaxBasicLeaf < 0xD) {
             InterlockedExchange(&vcpu->State, VcpuFailed);
             return 0;
         }
@@ -2826,6 +2844,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             return 0;
         }
         __cpuidex(localCpuid, 0xD, 0);
+        const u32 localXsaveAreaSize = static_cast<u32>(localCpuid[1]);
         const u64 localSupportedXcr0 = static_cast<u32>(localCpuid[0]) |
                                        (static_cast<u64>(static_cast<u32>(localCpuid[3])) << 32);
         const u64 localCr4 = __readcr4();
@@ -2864,11 +2883,11 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         if ((localXcr0 & ~localSupportedXcr0) != 0 ||
             (localXcr0 & 0x3ULL) != 0x3ULL ||
             localXcr0 != g_HostXcr0Mask ||
-            static_cast<u32>(localCpuid[1]) > VMEXIT_XSAVE_MAX) {
+            localXsaveAreaSize > VMEXIT_XSAVE_MAX) {
             HV_VERBOSE_PRINT("[HV] CPU %u local XCR0/XSAVE contract mismatch: "
                              "xcr0=0x%llX supported=0x%llX frame=%lu\n",
                              id, localXcr0, localSupportedXcr0,
-                             static_cast<ULONG>(localCpuid[1]));
+                             static_cast<ULONG>(localXsaveAreaSize));
             InterlockedExchange(&vcpu->State, VcpuFailed);
             return 0;
         }
@@ -2892,9 +2911,34 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             InterlockedExchange(&vcpu->State, VcpuFailed);
             return 0;
         }
-        __cpuidex(localCpuid, 7, 0);
-        const bool localPtEnumerated =
-            (static_cast<u32>(localCpuid[1]) & CPUID_7_EBX_INTEL_PT) != 0;
+        if ((localXsaveFeatures & CPUID_D1_XFD) != 0) {
+            u64 localXfd = 0;
+            u64 localXfdError = 0;
+            if (!ReadMsrSafe(MSR_IA32_XFD, &localXfd) ||
+                !ReadMsrSafe(MSR_IA32_XFD_ERR, &localXfdError) ||
+                localXfd != 0 || localXfdError != 0) {
+                HV_VERBOSE_PRINT("[HV] CPU %u active XFD state changed during "
+                                 "launch: xfd=0x%llX error=0x%llX\n", id,
+                                 localXfd, localXfdError);
+                InterlockedExchange(&vcpu->State, VcpuFailed);
+                return 0;
+            }
+        }
+        bool localPtEnumerated = false;
+        if (localMaxBasicLeaf >= 7) {
+            __cpuidex(localCpuid, 7, 0);
+            const u32 localCpuid7MaxSubleaf = static_cast<u32>(localCpuid[0]);
+            localPtEnumerated =
+                (static_cast<u32>(localCpuid[1]) & CPUID_7_EBX_INTEL_PT) != 0;
+            if (localCpuid7MaxSubleaf >= 1) {
+                __cpuidex(localCpuid, 7, 1);
+                if ((static_cast<u32>(localCpuid[0]) & CPUID_7_1_EAX_FRED) != 0) {
+                    HV_VERBOSE_PRINT("[HV] CPU %u enumerates unsupported FRED\n", id);
+                    InterlockedExchange(&vcpu->State, VcpuFailed);
+                    return 0;
+                }
+            }
+        }
         if (localPtEnumerated) {
             u64 localPtControl = 0;
             if (!ReadMsrSafe(MSR_IA32_RTIT_CTL, &localPtControl) ||
@@ -2927,7 +2971,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                 InterlockedExchange(&vcpu->State, VcpuFailed);
                 return 0;
             }
-        } else if (static_cast<u32>(localCpuid[1]) != g_XsaveStateSize) {
+        } else if (localXsaveAreaSize != g_XsaveStateSize) {
             InterlockedExchange(&vcpu->State, VcpuFailed);
             return 0;
         }

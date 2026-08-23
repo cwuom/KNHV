@@ -149,7 +149,8 @@
 #define CPUID_D1_XGETBV1                         (1U << 2)
 #define CPUID_D1_XSAVES                          (1U << 3)
 #define CPUID_D1_XFD                             (1U << 4)
-#define CPUID_7_EDX_FRED                         (1U << 17)
+// fred is enumerated by CPUID.(EAX=7,ECX=1):EAX, not subleaf zero
+#define CPUID_7_1_EAX_FRED                       (1U << 17)
 #define IA32_DEBUGCTL_LBR                        (1ULL << 0)
 #define IA32_DEBUGCTL_BTF                        (1ULL << 1)
 #define IA32_DEBUGCTL_BUS_LOCK_DETECT            (1ULL << 2)
