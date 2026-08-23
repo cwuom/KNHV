@@ -43,6 +43,7 @@ extern "C" {
     u16 GetTr(); u16 GetLdtr();
     u64 GetGdtBase(); u16 GetGdtLimit(); u64 GetIdtBase(); u16 GetIdtLimit();
     u64 GetRflags();
+    u64 GetDr7();
     u32 HvGetSegmentLimit(u16 Selector);
     u32 HvGetSegmentAr(u16 Selector);
 
@@ -107,10 +108,9 @@ enum VmxCapabilityProfile : u32 {
     VmxProfileSecondaryControls = 1U << 2,
     VmxProfileXsaves = 1U << 3,
     VmxProfileCetVmcs = 1U << 4,
-    VmxProfileNoHardwareErrorCode = 1U << 5,
-    VmxProfileRdtscp = 1U << 6,
-    VmxProfileInvpcid = 1U << 7,
-    VmxProfileTertiaryControls = 1U << 8,
+    VmxProfileRdtscp = 1U << 5,
+    VmxProfileInvpcid = 1U << 6,
+    VmxProfileTertiaryControls = 1U << 7,
 };
 static u32 g_VmxCapabilityProfile = 0;
 
@@ -184,10 +184,6 @@ static u32 BuildVmxCapabilityProfile(u64 vmxBasic, bool xsaves,
     }
     if (xsaves) profile |= VmxProfileXsaves;
     if (cetVmcs) profile |= VmxProfileCetVmcs;
-    if ((vmxBasic & VMX_BASIC_NO_HW_ERROR_CODE) != 0) {
-        profile |= VmxProfileNoHardwareErrorCode;
-    }
-
     int regs[4] = {};
     __cpuid(regs, 0);
     const u32 maxBasicLeaf = static_cast<u32>(regs[0]);
@@ -495,7 +491,6 @@ if (xsavesInstruction && xssRead &&
     // is inactive.  In that state VMX still requires the paired CET
     // entry/exit controls and valid zeroed VMCS CET fields.
     if ((currentCr4 & CR4_CET) != 0) {
-        if ((vmxBasic & VMX_BASIC_NO_HW_ERROR_CODE) == 0) return false;
         const u32 exitMsr = ControlMsr(vmxBasic,
                                        MSR_IA32_VMX_EXIT_CTLS,
                                        MSR_IA32_VMX_TRUE_EXIT_CTLS);
@@ -681,7 +676,7 @@ extern "C" __declspec(noreturn) void HvFatalBugCheck(GuestContext* c) {
         // VMXOFF has already ended VMX operation on this path.  Use the
         // per-CPU snapshot instead of issuing an invalid post-VMX VMREAD
         // while collecting bugcheck parameters
-        reason = static_cast<ULONG_PTR>(g_VcpuData[cpu].LastExitReason);
+        reason = static_cast<ULONG_PTR>(g_VcpuData[cpu].LastExitReasonRaw);
     }
     const ULONG_PTR rip = c ? static_cast<ULONG_PTR>(c->GuestRip) : 0;
     const ULONG_PTR rsp = c ? static_cast<ULONG_PTR>(c->GuestRsp) : 0;
@@ -899,6 +894,12 @@ bool HandleMsrRead(GuestContext* Ctx) {
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
     }
+    if (msrIndex == MSR_IA32_DEBUGCTL) {
+        const u64 value = Ctx->GuestDebugctl;
+        Ctx->Rax = static_cast<u32>(value);
+        Ctx->Rdx = static_cast<u32>(value >> 32);
+        return true;
+    }
     if (msrIndex == MSR_IA32_SYSENTER_CS) {
         const u64 value = HvVmRead(GUEST_SYSENTER_CS);
         Ctx->Rax = static_cast<u32>(value);
@@ -1030,6 +1031,14 @@ bool HandleMsrWrite(GuestContext* Ctx) {
             Ctx->HaltVm = 1;
             return false;
         }
+        return true;
+    }
+    if (msrIndex == MSR_IA32_DEBUGCTL) {
+        if (!VmWriteChecked(GUEST_DEBUGCTL, value.QuadPart)) {
+            Ctx->HaltVm = 1;
+            return false;
+        }
+        Ctx->GuestDebugctl = value.QuadPart;
         return true;
     }
     if (msrIndex == MSR_IA32_SYSENTER_CS) {
@@ -1190,6 +1199,7 @@ static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
     constexpr u32 baseManagedMsrs[] = {
         MSR_FS_BASE, MSR_GS_BASE, MSR_IA32_KERNEL_GS_BASE,
         MSR_IA32_EFER, MSR_IA32_PAT,
+        MSR_IA32_DEBUGCTL,
         MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP,
         MSR_IA32_SYSENTER_EIP,
     };
@@ -1437,7 +1447,10 @@ static bool HandleXsetbv(GuestContext* c, const VcpuContext* vcpu) {
 
 extern "C" void VmExitHandler(GuestContext* Ctx) {
     if (!Ctx) return;
-    const u64 ExitReason = HvVmRead(VM_EXIT_REASON) & 0xFFFF;
+    const u32 rawExitReason = static_cast<u32>(HvVmRead(VM_EXIT_REASON));
+    const u32 basicExitReason = rawExitReason & 0xFFFFU;
+    const bool entryFailure = (rawExitReason & 0x80000000U) != 0;
+    const u64 ExitReason = basicExitReason;
     const u64 ExitLen    = HvVmRead(VM_EXIT_INSTRUCTION_LEN);
     const u32 cpuId = CurrentProcessorIndex();
     if (!g_VcpuData || cpuId >= g_ProcessorCount) {
@@ -1449,7 +1462,24 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     VcpuContext* vcpu = &g_VcpuData[cpuId];
     // Capture the reason before any VMCS write can fail and route directly to
     // the fatal path.  The snapshot remains available after VMXOFF.
-    vcpu->LastExitReason = static_cast<long>(ExitReason);
+    vcpu->LastExitReason = static_cast<long>(basicExitReason);
+    vcpu->LastExitReasonRaw = rawExitReason;
+    vcpu->LastExitReasonBasic = basicExitReason;
+    vcpu->LastExitEntryFailure = entryFailure ? 1U : 0U;
+    if (entryFailure) {
+        // A VM-entry failure is not a running guest exit. The VMCS guest
+        // fields cannot be used to manufacture an IRET continuation here.
+        vcpu->LastVmInstructionError = HvVmRead(VM_INSTRUCTION_ERROR);
+        vcpu->LastExitQualification = HvVmRead(EXIT_QUALIFICATION);
+        vcpu->LastExitAction = kExitActionHalt;
+        Ctx->HaltVm = 1;
+        HV_VERBOSE_PRINT("[HV] VM-entry failure cpu=%u raw=0x%08X basic=%u "
+                         "instruction_error=0x%llX qualification=0x%llX\n",
+                         cpuId, rawExitReason, basicExitReason,
+                         vcpu->LastVmInstructionError,
+                         vcpu->LastExitQualification);
+        return;
+    }
     const long exitCount = InterlockedIncrement(&vcpu->VmExitCount);
     // Keep the first exits verbose and retain power-of-two checkpoints so a
     // long-running guest still leaves a bounded, useful trace in KD.
@@ -1486,6 +1516,10 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     Ctx->GuestSysenterCs = HvVmRead(GUEST_SYSENTER_CS);
     Ctx->GuestSysenterEsp = HvVmRead(GUEST_SYSENTER_ESP);
     Ctx->GuestSysenterEip = HvVmRead(GUEST_SYSENTER_EIP);
+    Ctx->GuestDr7 = HvVmRead(GUEST_DR7);
+    Ctx->GuestDebugctl = HvVmRead(GUEST_DEBUGCTL);
+    vcpu->GuestDr7 = Ctx->GuestDr7;
+    vcpu->GuestDebugctl = Ctx->GuestDebugctl;
     vcpu->LastExitQualification = HvVmRead(EXIT_QUALIFICATION);
     vcpu->LastGuestRip = Ctx->GuestRip;
     vcpu->LastGuestRsp = Ctx->GuestRsp;
@@ -1976,7 +2010,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(GUEST_CR0, AdjustCr0(__readcr0()));
     VmWriteChecked(GUEST_CR3, guestCr3);
     VmWriteChecked(GUEST_CR4, AdjustCr4(hostCr4));
-    VmWriteChecked(GUEST_DR7, 0x400);
+    VmWriteChecked(GUEST_DR7, Vcpu->GuestDr7);
 
     // guest selectors
     VmWriteChecked(GUEST_CS_SELECTOR, csSelector);
@@ -2051,7 +2085,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(GUEST_ACTIVITY_STATE, 0); // 0 = Active
     VmWriteChecked(GUEST_INTERRUPTIBILITY_INFO, 0);
     VmWriteChecked(GUEST_VMCS_LINK_PTR, ~0ULL); // Must be -1
-    VmWriteChecked(GUEST_DEBUGCTL, 0);
+    VmWriteChecked(GUEST_DEBUGCTL, Vcpu->GuestDebugctl);
     VmWriteChecked(GUEST_PENDING_DBG_EXCEPTIONS, 0);
     VmWriteChecked(GUEST_SM_BASE, 0);
 
@@ -2234,6 +2268,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
 
     // Bit 9: Host Address Space Size (Must be 1 for x64 Host)
     u32 requestedExit = VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
+                        VM_EXIT_SAVE_DEBUG_CONTROLS |
                         VM_EXIT_LOAD_HOST_EFER |
                         VM_EXIT_LOAD_HOST_PAT;
     if (g_CetVmcsEnabled) requestedExit |= VM_EXIT_LOAD_CET_STATE;
@@ -2245,6 +2280,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
 
     // Bit 9: IA-32e Mode Guest (Must be 1 for x64 Guest)
     u32 requestedEntry = VM_ENTRY_IA32E_MODE_GUEST |
+                         VM_ENTRY_LOAD_DEBUG_CONTROLS |
                          VM_ENTRY_LOAD_GUEST_EFER |
                          VM_ENTRY_LOAD_GUEST_PAT;
     if (g_CetVmcsEnabled) requestedEntry |= VM_ENTRY_LOAD_CET_STATE;
@@ -2454,10 +2490,6 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                 InterlockedExchange(&vcpu->State, VcpuFailed);
                 return 0;
             }
-            if ((localVmxBasic & VMX_BASIC_NO_HW_ERROR_CODE) == 0) {
-                InterlockedExchange(&vcpu->State, VcpuFailed);
-                return 0;
-            }
             const u32 localExitMsr = ControlMsr(localVmxBasic,
                                                 MSR_IA32_VMX_EXIT_CTLS,
                                                 MSR_IA32_VMX_TRUE_EXIT_CTLS);
@@ -2540,10 +2572,20 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         // guest starts with the same value; subsequent SWAPGS/WRMSR changes
         // are captured in GuestContext and restored before VMRESUME/IRET.
         const u64 hostKernelGs = __readmsr(MSR_IA32_KERNEL_GS_BASE);
+        const u64 hostDr7 = GetDr7();
+        u64 hostDebugctl = 0;
+        if (!ReadMsrSafe(MSR_IA32_DEBUGCTL, &hostDebugctl)) {
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
         // The VM-exit stub allocates 0x1180 bytes below HOST_RSP and reserves
         // the final qword of that frame (offset 0x1178) for this shadow.
         *reinterpret_cast<u64*>(vcpu->HostStackTop -
                                  (VMEXIT_FRAME_SIZE - VMEXIT_HOST_KGS_OFFSET)) = hostKernelGs;
+        *reinterpret_cast<u64*>(vcpu->HostStackTop -
+                                 (VMEXIT_FRAME_SIZE - VMEXIT_HOST_DR7_OFFSET)) = hostDr7;
+        *reinterpret_cast<u64*>(vcpu->HostStackTop -
+                                 (VMEXIT_FRAME_SIZE - VMEXIT_HOST_DEBUGCTL_OFFSET)) = hostDebugctl;
         const u64 hostXcr0 = _xgetbv(0);
         u64 hostXss = 0;
         if (g_XsavesEnabled) {
@@ -2562,6 +2604,10 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                                 (VMEXIT_FRAME_SIZE - VMEXIT_HOST_XSS_OFFSET)) = hostXss;
         vcpu->GuestGsBase = __readmsr(MSR_GS_BASE);
         vcpu->GuestKernelGsBase = hostKernelGs;
+        vcpu->HostDr7 = hostDr7;
+        vcpu->HostDebugctl = hostDebugctl;
+        vcpu->GuestDr7 = hostDr7;
+        vcpu->GuestDebugctl = hostDebugctl;
         // XCR0 is not saved/restored by VMX transitions.  The VM-exit stub
         // uses the live mask for XSAVE/XRSTOR, so retain the root value and
         // reject guest attempts to switch to a different mask (see the
@@ -2914,13 +2960,16 @@ extern "C" NTSTATUS StartHypervisor() {
 
     for (u32 i = 0; i < g_ProcessorCount; i++) {
         DbgPrint("[HV] CPU %u launch result: state=%ld stage=%ld vmexits=%ld "
-                "reason=%ld action=%ld resumes=%ld rip=0x%llX instrerr=0x%llX\n",
-                i,
-                g_VcpuData[i].State,
-                g_VcpuData[i].LaunchStage,
-                g_VcpuData[i].VmExitCount,
-                g_VcpuData[i].LastExitReason,
-                g_VcpuData[i].LastExitAction,
+                 "raw_reason=0x%08X basic=%u entry_failure=%u action=%ld "
+                 "resumes=%ld rip=0x%llX instrerr=0x%llX\n",
+                 i,
+                 g_VcpuData[i].State,
+                 g_VcpuData[i].LaunchStage,
+                 g_VcpuData[i].VmExitCount,
+                 g_VcpuData[i].LastExitReasonRaw,
+                 g_VcpuData[i].LastExitReasonBasic,
+                 g_VcpuData[i].LastExitEntryFailure,
+                 g_VcpuData[i].LastExitAction,
                 g_VcpuData[i].VmResumeAttempts,
                 g_VcpuData[i].LastGuestRip,
                 g_VcpuData[i].LastVmInstructionError);

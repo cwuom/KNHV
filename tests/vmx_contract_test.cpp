@@ -46,6 +46,8 @@ constexpr std::uint32_t kHostSsp = 0x6c1a;
 constexpr std::uint32_t kHostIntrSspTable = 0x6c1c;
 constexpr std::uint32_t kExitXsaves = 63;
 constexpr std::uint32_t kExitXrstors = 64;
+constexpr std::uint32_t kVmExitSaveDebug = 1u << 2;
+constexpr std::uint32_t kVmEntryLoadDebug = 1u << 2;
 }  // namespace reference
 
 static_assert(reference::kVmEntryLoadCet == 0x00100000);
@@ -61,6 +63,8 @@ static_assert(reference::kHostSsp == 0x6c1a);
 static_assert(reference::kHostIntrSspTable == 0x6c1c);
 static_assert(reference::kExitXsaves == 63);
 static_assert(reference::kExitXrstors == 64);
+static_assert(reference::kVmExitSaveDebug == 0x4);
+static_assert(reference::kVmEntryLoadDebug == 0x4);
 
 namespace {
 
@@ -106,6 +110,8 @@ struct GuestContextLayout {
   std::uint64_t GuestSCet{};
   std::uint64_t GuestSsp{};
   std::uint64_t GuestInterruptSspTable{};
+  std::uint64_t GuestDr7{};
+  std::uint64_t GuestDebugctl{};
 };
 
 static_assert(offsetof(GuestContextLayout, Rax) == 0x1000);
@@ -113,7 +119,9 @@ static_assert(offsetof(GuestContextLayout, GuestXcr0) == 0x1108);
 static_assert(offsetof(GuestContextLayout, GuestXss) == 0x1110);
 static_assert(offsetof(GuestContextLayout, GuestSCet) == 0x1118);
 static_assert(offsetof(GuestContextLayout, GuestSsp) == 0x1120);
-static_assert(offsetof(GuestContextLayout, GuestInterruptSspTable) == 0x1128);
+  static_assert(offsetof(GuestContextLayout, GuestInterruptSspTable) == 0x1128);
+static_assert(offsetof(GuestContextLayout, GuestDr7) == 0x1130);
+static_assert(offsetof(GuestContextLayout, GuestDebugctl) == 0x1138);
 static_assert(sizeof(GuestContextLayout) <= 0x1178);
 
 struct TestState {
@@ -184,6 +192,10 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(HOST_S_CET\s*=\s*0x6c18[\s\S]*HOST_SSP\s*=\s*0x6c1a[\s\S]*HOST_INTR_SSP_TABLE\s*=\s*0x6c1c)");
   CheckPattern(state, "XSAVES/XRSTORS exit reasons", vmx,
                R"(VM_EXIT_REASON_XSAVES\s+63[\s\S]*VM_EXIT_REASON_XRSTORS\s+64)");
+  CheckPattern(state, "VMX debug control encoding", vmx,
+               R"(VM_EXIT_SAVE_DEBUG_CONTROLS\s+\(1UL\s*<<\s*2\)[\s\S]*VM_ENTRY_LOAD_DEBUG_CONTROLS\s+\(1UL\s*<<\s*2\))");
+  CheckPattern(state, "IA32_DEBUGCTL is defined", vmx,
+               R"(MSR_IA32_DEBUGCTL\s+0x000001D9)");
 
   CheckPattern(state, "MASM GuestContext XCR0 offset", asm_source,
                R"(CTX_GUEST_XCR0\s+equ\s+01108h)");
@@ -191,6 +203,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(CTX_GUEST_XSS\s+equ\s+01110h)");
   CheckPattern(state, "MASM GuestContext CET offset", asm_source,
                R"(CTX_GUEST_S_CET\s+equ\s+01118h)");
+  CheckPattern(state, "MASM GuestContext debug offsets", asm_source,
+               R"(CTX_GUEST_DR7\s+equ\s+01130h[\s\S]*CTX_GUEST_DEBUGCTL\s+equ\s+01138h)");
   CheckPattern(state, "VM-exit uses XSAVES", asm_source,
                R"(\bxsaves\s+\[rsp\])");
   CheckPattern(state, "VM-exit uses XRSTORS", asm_source,
@@ -245,7 +259,29 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "XSAVES/XRSTORS exits recover natively", vmm,
                R"(case VM_EXIT_REASON_XSAVES[\s\S]{0,300}case VM_EXIT_REASON_XRSTORS[\s\S]{0,900}RequestSafeExit\s*\(Ctx\))");
   CheckPattern(state, "VM-entry injection is cleared per exit", vmm,
-               R"(VmExitHandler\(GuestContext\* Ctx\)[\s\S]{0,2200}CONTROL_VM_ENTRY_INTR_INFO_FIELD, 0[\s\S]{0,300}CONTROL_VM_ENTRY_EXCEPTION_ERROR_CODE, 0)");
+               R"(VmExitHandler\(GuestContext\* Ctx\)[\s\S]{0,3200}CONTROL_VM_ENTRY_INTR_INFO_FIELD, 0[\s\S]{0,300}CONTROL_VM_ENTRY_EXCEPTION_ERROR_CODE, 0)");
+  const std::size_t exit_begin = vmm.find("extern \"C\" void VmExitHandler");
+  const std::size_t exit_end = vmm.find(
+      "// =============================================================================="
+      "\n// VMCS Setup", exit_begin);
+  const std::string exit_source =
+      exit_begin != std::string::npos && exit_end > exit_begin
+          ? vmm.substr(exit_begin, exit_end - exit_begin)
+          : std::string{};
+  Check(state, "VM-entry failure preserves raw reason",
+        exit_source.find("rawExitReason") != std::string::npos &&
+            exit_source.find("LastExitReasonRaw") != std::string::npos &&
+            exit_source.find("if (entryFailure)") != std::string::npos);
+  CheckPattern(state, "VM-entry failure does not use native teardown", vmm,
+               R"(if\s*\(entryFailure\)[\s\S]{0,650}LastVmInstructionError[\s\S]{0,350}return;)");
+  Check(state, "DEBUGCTL is virtualized",
+        vmm.find("if (msrIndex == MSR_IA32_DEBUGCTL)") != std::string::npos &&
+            vmm.find("VmWriteChecked(GUEST_DEBUGCTL") != std::string::npos &&
+            vmm.find("MSR_IA32_DEBUGCTL,\n") != std::string::npos);
+  CheckPattern(state, "debug controls are paired in VMCS", vmm,
+               R"(requestedExit\s*=\s*VM_EXIT_HOST_ADDRESS_SPACE_SIZE[\s\S]{0,180}VM_EXIT_SAVE_DEBUG_CONTROLS[\s\S]{0,900}requestedEntry\s*=\s*VM_ENTRY_IA32E_MODE_GUEST[\s\S]{0,180}VM_ENTRY_LOAD_DEBUG_CONTROLS)");
+  Check(state, "CET does not depend on VMX BASIC bit 56",
+        vmm.find("VMX_BASIC_NO_HW_ERROR_CODE") == std::string::npos);
   const std::size_t setup_begin = vmm.find("bool SetupVmcs(");
   const std::size_t setup_end = vmm.find(
       "// ==============================================================================\n// Launch Logic", setup_begin);
@@ -371,10 +407,10 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             asm_source.substr(wrapper_begin, wrapper_end - wrapper_begin).find(
                 "movdqu xmm6, xmmword ptr [rsp + 080h]") != std::string::npos);
   CheckPattern(state, "launch reserves teardown stack space", asm_source,
-               R"(HvLaunchGuest proc[\s\S]{0,420}sub rsp, 200h[\s\S]{0,300}VMCS_GUEST_RSP[\s\S]{0,700}vmlaunch[\s\S]{0,300}add rsp, 200h)");
+               R"(HvLaunchGuest proc[\s\S]{0,1100}sub rsp, 200h[\s\S]{0,800}VMCS_GUEST_RSP[\s\S]{0,700}vmlaunch[\s\S]{0,300}add rsp, 200h)");
   CheckPattern(state, "guest launch RSP points at the wrapper return slot",
                asm_source,
-               R"(HvLaunchGuest proc[\s\S]{0,520}add rax, 1F8h[\s\S]{0,260}VMCS_GUEST_RSP)");
+                R"(HvLaunchGuest proc[\s\S]{0,1100}add rax, 200h[\s\S]{0,260}VMCS_GUEST_RSP)");
   const std::size_t launch_begin = asm_source.find("HvLaunchGuest proc frame");
   const std::size_t launch_end = asm_source.find("HvLaunchGuest endp", launch_begin);
   Check(state, "launch has VMXE guard",
@@ -406,7 +442,7 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             vmm.substr(abort_begin, abort_end - abort_begin).find(
                 "HvVmxOff") != std::string::npos);
   CheckPattern(state, "teardown restores guest XSS after stopped marker", asm_source,
-               R"(vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped[\s\S]{0,1800}CTX_GUEST_XSS)");
+               R"(vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped[\s\S]{0,2100}CTX_GUEST_XSS)");
   CheckPattern(state, "VmxOn stop restores host XSS", vmm,
                R"(state\s*==\s*VcpuVmxOn[\s\S]{0,500}WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->HostXss\))");
   CheckPattern(state, "stop claims ownership with a lifecycle CAS", vmm,

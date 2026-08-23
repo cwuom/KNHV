@@ -23,6 +23,8 @@ constexpr u64 VMEXIT_FRAME_SIZE = 0x1180;
 constexpr u64 VMEXIT_HOST_XCR0_OFFSET = 0x1168;
 constexpr u64 VMEXIT_HOST_XSS_OFFSET = 0x1170;
 constexpr u64 VMEXIT_HOST_KGS_OFFSET = 0x1178;
+constexpr u64 VMEXIT_HOST_DR7_OFFSET = 0x1158;
+constexpr u64 VMEXIT_HOST_DEBUGCTL_OFFSET = 0x1160;
 static_assert(VMEXIT_XSAVE_MAX <= VMEXIT_FRAME_SIZE, "XSAVE frame exceeds VM-exit frame");
 static_assert(VMEXIT_HOST_XCR0_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
               "host XCR0 slot exceeds VM-exit frame");
@@ -30,6 +32,10 @@ static_assert(VMEXIT_HOST_XSS_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
               "host XSS slot exceeds VM-exit frame");
 static_assert(VMEXIT_HOST_KGS_OFFSET + sizeof(u64) == VMEXIT_FRAME_SIZE,
               "host KGS slot must terminate VM-exit frame");
+static_assert(VMEXIT_HOST_DR7_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
+              "host DR7 slot exceeds VM-exit frame");
+static_assert(VMEXIT_HOST_DEBUGCTL_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
+              "host DEBUGCTL slot exceeds VM-exit frame");
 // Returned by GuestStartThunk after a successful VM-entry.  A distinct value
 // lets the C++ launch callback distinguish the normal guest continuation from
 // a VMLAUNCH failure (which returns VMX flags instead).
@@ -103,6 +109,8 @@ struct __declspec(align(64)) GuestContext {
     u64 GuestSCet;
     u64 GuestSsp;
     u64 GuestInterruptSspTable;
+    u64 GuestDr7;
+    u64 GuestDebugctl;
 };
 
 static_assert(offsetof(GuestContext, Rax) == 0x1000, "VM-exit GPR layout changed");
@@ -130,6 +138,10 @@ static_assert(offsetof(GuestContext, GuestSCet) == 0x1118, "VM-exit S_CET layout
 static_assert(offsetof(GuestContext, GuestSsp) == 0x1120, "VM-exit SSP layout changed");
 static_assert(offsetof(GuestContext, GuestInterruptSspTable) == 0x1128,
               "VM-exit interrupt SSP table layout changed");
+static_assert(offsetof(GuestContext, GuestDr7) == 0x1130,
+              "VM-exit DR7 layout changed");
+static_assert(offsetof(GuestContext, GuestDebugctl) == 0x1138,
+              "VM-exit DEBUGCTL layout changed");
 // The VM-exit frame is 0x1180 bytes.  Its final eight bytes are reserved for
 // the per-CPU host KERNEL_GS_BASE shadow (HostStackTop - 8).
 static_assert(offsetof(GuestContext, GuestSysenterEip) + sizeof(u64) <= 0x1178,
@@ -175,6 +187,10 @@ struct VcpuContext {
     u64   GuestXss;
     u64   GuestXcr0;
     u64   HostXss;
+    u64   HostDr7;
+    u64   HostDebugctl;
+    u64   GuestDr7;
+    u64   GuestDebugctl;
 
     // State is published with InterlockedExchange so lifecycle callbacks can
     // inspect it without taking a lock at IPI_LEVEL.
@@ -195,6 +211,9 @@ struct VcpuContext {
     // by the owning processor and read only after an IPI rendezvous completes.
     volatile long LaunchStage;
     volatile long LastExitReason;
+    volatile u32 LastExitReasonRaw;
+    volatile u32 LastExitReasonBasic;
+    volatile u32 LastExitEntryFailure;
     volatile long LastExitAction;
     volatile long VmResumeAttempts;
     u64 LastExitQualification;

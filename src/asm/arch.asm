@@ -21,6 +21,7 @@ MSR_GS_BASE     equ 0C0000101h
 MSR_KERNEL_GS_BASE equ 0C0000102h
 MSR_IA32_EFER   equ 0C0000080h
 MSR_IA32_PAT    equ 00000277h
+MSR_IA32_DEBUGCTL equ 000001D9h
 MSR_IA32_XSS    equ 00000DA0h
 MSR_IA32_U_CET  equ 000006A0h
 MSR_IA32_S_CET  equ 000006A2h
@@ -39,6 +40,8 @@ CR4_VMXE        equ 02000h
 ; encodings from Intel SDM Vol. 3C, Table B-1.
 VMCS_GUEST_RSP  equ 0681Ch
 VMCS_GUEST_RIP  equ 0681Eh
+VMCS_GUEST_DR7  equ 0681Ah
+VMCS_GUEST_DEBUGCTL equ 02802h
 
 ; GuestContext offsets.  Keep these in lockstep with common.h's static_asserts.
 CTX_RAX         equ 01000h
@@ -74,15 +77,15 @@ CTX_GUEST_CR0   equ 010E8h
 CTX_SYSENTER_CS  equ 010F0h
 CTX_SYSENTER_ESP equ 010F8h
 CTX_SYSENTER_EIP equ 01100h
-; Reserved GuestContext tail slots for the guest XCR0/XSS pair.  These are
-; intentionally outside the C++ fields currently in common.h; if the struct
-; grows, its static_asserts must keep these offsets reserved or update them
-; together with this file.
+; GuestContext tail slots for state that is not part of the VMCS transition
+; contract. Keep these offsets synchronized with common.h static_asserts.
 CTX_GUEST_XCR0  equ 01108h
 CTX_GUEST_XSS   equ 01110h
 CTX_GUEST_S_CET equ 01118h
 CTX_GUEST_SSP   equ 01120h
 CTX_GUEST_INTR_SSP_TABLE equ 01128h
+CTX_GUEST_DR7   equ 01130h
+CTX_GUEST_DEBUGCTL equ 01138h
 
 ; The VMX host RSP is HostStackTop. The C++ preparation stores the host
 ; KERNEL_GS_BASE shadow at HostStackTop - 8, which is offset 0x1178 after the
@@ -95,6 +98,8 @@ HOST_KGS_CONTEXT_SLOT equ 01178h
 ; before VMLAUNCH; the VM-exit path only reads them from this fixed frame.
 HOST_XCR0_FRAME_SLOT  equ 01168h
 HOST_XSS_FRAME_SLOT   equ 01170h
+HOST_DR7_FRAME_SLOT   equ 01158h
+HOST_DEBUGCTL_FRAME_SLOT equ 01160h
 
 ; HvRestoreStateAndReturn stages state in [guest-rsp - 100h].  This area is
 ; below the active guest stack and is kept separate from the iret frame near
@@ -176,10 +181,23 @@ HvVmExitEntryPoint proc
     shl rdx, 20h
     or rax, rdx
     mov [rsp + CTX_GUEST_KGS], rax
+    mov ecx, VMCS_GUEST_DR7
+    vmread rax, rcx
+    mov [rsp + CTX_GUEST_DR7], rax
+    mov ecx, VMCS_GUEST_DEBUGCTL
+    vmread rax, rcx
+    mov [rsp + CTX_GUEST_DEBUGCTL], rax
     mov rax, [rsp + HOST_KGS_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_KERNEL_GS_BASE
+    wrmsr
+    mov rax, [rsp + HOST_DR7_FRAME_SLOT]
+    mov dr7, rax
+    mov rax, [rsp + HOST_DEBUGCTL_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_IA32_DEBUGCTL
     wrmsr
 
     ; VMX does not virtualize XCR0.  Capture it before switching to the host
@@ -625,6 +643,13 @@ restoreSpillCanonicalCompare:
     mov r8, rsi
 
     ; Restore VMX-managed MSRs after the lifecycle marker has run.
+    mov rax, [r10 + CTX_GUEST_DR7]
+    mov dr7, rax
+    mov ecx, MSR_IA32_DEBUGCTL
+    mov rax, [r10 + CTX_GUEST_DEBUGCTL]
+    mov rdx, rax
+    shr rdx, 20h
+    wrmsr
     mov ecx, MSR_FS_BASE
     mov rax, [r10 + CTX_GUEST_FS]
     mov rdx, rax
@@ -861,12 +886,12 @@ HvLaunchGuest proc frame
     jz launchNotVmx
 
     ; GuestStartThunk executes a RET.  The call to HvLaunchGuest has already
-    ; pushed the wrapper continuation at [RSP+200h-8]; point guest RSP at that
+    ; pushed the wrapper continuation at [RSP+200h]; point guest RSP at that
     ; return slot so the successful VM-entry returns to enableHvDone exactly
-    ; as the original call would.  Using [RSP+200h] skips the return address and
-    ; transfers control through an uninitialized shadow-space value.
+    ; as the original call would.  The call return slot is exactly [RSP+200h]
+    ; after this thunk's private stack reservation.
     mov rax, rsp
-    add rax, 1F8h
+    add rax, 200h
     mov ecx, VMCS_GUEST_RSP
     mov rdx, rax
     vmwrite rcx, rdx
@@ -963,6 +988,10 @@ GetRflags proc
     pop rax
     ret
 GetRflags endp
+GetDr7 proc
+    mov rax, dr7
+    ret
+GetDr7 endp
 
 ; u32 HvGetSegmentLimit(u16 Selector)
 HvGetSegmentLimit proc

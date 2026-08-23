@@ -43,6 +43,7 @@
 #define MSR_IA32_SYSENTER_ESP           0x00000175
 #define MSR_IA32_SYSENTER_EIP           0x00000176
 #define MSR_IA32_PAT                    0x00000277
+#define MSR_IA32_DEBUGCTL               0x000001D9
 #define MSR_IA32_RTIT_OUTPUT_BASE       0x00000560
 #define MSR_IA32_RTIT_OUTPUT_MASK_PTRS  0x00000561
 #define MSR_IA32_RTIT_CTL               0x00000570
@@ -90,7 +91,6 @@
 #define IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX   (1ULL << 2)
 #define VMX_BASIC_PHYSICAL_ADDRESS_32            (1ULL << 48)
 #define VMX_BASIC_TRUE_CONTROLS                  (1ULL << 55)
-#define VMX_BASIC_NO_HW_ERROR_CODE               (1ULL << 56)
 #define VMX_BASIC_REVISION_MASK                  0x7FFFFFFFULL
 
 // Mandatory-one masks from Intel's VMX capability MSRs. These bits are
@@ -144,9 +144,11 @@
 #define VM_ENTRY_IA32E_MODE_GUEST                (1UL << 9)
 #define VM_EXIT_LOAD_HOST_EFER                   (1UL << 21)
 #define VM_EXIT_LOAD_HOST_PAT                    (1UL << 19)
+#define VM_EXIT_SAVE_DEBUG_CONTROLS              (1UL << 2)
 #define VM_ENTRY_LOAD_GUEST_EFER                 (1UL << 15)
 #define VM_ENTRY_LOAD_GUEST_PAT                  (1UL << 14)
 #define VM_ENTRY_LOAD_CET_STATE                  (1UL << 20)
+#define VM_ENTRY_LOAD_DEBUG_CONTROLS             (1UL << 2)
 #define VM_ENTRY_INTR_INFO_VALID                 (1UL << 31)
 #define VM_ENTRY_INTR_INFO_DELIVER_ERROR_CODE   (1UL << 11)
 #define VM_ENTRY_INTR_TYPE_HARDWARE_EXCEPTION   (3UL << 8)
