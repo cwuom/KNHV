@@ -891,8 +891,8 @@ HvVmPtrLd proc
 HvVmPtrLd endp
 
 HvVmWrite proc
-    ; Intel syntax takes the VMCS field first and the value second
-    vmwrite rcx, rdx
+    ; vmwrite takes the value first and the VMCS field second
+    vmwrite rdx, rcx
     pushfq
     pop rax
     ret
@@ -903,7 +903,10 @@ HvVmReadChecked proc
     vmread r8, rcx
     pushfq
     pop rax
+    test al, 041h
+    jnz vmreadFailed
     mov [rdx], r8
+vmreadFailed:
     ret
 HvVmReadChecked endp
 
@@ -931,13 +934,13 @@ HvLaunchGuest proc frame
     add rax, 200h
     mov ecx, VMCS_GUEST_RSP
     mov rdx, rax
-    vmwrite rcx, rdx
+    vmwrite rdx, rcx
     jc launchVmwriteFailure
     jz launchVmwriteFailure
 
     lea rdx, GuestStartThunk
     mov ecx, VMCS_GUEST_RIP
-    vmwrite rcx, rdx
+    vmwrite rdx, rcx
     jc launchVmwriteFailure
     jz launchVmwriteFailure
 

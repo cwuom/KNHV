@@ -175,6 +175,16 @@ struct VcpuContext {
     u32   VmxProfile;
     volatile long VmcsWriteFailed;
     volatile long VmcsReadFailed;
+    volatile long VmcsSetupPhase;
+    u64   FirstVmcsWriteField;
+    u64   FirstVmcsWriteFlags;
+    u64   FirstVmcsWriteError;
+    u64   FirstVmcsReadField;
+    u64   FirstVmcsReadFlags;
+    u64   LastVmclearFlags;
+    u64   LastVmptrldFlags;
+    u64   PrimaryControlsCapability;
+    u64   TertiaryControlsAllowed;
 
     // IA32_KERNEL_GS_BASE is not part of VMCS state and SWAPGS does not cause
     // a VM-exit. Keep the guest GS/KGS values in software so the exit path can

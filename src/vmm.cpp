@@ -14,6 +14,7 @@
 
 #include "header/vmm.h"
 #include "header/vmx.h"
+#include "header/vmx_contract.h"
 
 extern "C" void StopHypervisor();
 extern "C" PDRIVER_OBJECT g_HvDriverObject;
@@ -189,19 +190,35 @@ static u32 BuildVmxCapabilityProfile(u64 vmxBasic, bool xsaves,
     u32 profile = (vmxBasic & VMX_BASIC_TRUE_CONTROLS) != 0
                       ? VmxProfileTrueControls
                       : VmxProfileLegacyControls;
+    const u32 primaryMsr = ControlMsr(vmxBasic,
+                                      MSR_IA32_VMX_PROCBASED_CTLS,
+                                      MSR_IA32_VMX_TRUE_PROCBASED_CTLS);
+    u64 primaryControls = 0;
+    const bool primaryRead = ReadMsrSafe(primaryMsr, &primaryControls);
     u64 secondaryControls = 0;
-    if (ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS2, &secondaryControls) &&
-        secondaryControls != 0) {
+    const bool secondaryField =
+        primaryRead &&
+        ((static_cast<u32>(primaryControls >> 32) &
+          CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) != 0) &&
+        ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS2, &secondaryControls);
+    if (secondaryField) {
         profile |= VmxProfileSecondaryControls;
     }
-    if (xsaves) profile |= VmxProfileXsaves;
+    if (xsaves && secondaryField &&
+        (static_cast<u32>(secondaryControls >> 32) &
+         SECONDARY_ENABLE_XSAVES) != 0) {
+        profile |= VmxProfileXsaves;
+    }
     if (cetVmcs) profile |= VmxProfileCetVmcs;
     int regs[4] = {};
     __cpuid(regs, 0);
     const u32 maxBasicLeaf = static_cast<u32>(regs[0]);
     if (maxBasicLeaf >= 7) {
         __cpuidex(regs, 7, 0);
-        if ((regs[1] & (1 << 10)) != 0) {
+        if (secondaryField &&
+            (regs[1] & (1 << 10)) != 0 &&
+            (static_cast<u32>(secondaryControls >> 32) &
+             SECONDARY_ENABLE_INVPCID) != 0) {
             profile |= VmxProfileInvpcid;
         }
     }
@@ -209,17 +226,16 @@ static u32 BuildVmxCapabilityProfile(u64 vmxBasic, bool xsaves,
     const u32 maxExtendedLeaf = static_cast<u32>(regs[0]);
     if (maxExtendedLeaf >= 0x80000001) {
         __cpuidex(regs, 0x80000001, 0);
-        if ((regs[3] & (1 << 27)) != 0) {
+        if (secondaryField &&
+            (regs[3] & (1 << 27)) != 0 &&
+            (static_cast<u32>(secondaryControls >> 32) &
+             SECONDARY_ENABLE_RDTSCP) != 0) {
             profile |= VmxProfileRdtscp;
         }
     }
 
-    u64 primaryControls = 0;
-    const u32 primaryMsr = ControlMsr(vmxBasic,
-                                      MSR_IA32_VMX_PROCBASED_CTLS,
-                                      MSR_IA32_VMX_TRUE_PROCBASED_CTLS);
-    if (ReadMsrSafe(primaryMsr, &primaryControls) &&
-        (primaryControls >> 32 & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) != 0) {
+    if (primaryRead &&
+        ((primaryControls >> 32) & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) != 0) {
         u64 tertiaryControls = 0;
         if (ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS3, &tertiaryControls)) {
             profile |= VmxProfileTertiaryControls;
@@ -522,26 +538,27 @@ bool InitializeVmxFeatureContract() {
         g_SupportedXssMask = 0;
     }
 
-if (xsavesInstruction && xssRead &&
-    VmxControlAllows(MSR_IA32_VMX_PROCBASED_CTLS2,
-                      SECONDARY_ENABLE_XSAVES)) {
-    // Late-launch rule: Windows has already booted with the live IA32_XSS
-    // selector. Do not build the VM-exit XSAVES frame from components that
-    // are merely CPUID-enumerated but not selected by the running OS.
-    const u64 fixedXssMask = hostXss & IA32_XSS_VIRTUALIZABLE_MASK;
-    if ((fixedXssMask & ~enumeratedXss) != 0 ||
-        (fixedXssMask & ~IA32_XSS_VIRTUALIZABLE_MASK) != 0) {
-        return false;
-    }
+    const bool secondaryControlsUsable =
+        (g_VmxCapabilityProfile & VmxProfileSecondaryControls) != 0;
+    if (xsavesInstruction && xssRead && secondaryControlsUsable &&
+        VmxControlAllows(MSR_IA32_VMX_PROCBASED_CTLS2,
+                          SECONDARY_ENABLE_XSAVES)) {
+        // late-launch rule: Windows has already booted with the live
+        // IA32_XSS selector, so preserve only the selected virtualizable state
+        const u64 fixedXssMask = hostXss & IA32_XSS_VIRTUALIZABLE_MASK;
+        if ((fixedXssMask & ~enumeratedXss) != 0 ||
+            (fixedXssMask & ~IA32_XSS_VIRTUALIZABLE_MASK) != 0) {
+            return false;
+        }
 
-    u64 computedXssCapabilities = 0;
-    if (!ComputeXsaveAreaSize(hostXcr0, fixedXssMask,
-                              &computedXssCapabilities,
-                              &g_XsaveStateSize) ||
-        (fixedXssMask & ~computedXssCapabilities) != 0) {
-        return false;
-    }
-    g_XsavesEnabled = 1;
+        u64 computedXssCapabilities = 0;
+        if (!ComputeXsaveAreaSize(hostXcr0, fixedXssMask,
+                                  &computedXssCapabilities,
+                                  &g_XsaveStateSize) ||
+            (fixedXssMask & ~computedXssCapabilities) != 0) {
+            return false;
+        }
+        g_XsavesEnabled = 1;
     } else if (hostXss != 0) {
         // Ordinary XSAVE cannot preserve IA32_XSS-selected components.
         return false;
@@ -616,27 +633,66 @@ static __forceinline bool VmxOk(u64 rflags) {
     return ((rflags & 1ULL) == 0) && ((rflags & (1ULL << 6)) == 0);
 }
 
+enum VmcsSetupPhase : long {
+    VmcsSetupPhaseNone = 0,
+    VmcsSetupPhaseDescriptors = 1,
+    VmcsSetupPhaseHostState = 2,
+    VmcsSetupPhaseGuestState = 3,
+    VmcsSetupPhaseExecutionControls = 4,
+    VmcsSetupPhaseTertiaryControls = 5,
+    VmcsSetupPhaseExitEntryControls = 6,
+    VmcsSetupPhaseReadback = 7,
+};
+
+static __forceinline void SetVmcsSetupPhase(VcpuContext* vcpu,
+                                             VmcsSetupPhase phase) {
+    if (vcpu) {
+        InterlockedExchange(&vcpu->VmcsSetupPhase, phase);
+    }
+}
+
 static __forceinline bool VmWriteChecked(u64 field, u64 value) {
-    const u64 flags = HvVmWrite(field, value);
-    if (!VmxOk(flags) && g_VcpuData) {
+    VcpuContext* vcpu = nullptr;
+    if (g_VcpuData) {
         const u32 id = CurrentProcessorIndex();
         if (id < g_ProcessorCount) {
-            InterlockedExchange(&g_VcpuData[id].VmcsWriteFailed, 1);
+            vcpu = &g_VcpuData[id];
+            if (vcpu->VmcsWriteFailed != 0) return false;
         }
     }
-    return VmxOk(flags);
+    const u64 flags = HvVmWrite(field, value);
+    const bool success = VmxOk(flags);
+    if (!success && vcpu) {
+        if (InterlockedCompareExchange(&vcpu->VmcsWriteFailed, 1, 0) == 0) {
+            u64 instructionError = ~0ULL;
+            if ((flags & (1ULL << 6)) != 0) {
+                const u64 readFlags =
+                    HvVmReadChecked(VM_INSTRUCTION_ERROR, &instructionError);
+                if (!VmxOk(readFlags)) instructionError = ~0ULL;
+            }
+            vcpu->FirstVmcsWriteField = field;
+            vcpu->FirstVmcsWriteFlags = flags;
+            vcpu->FirstVmcsWriteError = instructionError;
+        }
+    }
+    return success;
 }
 
 static __forceinline bool VmReadChecked(u64 field, u64* value) {
     if (!value) return false;
     const u64 flags = HvVmReadChecked(field, value);
-    if (!VmxOk(flags) && g_VcpuData) {
+    const bool success = VmxOk(flags);
+    if (!success && g_VcpuData) {
         const u32 id = CurrentProcessorIndex();
         if (id < g_ProcessorCount) {
-            InterlockedExchange(&g_VcpuData[id].VmcsReadFailed, 1);
+            VcpuContext* vcpu = &g_VcpuData[id];
+            if (InterlockedCompareExchange(&vcpu->VmcsReadFailed, 1, 0) == 0) {
+                vcpu->FirstVmcsReadField = field;
+                vcpu->FirstVmcsReadFlags = flags;
+            }
         }
     }
-    return VmxOk(flags);
+    return success;
 }
 
 static __forceinline bool IsFixedCrValueValid(u64 value, u32 fixed0Msr,
@@ -1085,13 +1141,6 @@ static void InjectGuestException(GuestContext* c, u8 vector, bool hasErrorCode,
         !VmWriteChecked(CONTROL_VM_ENTRY_INSTRUCTION_LENGTH, 0)) {
         c->HaltVm = 1;
     }
-}
-
-static u64 AdjustControls64(u64 ctl, u32 msr) {
-    const u64 value = __readmsr(msr);
-    const u64 allowedOne = value >> 32;
-    const u64 mandatoryOne = value & 0xFFFFFFFFULL;
-    return (ctl & allowedOne) | mandatoryOne;
 }
 
 // handle hypervisor unload requests
@@ -2336,6 +2385,15 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if (!Vcpu) return false;
     VcpuContext* mutableVcpu = const_cast<VcpuContext*>(Vcpu);
     InterlockedExchange(&mutableVcpu->VmcsWriteFailed, 0);
+    InterlockedExchange(&mutableVcpu->VmcsReadFailed, 0);
+    mutableVcpu->FirstVmcsWriteField = 0;
+    mutableVcpu->FirstVmcsWriteFlags = 0;
+    mutableVcpu->FirstVmcsWriteError = 0;
+    mutableVcpu->FirstVmcsReadField = 0;
+    mutableVcpu->FirstVmcsReadFlags = 0;
+    mutableVcpu->PrimaryControlsCapability = 0;
+    mutableVcpu->TertiaryControlsAllowed = 0;
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseDescriptors);
     const u32 cpuId = CurrentProcessorIndex();
     HV_VERBOSE_PRINT("[HV] CPU %u VMCS setup begin: vmxon_pa=0x%llX "
                      "vmcs_pa=0x%llX msr_bitmap_pa=0x%llX host_cr3=0x%llX "
@@ -2412,6 +2470,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // ==============================================================================
     // Host State Configuration
     // ==============================================================================
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseHostState);
     VmWriteChecked(HOST_CR0, hostCr0);
 
     // set host CR3 to system directory table base
@@ -2464,6 +2523,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // ==============================================================================
     // Guest State Configuration
     // ==============================================================================
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseGuestState);
 
     // control registers
     VmWriteChecked(GUEST_CR0, AdjustCr0(__readcr0()));
@@ -2579,6 +2639,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // ==============================================================================
     // VM Execution Controls
     // ==============================================================================
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseExecutionControls);
 
     const VmxControlGeneration generation =
         SelectVmxControlGeneration(Vcpu->VmxProfile);
@@ -2604,6 +2665,10 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         default:
             return false;
     }
+
+    u64 primaryControlsCapability = 0;
+    if (!ReadMsrSafe(procCtlMsr, &primaryControlsCapability)) return false;
+    mutableVcpu->PrimaryControlsCapability = primaryControlsCapability;
 
     u32 pinCtl = AdjustControls(0, pinCtlMsr);
     // Intel requires a few reserved pin bits to be one (normally 0x16).
@@ -2693,21 +2758,30 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         // pass-through set selected from CPUID above.
         if (secCtl & ~secondaryRequested) return false;
     }
-    if (!VmWriteChecked(CONTROL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, secCtl)) return false;
+    if ((procCtl & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) != 0 &&
+        !VmWriteChecked(
+            CONTROL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+            secCtl)) {
+        return false;
+    }
 
-    // Recent Intel processors may require primary control bit 17, which
-    // activates the 64-bit tertiary controls field. Intel capability MSRs
-    // encode mandatory-one bits in the low half; those bits must be written
-    // even when this monitor does not request optional tertiary features.
+    // The tertiary capability MSR is a direct 64-bit allowed-one bitmap. Do
+    // not apply AdjustControls, whose low half has a different meaning.
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseTertiaryControls);
     if (procCtl & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) {
         if ((profile & VmxProfileTertiaryControls) == 0) return false;
-        u64 tertiaryCtl = 0;
-        __try {
-            tertiaryCtl = AdjustControls64(0, MSR_IA32_VMX_PROCBASED_CTLS3);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        u64 tertiaryAllowedOne = 0;
+        if (!ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS3, &tertiaryAllowedOne)) {
             return false;
         }
+        mutableVcpu->TertiaryControlsAllowed = tertiaryAllowedOne;
+        constexpr u64 tertiaryRequested = 0;
+        if (!HvTertiaryControlsAllowed(tertiaryRequested,
+                                       tertiaryAllowedOne)) {
+            return false;
+        }
+        const u64 tertiaryCtl = HvNormalizeTertiaryControls(
+            tertiaryRequested, tertiaryAllowedOne);
         if (!VmWriteChecked(
                 CONTROL_TERTIARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
                 tertiaryCtl)) {
@@ -2718,6 +2792,11 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         HV_VERBOSE_PRINT("[HV] CPU %u tertiary VMX controls: 0x%llX\n",
                          cpuId, tertiaryCtl);
     }
+
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseExitEntryControls);
+
+    // optional fields stay untouched while their activating controls remain
+    // zero, avoiding VMfailValid on implementations without those components
 
     if (!VmWriteChecked(CONTROL_MSR_BITMAP_ADDRESS, Vcpu->MsrBitmapPhys)) return false;
     if (g_XsavesEnabled &&
@@ -2764,6 +2843,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(CONTROL_CR4_GUEST_HOST_MASK, cr4GuestHostMask);
     VmWriteChecked(CONTROL_CR4_READ_SHADOW, guestCr4 & ~cr4GuestHostMask);
 
+    SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseReadback);
     bool success = mutableVcpu->VmcsWriteFailed == 0;
     u64 vmcsHostCr0 = 0;
     u64 vmcsHostCr3 = 0;
@@ -2872,6 +2952,17 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
     InterlockedExchange(&vcpu->LaunchStage, 1);
     InterlockedExchange(&vcpu->VmcsWriteFailed, 0);
     InterlockedExchange(&vcpu->VmcsReadFailed, 0);
+    InterlockedExchange(&vcpu->VmcsSetupPhase, VmcsSetupPhaseNone);
+    vcpu->FirstVmcsWriteField = 0;
+    vcpu->FirstVmcsWriteFlags = 0;
+    vcpu->FirstVmcsWriteError = 0;
+    vcpu->FirstVmcsReadField = 0;
+    vcpu->FirstVmcsReadFlags = 0;
+    vcpu->LastVmclearFlags = 0;
+    vcpu->LastVmptrldFlags = 0;
+    vcpu->PrimaryControlsCapability = 0;
+    vcpu->TertiaryControlsAllowed = 0;
+    vcpu->LastVmInstructionError = 0;
 
     volatile bool vmxActive = false;
     volatile bool cr4Prepared = false;
@@ -3207,6 +3298,8 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         const u64 vmptrldFlags = VmxOk(vmclearFlags)
                                      ? HvVmPtrLd(&vcpu->VmcsPhys)
                                      : vmclearFlags;
+        vcpu->LastVmclearFlags = vmclearFlags;
+        vcpu->LastVmptrldFlags = vmptrldFlags;
         if (!VmxOk(vmclearFlags) || !VmxOk(vmptrldFlags) ||
             !SetupVmcs(vcpu, GuestSp, GuestIp)) {
             u64 instructionError = 0;
@@ -3214,9 +3307,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                 !VmReadChecked(VM_INSTRUCTION_ERROR, &instructionError)) {
                 instructionError = ~0ULL;
             }
-            HV_VERBOSE_PRINT("[HV] CPU %u VMCS setup failed: vmclear=0x%llX "
-                             "vmptrld=0x%llX instruction_error=0x%llX\n", id,
-                             vmclearFlags, vmptrldFlags, instructionError);
+            vcpu->LastVmInstructionError = instructionError;
             HvVmxOff();
             __writecr0(vcpu->OriginalCr0);
             __writecr4(vcpu->OriginalCr4);
@@ -3530,7 +3621,12 @@ extern "C" NTSTATUS StartHypervisor() {
         DbgPrint("[HV] CPU %u launch result: state=%ld stage=%ld vmexits=%ld "
                  "launch_flags=0x%llX raw_reason=0x%08X basic=%u "
                  "entry_failure=%u action=%ld resumes=%ld rip=0x%llX "
-                 "instrerr=0x%llX resume_flags=0x%llX\n",
+                 "instrerr=0x%llX resume_flags=0x%llX setup_phase=%ld "
+                 "vmwrite_failed=%ld write_field=0x%llX write_flags=0x%llX "
+                 "write_error=0x%llX "
+                 "vmread_failed=%ld read_field=0x%llX read_flags=0x%llX "
+                 "vmclear=0x%llX vmptrld=0x%llX primary_caps=0x%llX "
+                 "tertiary_caps=0x%llX\n",
                  i,
                  g_VcpuData[i].State,
                  g_VcpuData[i].LaunchStage,
@@ -3543,7 +3639,19 @@ extern "C" NTSTATUS StartHypervisor() {
                 g_VcpuData[i].VmResumeAttempts,
                 g_VcpuData[i].LastGuestRip,
                 g_VcpuData[i].LastVmInstructionError,
-                g_VcpuData[i].LastVmResumeFlags);
+                g_VcpuData[i].LastVmResumeFlags,
+                g_VcpuData[i].VmcsSetupPhase,
+                g_VcpuData[i].VmcsWriteFailed,
+                g_VcpuData[i].FirstVmcsWriteField,
+                g_VcpuData[i].FirstVmcsWriteFlags,
+                g_VcpuData[i].FirstVmcsWriteError,
+                g_VcpuData[i].VmcsReadFailed,
+                g_VcpuData[i].FirstVmcsReadField,
+                g_VcpuData[i].FirstVmcsReadFlags,
+                g_VcpuData[i].LastVmclearFlags,
+                g_VcpuData[i].LastVmptrldFlags,
+                g_VcpuData[i].PrimaryControlsCapability,
+                g_VcpuData[i].TertiaryControlsAllowed);
 
         if (g_VcpuData[i].State == VcpuLaunched) {
             ok++;
