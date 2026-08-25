@@ -419,22 +419,33 @@ u32 GetXsaveStateSize() {
 
 static bool IsGdtSelectorUsable(u64 gdtBase, u16 gdtLimit, u16 selector,
                                 bool allowNull, bool requireSystem,
-                                bool requireCode) {
+                                bool requireCode,
+                                bool requireKernelPrivilege,
+                                bool requireWritableData) {
     if (selector == 0) return allowNull;
-    if ((selector & 0x7U) != 0 || (selector & 0xFFF8U) > gdtLimit ||
-        !IsCanonical(gdtBase)) {
+    const u16 offset = selector & 0xFFF8U;
+    // segment RPL may be nonzero for the current DS, ES, FS, or GS selector
+    // even while the kernel runs at CPL 0. Only LDT selectors lack a GDT base.
+    if ((selector & 0x4U) != 0 || offset > gdtLimit ||
+        !IsCanonical(gdtBase) || !IsCanonical(gdtBase + offset)) {
         return false;
     }
-    const auto descriptor = reinterpret_cast<const u8*>(gdtBase +
-                                                         (selector & 0xFFF8U));
+    const auto descriptor = reinterpret_cast<const u8*>(gdtBase + offset);
     const u8 access = descriptor[5];
     const u8 type = access & 0x0FU;
     if ((access & 0x80U) == 0) return false;
-    if ((access & 0x60U) != 0) return false;
-    if (requireSystem) return (type == 9U || type == 0xBU) &&
-                                  (gdtLimit - (selector & 0xFFF8U)) >= 15U;
+    if (requireKernelPrivilege &&
+        (((selector & 0x3U) != 0) || (access & 0x60U) != 0)) {
+        return false;
+    }
+    if (requireSystem) {
+        return (access & 0x10U) == 0 && (type == 9U || type == 0xBU) &&
+               gdtLimit - offset >= 15U;
+    }
     if ((access & 0x10U) == 0) return false;
-    return requireCode ? (type & 0x8U) != 0 : (type & 0x8U) == 0;
+    if (requireCode) return (type & 0x8U) != 0;
+    if ((type & 0x8U) != 0) return false;
+    return !requireWritableData || (type & 0x2U) != 0;
 }
 
 bool InitializeVmxFeatureContract() {
@@ -2605,8 +2616,9 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
 // extract the 64-bit base address from a 16-byte tss descriptor
 u64 GetTssBase(const u64 GdtBase, const u16 GdtLimit, const u16 Selector) {
     const u64 offset = Selector & 0xFFF8U;
-    if (offset == 0 || offset > GdtLimit || GdtLimit - offset < 15U ||
-        !IsCanonical(GdtBase) || !IsCanonical(GdtBase + offset)) {
+    if ((Selector & 0x7U) != 0 || offset == 0 || offset > GdtLimit ||
+        GdtLimit - offset < 15U || !IsCanonical(GdtBase) ||
+        !IsCanonical(GdtBase + offset)) {
         return 0;
     }
     auto descriptor = reinterpret_cast<u8*>(GdtBase + offset);
@@ -2672,15 +2684,23 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     const u64 guestCr3 = NormalizeCr3(__readcr3(), hostCr4);
 
     if (!IsCanonical(gdtBase) || !IsCanonical(idtBase) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, csSelector, false, false, true) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, ssSelector, false, false, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, dsSelector, true, false, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, esSelector, true, false, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, fsSelector, true, false, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, gsSelector, true, false, false) ||
-        !IsGdtSelectorUsable(gdtBase, gdtLimit, trSelector, false, true, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, csSelector, false, false, true,
+                             true, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, ssSelector, false, false, false,
+                             true, true) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, dsSelector, true, false, false,
+                             false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, esSelector, true, false, false,
+                             false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, fsSelector, true, false, false,
+                             false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, gsSelector, true, false, false,
+                             false, false) ||
+        !IsGdtSelectorUsable(gdtBase, gdtLimit, trSelector, false, true, false,
+                             true, false) ||
         (ldtrSelector != 0 &&
-         !IsGdtSelectorUsable(gdtBase, gdtLimit, ldtrSelector, false, true, false)) ||
+         !IsGdtSelectorUsable(gdtBase, gdtLimit, ldtrSelector, false, true,
+                              false, true, false)) ||
         !IsValidArchitecturalCr3(hostCr3, hostCr4) ||
         !IsValidArchitecturalCr3(guestCr3, hostCr4) ||
         tssBase == 0) {

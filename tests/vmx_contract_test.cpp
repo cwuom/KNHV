@@ -459,7 +459,27 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "non-empty LDTR fails closed", vmm,
                R"(ldtrSelector\s*!=\s*0[\s\S]{0,600}non-empty LDTR[\s\S]{0,240}return false)");
   CheckPattern(state, "GDT validation checks descriptor type", vmm,
-               R"(static bool IsGdtSelectorUsable\([\s\S]{0,700}access\s*=\s*descriptor\[5\][\s\S]{0,300}access\s*&\s*0x80U[\s\S]{0,300}requireSystem)");
+               R"(const u8 type = access & 0x0FU;[\s\S]{0,900}if \(requireSystem\)[\s\S]{0,260}type == 9U)");
+  const std::size_t selector_validator =
+      vmm.find("static bool IsGdtSelectorUsable(");
+  const std::size_t selector_validator_end =
+      vmm.find("bool InitializeVmxFeatureContract()", selector_validator);
+  const std::string selector_validator_source =
+      selector_validator != std::string::npos &&
+              selector_validator_end > selector_validator
+          ? vmm.substr(selector_validator,
+                       selector_validator_end - selector_validator)
+          : std::string{};
+  Check(state, "GDT validation accepts user RPL data selectors",
+        selector_validator_source.find("selector & 0x4U") != std::string::npos &&
+            selector_validator_source.find("requireKernelPrivilege") !=
+                std::string::npos &&
+            selector_validator_source.find("selector & 0x3U") !=
+                std::string::npos);
+  CheckPattern(state, "VMCS accepts current user data selectors", vmm,
+               R"(dsSelector,\s*true,\s*false,\s*false,\s*false,\s*false[\s\S]{0,180}esSelector,\s*true,\s*false,\s*false,\s*false,\s*false)");
+  CheckPattern(state, "VMCS keeps CS SS and TR at kernel privilege", vmm,
+               R"(csSelector,\s*false,\s*false,\s*true,\s*true,\s*false[\s\S]{0,260}ssSelector,\s*false,\s*false,\s*false,\s*true,\s*true[\s\S]{0,800}trSelector,\s*false,\s*true,\s*false,\s*true,\s*false)");
   CheckPattern(state, "TSS base is canonical before VMCS write", vmm,
                R"(base\s*\|=\s*\(high\s*<<\s*32\)[\s\S]{0,120}return\s+IsCanonical\(base\)\s*\?\s*base\s*:\s*0)");
   CheckPattern(state, "feature contract has a sticky validity result", vmm,
