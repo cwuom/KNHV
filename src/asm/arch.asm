@@ -14,6 +14,7 @@ extern HvFatalBugCheck:proc
 extern g_LinearAddressBits:byte
 extern g_CetVmcsEnabled:byte
 extern g_XsavesEnabled:byte
+extern g_XstateMode:byte
 extern g_XsavesMask:qword
 
 MSR_FS_BASE     equ 0C0000100h
@@ -35,6 +36,9 @@ MSR_IA32_SYSENTER_ESP equ 00000175h
 MSR_IA32_SYSENTER_EIP equ 00000176h
 CR4_CET         equ 0800000h
 CR4_VMXE        equ 02000h
+XSTATE_SAVE_FXSAVE equ 0
+XSTATE_SAVE_XSAVE  equ 1
+XSTATE_SAVE_XSAVES equ 2
 
 ; VMCS fields used by the launch thunk.  The values are the architectural
 ; encodings from Intel SDM Vol. 3C, Table B-1.
@@ -219,9 +223,12 @@ vmxDebugStateReady:
     mov ecx, MSR_IA32_DEBUGCTL
     wrmsr
 
-    ; VMX does not virtualize XCR0.  Capture it before switching to the host
-    ; mask used by the C++ exit handler. IA32_XSS is read only on the optional
-    ; XSAVES path; older processors may fault on that MSR.
+    ; VMX does not virtualize XCR0. Capture the guest mask, then switch to the
+    ; validated host mask before saving state. Saving with the guest's current
+    ; mask would leave a disabled component live in hardware; if the guest
+    ; enabled it again later, it could observe the host's value.
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je vmxSaveFxsave
     xor ecx, ecx
     xgetbv
     mov r8d, eax
@@ -230,6 +237,12 @@ vmxDebugStateReady:
     shl rdx, 20h
     or r8, rdx
     mov [rsp + CTX_GUEST_XCR0], r8
+
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
 
     cmp byte ptr [g_XsavesEnabled], 0
     je vmxSaveXsave
@@ -251,7 +264,7 @@ vmxDebugStateReady:
     mov edx, r14d
     mov ecx, MSR_IA32_XSS
     wrmsr
-    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     or rax, r15
     mov rdx, rax
     shr rdx, 20h
@@ -260,16 +273,25 @@ vmxDebugStateReady:
 
 vmxSaveXsave:
     mov qword ptr [rsp + CTX_GUEST_XSS], 0
-    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     xsave [rsp]
+
+    jmp short vmxStateSaved
+
+vmxSaveFxsave:
+    mov qword ptr [rsp + CTX_GUEST_XCR0], 0
+    mov qword ptr [rsp + CTX_GUEST_XSS], 0
+    fxsave64 [rsp]
 
 vmxStateSaved:
 
     ; Restore the host masks before touching any compiler-generated code.
     ; PrepareHvCallback initializes these per-CPU slots immediately below the
     ; host KERNEL_GS_BASE shadow.
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je vmxHostMasksReady
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
@@ -297,9 +319,12 @@ vmxHostMasksReady:
     call VmExitHandler
     add rsp, 20h
 
-    ; The handler ran with the host XCR0/XSS contract. Restore the guest mask
-    ; and state frame before inspecting the VM-exit action flags.
-    mov rax, [rsp + CTX_GUEST_XCR0]
+    ; The handler ran with the host XCR0/XSS contract. Restore the complete
+    ; host-saved state first, then switch to the guest mask. This keeps state
+    ; for components the guest temporarily disabled from leaking across exits.
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je vmxRestoreFxsave
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, 0
@@ -316,7 +341,7 @@ vmxHostMasksReady:
     mov edx, r14d
     mov ecx, MSR_IA32_XSS
     wrmsr
-    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     or rax, r15
     mov rdx, rax
     shr rdx, 20h
@@ -326,13 +351,29 @@ vmxHostMasksReady:
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
-    jmp short vmxStateRestored
-
-vmxRestoreXsave:
     mov rax, [rsp + CTX_GUEST_XCR0]
     mov rdx, rax
     shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    jmp short vmxStateRestored
+
+vmxRestoreXsave:
+    mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
     xrstor [rsp]
+
+    mov rax, [rsp + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+
+    jmp short vmxStateRestored
+
+vmxRestoreFxsave:
+    fxrstor64 [rsp]
 
 vmxStateRestored:
     ; Windows x64 C/C++ code requires DF=0.  RFLAGS (including the guest's
@@ -397,6 +438,8 @@ vmxHalt:
     ; vmxHalt can be reached after the guest masks were restored (for example
     ; an unsupported VM-exit or a VMRESUME failure).  Keep the park marker and
     ; all subsequent root-mode instructions on the host XCR0/XSS contract.
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je vmxHaltHostMasksReady
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
@@ -443,6 +486,8 @@ vmxResumeFailure:
     ; choosing native teardown; only an invalid frame falls through to park.
     pushfq
     pop rbx                         ; preserve VMRESUME CF/ZF flags
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je vmxResumeFailureHostMasksReady
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
@@ -489,16 +534,32 @@ HvRestoreStateAndReturn proc
     cli
     mov r10, rcx                         ; host GuestContext pointer
     mov rbx, r10
-    ; the teardown callback may clobber volatile state
-    ; restore host IA32_XSS before entering it when XSAVES is active
+    ; vmx does not restore IA32_KERNEL_GS_BASE, so the exit epilogue leaves
+    ; the guest value installed until the host value is restored here
+    mov rax, [r10 + HOST_KGS_CONTEXT_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, MSR_KERNEL_GS_BASE
+    wrmsr
+    ; the teardown callback runs as ordinary host C++ code. Restore the host
+    ; XCR0/XSS contract before entering it, then restore the guest masks after
+    ; VMXOFF and before the native IRET handoff.
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je teardownHostMasksReady
+    mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    ; restore host IA32_XSS before entering the callback when XSAVES is active
     cmp byte ptr [g_XsavesEnabled], 0
-    je teardownHostXssReady
+    je teardownHostMasksReady
     mov rax, [r10 + HOST_XSS_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
-teardownHostXssReady:
+teardownHostMasksReady:
     sub rsp, 20h
     call MarkCurrentVcpuTearingDown
     add rsp, 20h
@@ -724,7 +785,9 @@ restoreSpillCanonicalCompare:
 
     ; The teardown path returns to the guest, so use the guest masks captured
     ; by the VM-exit entry rather than the host masks used by C++.
-    mov rax, [r10 + CTX_GUEST_XCR0]
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je restoreGuestFxsave
+    mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
     mov ecx, 0
@@ -740,7 +803,7 @@ restoreSpillCanonicalCompare:
     mov edx, r14d
     mov ecx, MSR_IA32_XSS
     wrmsr
-    mov rax, [r10 + CTX_GUEST_XCR0]
+    mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
     or rax, r15
     mov rdx, rax
     shr rdx, 20h
@@ -750,13 +813,29 @@ restoreSpillCanonicalCompare:
     shr rdx, 20h
     mov ecx, MSR_IA32_XSS
     wrmsr
-    jmp short restoreGuestStateDone
-
-restoreGuestXsave:
     mov rax, [r10 + CTX_GUEST_XCR0]
     mov rdx, rax
     shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+    jmp short restoreGuestStateDone
+
+restoreGuestXsave:
+    mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
+    mov rdx, rax
+    shr rdx, 20h
     xrstor [r10]
+
+    mov rax, [r10 + CTX_GUEST_XCR0]
+    mov rdx, rax
+    shr rdx, 20h
+    mov ecx, 0
+    xsetbv
+
+    jmp short restoreGuestStateDone
+
+restoreGuestFxsave:
+    fxrstor64 [r10]
 
 restoreGuestStateDone:
     ; The CET VMCS path is disabled for the current contract. Keep the writes
@@ -819,6 +898,8 @@ restoreInvalid:
     cli
     ; No guest continuation is possible here.  Restore host XCR0/XSS before
     ; calling the park marker, whose implementation is normal kernel C++.
+    cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
+    je restoreInvalidHostMasksReady
     mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
@@ -891,8 +972,9 @@ HvVmPtrLd proc
 HvVmPtrLd endp
 
 HvVmWrite proc
-    ; vmwrite takes the value first and the VMCS field second
-    vmwrite rdx, rcx
+    ; Intel VMWRITE uses ModRM.reg for the VMCS field and ModRM.r/m for value
+    ; Win64 passes Field in RCX and Value in RDX
+    vmwrite rcx, rdx
     pushfq
     pop rax
     ret
@@ -934,13 +1016,13 @@ HvLaunchGuest proc frame
     add rax, 200h
     mov ecx, VMCS_GUEST_RSP
     mov rdx, rax
-    vmwrite rdx, rcx
+    vmwrite rcx, rdx
     jc launchVmwriteFailure
     jz launchVmwriteFailure
 
     lea rdx, GuestStartThunk
     mov ecx, VMCS_GUEST_RIP
-    vmwrite rdx, rcx
+    vmwrite rcx, rdx
     jc launchVmwriteFailure
     jz launchVmwriteFailure
 

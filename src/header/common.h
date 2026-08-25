@@ -25,6 +25,7 @@ constexpr u64 VMEXIT_HOST_XSS_OFFSET = 0x1170;
 constexpr u64 VMEXIT_HOST_KGS_OFFSET = 0x1178;
 constexpr u64 VMEXIT_HOST_DR7_OFFSET = 0x1158;
 constexpr u64 VMEXIT_HOST_DEBUGCTL_OFFSET = 0x1160;
+constexpr u32 FXSAVE_AREA_SIZE = 512;
 static_assert(VMEXIT_XSAVE_MAX <= VMEXIT_FRAME_SIZE, "XSAVE frame exceeds VM-exit frame");
 static_assert(VMEXIT_HOST_XCR0_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
               "host XCR0 slot exceeds VM-exit frame");
@@ -36,6 +37,12 @@ static_assert(VMEXIT_HOST_DR7_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
               "host DR7 slot exceeds VM-exit frame");
 static_assert(VMEXIT_HOST_DEBUGCTL_OFFSET + sizeof(u64) <= VMEXIT_FRAME_SIZE,
               "host DEBUGCTL slot exceeds VM-exit frame");
+
+enum XstateSaveMode : u8 {
+    XstateSaveFxsave = 0,
+    XstateSaveXsave = 1,
+    XstateSaveXsaves = 2,
+};
 // Returned by GuestStartThunk after a successful VM-entry.  A distinct value
 // lets the C++ launch callback distinguish the normal guest continuation from
 // a VMLAUNCH failure (which returns VMX flags instead).
@@ -171,7 +178,8 @@ struct VcpuContext {
     u64   VmxBasic;
     u32   RevisionId;
     // Capability profile selected for this logical processor.  The assembly
-    // save contract is global, so mixed profiles are rejected before VMXON.
+    // save contract is global, while optional VMX controls are local so
+    // heterogeneous P/E cores can choose their own safe control set.
     u32   VmxProfile;
     volatile long VmcsWriteFailed;
     volatile long VmcsReadFailed;
@@ -221,15 +229,17 @@ struct VcpuContext {
     u64   HostSsAr;
     volatile long NativeTeardownSafe;
 
+    // stopped is published only after the unload callback has returned
+    // from the non-returning VMXOFF and IRET transition
+    volatile long TeardownQuiesced;
+
     // State is published with InterlockedExchange so lifecycle callbacks can
     // inspect it without taking a lock at IPI_LEVEL.
     volatile long State;
 
-    // XCR0 is not part of VMCS guest/host state.  XSETBV in VMX non-root can
-    // otherwise change the mask used by the VM-exit XSAVE prologue while the
-    // C++ handler is running.  Capture the root mask at launch and only
-    // permit a guest XSETBV that leaves it unchanged; a different request is
-    // turned into #GP instead of touching host XCR0.
+    // XCR0 is not part of VMCS guest/host state. The guest mask may be a
+    // validated subset of the host mask; the assembly path switches to the
+    // host mask while C++ runs and restores this value before VMRESUME.
     u64   HostXcr0;
 
     // Diagnostic counters are kept per logical processor so the VM-exit path

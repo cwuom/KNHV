@@ -77,29 +77,35 @@ bool IsVmxSupported() {
     if (maxBasicLeaf < 1) return RejectVmx("CPUID basic leaf 1 is unavailable");
 
     __cpuidex(cpuInfo, 1, 0);
+    const bool fxsrEnumerated = (static_cast<u32>(cpuInfo[3]) &
+                                CPUID_1_EDX_FXSR) != 0;
+    const bool xsaveEnumerated = (static_cast<u32>(cpuInfo[2]) &
+                                  CPUID_1_ECX_XSAVE) != 0;
+    const bool osxsaveEnabled = (static_cast<u32>(cpuInfo[2]) &
+                                 CPUID_1_ECX_OSXSAVE) != 0;
+    const u64 currentCr4 = __readcr4();
+    const bool cr4OsxsaveEnabled = (currentCr4 & CR4_OSXSAVE) != 0;
     DbgPrint("[HV] CPUID.1:ECX=0x%08X\n", static_cast<ULONG>(cpuInfo[2]));
     DbgPrint("[HV] CPUID.1: VMX=%u XSAVE=%u OSXSAVE=%u hypervisor=%u CET_CR4=%u\n",
              (cpuInfo[2] & (1 << 5)) != 0 ? 1U : 0U,
-             (cpuInfo[2] & (1 << 26)) != 0 ? 1U : 0U,
-             (cpuInfo[2] & (1 << 27)) != 0 ? 1U : 0U,
+             xsaveEnumerated ? 1U : 0U,
+             osxsaveEnabled ? 1U : 0U,
              (cpuInfo[2] & (1 << 31)) != 0 ? 1U : 0U,
-             (__readcr4() & CR4_CET) != 0 ? 1U : 0U);
+             (currentCr4 & CR4_CET) != 0 ? 1U : 0U);
     if (!(cpuInfo[2] & (1 << 5))) return RejectVmx("CPUID.1:ECX.VMX is clear");
     if (cpuInfo[2] & (1 << 31)) return RejectVmx("another hypervisor is active; nested VMX is disabled");
-    if (!(cpuInfo[2] & (1 << 26)) || !(cpuInfo[2] & (1 << 27))) {
-        return RejectVmx("XSAVE or OSXSAVE is unavailable");
-    }
-    // The VM-exit entry stub executes XGETBV/XSAVE/XRSTOR on every exit.  Do
-    // not enter VMX unless the running kernel has enabled OSXSAVE and XCR0
-    // contains the architectural x87 state required by XSAVE.
-    const u64 currentCr4 = __readcr4();
+    // The VM-exit entry uses XSAVE when the OS has enabled it. Older Intel
+    // processors, or kernels with OSXSAVE disabled, use the FXSAVE backend.
+    // Both paths still require the legacy SSE save contract.
     // CR4.CET is a prerequisite for CET, but it is not by itself proof that
     // shadow-stack or IBT enforcement is enabled. Those controls live in
     // IA32_{U,S}_CET, while IA32_XSS advertises supervisor XSTATE components
     // that ordinary XSAVE/XRSTOR does not preserve. Read the complete state
     // before deciding which capability is outside this monitor's contract.
     DbgPrint("[HV] CR4=0x%llX\n", currentCr4);
-    if ((currentCr4 & (1ULL << 18)) == 0) return RejectVmx("CR4.OSXSAVE is clear");
+    if ((currentCr4 & CR4_FRED) != 0) {
+        return RejectVmx("FRED event delivery is active and unsupported");
+    }
     const u64 currentCr0 = __readcr0();
     DbgPrint("[HV] CR0=0x%llX\n", currentCr0);
     // XSAVE(S)/XRSTOR(S) raise #NM while CR0.TS is set and #UD while EM is
@@ -107,7 +113,7 @@ bool IsVmxSupported() {
     // nonstandard lazy-FPU configuration before VMXON instead of risking a
     // fault on the private VMX stack.
     if ((currentCr0 & ((1ULL << 2) | (1ULL << 3))) != 0) {
-        return RejectVmx("CR0.EM or CR0.TS blocks XSAVE instructions");
+        return RejectVmx("CR0.EM or CR0.TS blocks floating-point save");
     }
 
     u64 userCet = 0;
@@ -119,18 +125,25 @@ bool IsVmxSupported() {
     u64 pl3Ssp = 0;
     u64 interruptSspTable = 0;
     __try {
-        // XSAVE/XRSTOR and compiler-generated floating-point code require
-        // both the architectural x87 and SSE state components enabled in
-        // XCR0.  Refuse a nonstandard kernel configuration rather than
-        // entering VMX with an XSAVE frame the exit stub cannot restore.
-        const u64 xcr0 = _xgetbv(0);
-        DbgPrint("[HV] XCR0=0x%llX\n", xcr0);
-        if ((xcr0 & 0x3ULL) != 0x3ULL) return RejectVmx("XCR0 lacks x87/SSE state");
-        __cpuidex(cpuInfo, 0xD, 0);
-        const u64 supportedXcr0 = static_cast<u32>(cpuInfo[0]) |
-                                  (static_cast<u64>(static_cast<u32>(cpuInfo[3])) << 32);
-        if ((xcr0 & ~supportedXcr0) != 0) {
-            return RejectVmx("XCR0 contains an unenumerated state component");
+        if (xsaveEnumerated && osxsaveEnabled && cr4OsxsaveEnabled) {
+            const u64 xcr0 = _xgetbv(0);
+            DbgPrint("[HV] XCR0=0x%llX\n", xcr0);
+            if ((xcr0 & 0x3ULL) != 0x3ULL) {
+                return RejectVmx("XCR0 lacks x87/SSE state");
+            }
+            __cpuidex(cpuInfo, 0xD, 0);
+            const u64 supportedXcr0 = static_cast<u32>(cpuInfo[0]) |
+                                      (static_cast<u64>(static_cast<u32>(cpuInfo[3])) << 32);
+            if ((xcr0 & ~supportedXcr0) != 0) {
+                return RejectVmx("XCR0 contains an unenumerated state component");
+            }
+        } else if (!fxsrEnumerated ||
+                   (currentCr4 & CR4_OSFXSR) == 0 ||
+                   (currentCr4 & CR4_OSXSAVE) != 0 ||
+                   (currentCr4 & CR4_PKE) != 0) {
+            return RejectVmx("legacy FXSAVE state is unavailable");
+        } else {
+            DbgPrint("[HV] XSTATE: using legacy FXSAVE backend\n");
         }
         // CPUID.0D.0 enumerates every XCR0 component the processor can
         // support, not only the components enabled by the running OS. The
@@ -204,14 +217,17 @@ bool IsVmxSupported() {
                          static_cast<ULONG>(cpuInfo[3]));
             }
         }
-        if (fredEnumerated) {
-            return RejectVmx("FRED is enumerated but its VMX state is unsupported");
+        // CPUID advertises FRED capability, while CR4.FRED tells whether the
+        // current host actually uses FRED event delivery.  An enumerated but
+        // inactive feature does not alter the VMX host-state contract.
+        if (fredEnumerated && (currentCr4 & CR4_FRED) != 0) {
+            return RejectVmx("FRED event delivery is active and unsupported");
         }
     }
     bool xsavesEnumerated = false;
     bool xrstorsEnumerated = false;
     bool xfdEnumerated = false;
-    if (maxBasicLeaf >= 0xD) {
+    if (maxBasicLeaf >= 0xD && xsaveEnumerated) {
         __cpuidex(cpuInfo, 0xD, 1);
         // Intel defines EAX[3] as the paired XSAVES/XRSTORS capability.
         // EAX[4] is extended feature disable (XFD), not XRSTORS.
@@ -270,7 +286,7 @@ bool IsVmxSupported() {
         return RejectVmx("active user CET state is outside the safe VMX contract");
     }
     if ((supervisorCet & IA32_CET_ENABLE_MASK) != 0 ||
-        supervisorCet != 0 || pl0Ssp != 0 || pl1Ssp != 0 ||
+        pl0Ssp != 0 || pl1Ssp != 0 ||
         pl2Ssp != 0 || interruptSspTable != 0) {
         return RejectVmx("active supervisor CET state is outside the safe VMX contract");
     }
@@ -284,8 +300,6 @@ bool IsVmxSupported() {
     DbgPrint("[HV] CET contract selected: VMCS=%u XSAVES=%u\n",
              IsCETVmcsEnabled() ? 1U : 0U,
              IsXsavesEnabled() ? 1U : 0U);
-    if (maxBasicLeaf < 0xD) return RejectVmx("CPUID leaf 0xD is unavailable");
-
     __try {
         u64 featureControl = __readmsr(MSR_IA32_FEATURE_CONTROL);
         // Do not write IA32_FEATURE_CONTROL here.  Setting the lock bit is

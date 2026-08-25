@@ -182,6 +182,8 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(CPUID_D1_XSAVES\s+\(1U\s*<<\s*3\))");
   CheckPattern(state, "CPUID XFD uses bit 4", vmx,
                R"(CPUID_D1_XFD\s+\(1U\s*<<\s*4\))");
+  CheckPattern(state, "CPUID XGETBV1 uses bit 2", vmx,
+               R"(CPUID_D1_XGETBV1\s+\(1U\s*<<\s*2\))");
   CheckPattern(state, "tertiary control activation encoding", vmx,
                R"(CPU_BASED_ACTIVATE_TERTIARY_CONTROLS\s+\(1UL\s*<<\s*17\))");
   CheckPattern(state, "XSS exiting bitmap encoding", vmx,
@@ -200,6 +202,16 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(MSR_IA32_XFD\s+0x000001C4[\s\S]*MSR_IA32_XFD_ERR\s+0x000001C5)");
   CheckPattern(state, "FRED capability bit is identified", vmx,
                R"(CPUID_7_1_EAX_FRED\s+\(1U\s*<<\s*17\))");
+  CheckPattern(state, "FXSAVE capability bit is identified", vmx,
+               R"(CPUID_1_EDX_FXSR\s+\(1U\s*<<\s*24\))");
+  CheckPattern(state, "FXSAVE masks CR4 OSXSAVE", vmx,
+               R"(CR4_OSXSAVE\s+\(1ULL\s*<<\s*18\))");
+  Check(state, "PKU and MPX state bits are identified",
+        vmx.find("CR4_PKE") != std::string::npos &&
+            vmx.find("CPUID_7_EBX_MPX") != std::string::npos &&
+            vmx.find("CPUID_7_ECX_PKU") != std::string::npos &&
+            vmx.find("CPUID_7_ECX_OSPKE") != std::string::npos &&
+            vmx.find("XCR0_PKRU") != std::string::npos);
 
   CheckPattern(state, "MASM GuestContext XCR0 offset", asm_source,
                R"(CTX_GUEST_XCR0\s+equ\s+01108h)");
@@ -211,8 +223,13 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(CTX_GUEST_DR7\s+equ\s+01130h[\s\S]*CTX_GUEST_DEBUGCTL\s+equ\s+01138h)");
   CheckPattern(state, "VMREAD flags are checked", asm_source,
                R"(HvVmReadChecked proc[\s\S]{0,180}vmread r8, rcx[\s\S]{0,180}mov \[rdx\], r8)");
+  Check(state, "legacy FXSAVE backend is guarded",
+        asm_source.find("g_XstateMode") != std::string::npos &&
+            asm_source.find("vmxSaveFxsave:") != std::string::npos &&
+            asm_source.find("fxsave64 [rsp]") != std::string::npos &&
+            asm_source.find("fxrstor64 [rsp]") != std::string::npos);
   CheckPattern(state, "VMWRITE uses field then value operands", asm_source,
-               R"(HvVmWrite proc[\s\S]{0,220}vmwrite rcx, rdx)");
+               R"(HvVmWrite proc[\s\S]{0,260}vmwrite rcx, rdx)");
   CheckPattern(state, "VMLAUNCH guest RSP uses field then value operands",
                asm_source,
                R"(mov ecx, VMCS_GUEST_RSP[\s\S]{0,120}vmwrite rcx, rdx)");
@@ -221,6 +238,19 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(mov ecx, VMCS_GUEST_RIP[\s\S]{0,120}vmwrite rcx, rdx)");
   Check(state, "C++ has no unchecked VMREAD path",
         vmm.find("HvVmRead(") == std::string::npos);
+  CheckPattern(state, "FXSAVE mode hides XSAVE from the guest", vmm,
+               R"(leaf\s*==\s*1[\s\S]{0,280}g_XstateMode\s*==\s*XstateSaveFxsave[\s\S]{0,180}CPUID_1_ECX_XSAVE)");
+  CheckPattern(state, "FXSAVE mode hides AVX state", vmm,
+               R"(CPUID_1_ECX_AVX[\s\S]{0,260}CPUID_1_ECX_FMA[\s\S]{0,140}CPUID_1_ECX_F16C)");
+  CheckPattern(state, "FXSAVE mode hides CPUID leaf D", vmm,
+               R"(leaf\s*==\s*0xD[\s\S]{0,120}g_XstateMode\s*==\s*XstateSaveFxsave[\s\S]{0,120}RtlZeroMemory\(regs,\s* sizeof\(regs\)\))");
+  Check(state, "guest OSXSAVE follows the selected backend",
+        vmm.find("requiredOsxsave = g_XstateMode != XstateSaveFxsave") !=
+                std::string::npos &&
+            vmm.find("value & CR4_OSXSAVE") != std::string::npos &&
+            vmm.find("InjectGuestException(c, 13") != std::string::npos);
+  CheckPattern(state, "VMCS always masks guest OSXSAVE", vmm,
+               R"(cr4GuestHostMask[\s\S]{0,180}CR4_OSXSAVE[\s\S]{0,220}cr4ReadShadow[\s\S]{0,180}CR4_OSXSAVE)");
   CheckPattern(state, "guest debug VMREAD failures halt",
                asm_source,
                R"(VMCS_GUEST_DR7[\s\S]{0,240}test dl, 041h[\s\S]{0,360}VMCS_GUEST_DEBUGCTL[\s\S]{0,240}test dl, 041h[\s\S]{0,260}CTX_HALT_VM)");
@@ -230,8 +260,12 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(\bxrstors\s+\[rsp\])");
   CheckPattern(state, "XSAVES uses immutable XSS mask", asm_source,
                R"(mov r15, qword ptr \[g_XsavesMask\][\s\S]{0,500}xsaves\s+\[rsp\])");
+  CheckPattern(state, "XSAVES uses the host XCR0 mask", asm_source,
+               R"(HOST_XCR0_FRAME_SLOT[\s\S]{0,260}xsaves\s+\[rsp\])");
   CheckPattern(state, "XRSTORS restores guest XSS after fixed mask", asm_source,
                R"(xrstors\s+\[rsp\][\s\S]{0,240}CTX_GUEST_XSS[\s\S]{0,160}wrmsr)");
+  CheckPattern(state, "XRSTORS restores host state before guest XCR0", asm_source,
+               R"(HOST_XCR0_FRAME_SLOT[\s\S]{0,500}xrstors\s+\[rsp\][\s\S]{0,260}CTX_GUEST_XCR0[\s\S]{0,120}xsetbv)");
   CheckPattern(state, "IA32_XSS access is XSAVES-gated", asm_source,
                R"(cmp byte ptr \[g_XsavesEnabled\], 0[\s\S]{0,80}je vmxSaveXsave)");
   CheckPattern(state, "CET teardown MSRs are gated", asm_source,
@@ -243,17 +277,56 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "fatal path parks after VMXOFF", asm_source,
                R"(vmxHalt:[\s\S]{0,1800}call MarkCurrentVcpuParked[\s\S]{0,300}vmxoff)");
   CheckPattern(state, "VMRESUME failure is validated in C++", asm_source,
-               R"(vmxResumeFailure:[\s\S]{0,900}call HandleVmResumeFailure)");
+               R"(vmxResumeFailure:[\s\S]{0,1500}call HandleVmResumeFailure)");
   CheckPattern(state, "fatal path triggers the dedicated bugcheck", asm_source,
-               R"(vmxHalt:[\s\S]{0,2200}call HvFatalBugCheck)");
+               R"(vmxHalt:[\s\S]{0,3000}call HvFatalBugCheck)");
   CheckPattern(state, "fatal bugcheck uses the saved exit snapshot", vmm,
                R"(HvFatalBugCheck\(GuestContext\* c\)[\s\S]{0,700}LastExitReason[\s\S]{0,220}KeBugCheckEx)");
-  CheckPattern(state, "native teardown publishes stopped after VMXOFF", asm_source,
+  CheckPattern(state, "native teardown reaches the stopped marker after VMXOFF", asm_source,
                R"(HvRestoreStateAndReturn proc[\s\S]{0,7000}vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped)");
+  const std::size_t teardown_begin =
+      asm_source.find("HvRestoreStateAndReturn proc");
+  const std::size_t teardown_end =
+      asm_source.find("HvRestoreStateAndReturn endp", teardown_begin);
+  const std::string teardown_source =
+      teardown_begin != std::string::npos && teardown_end > teardown_begin
+          ? asm_source.substr(teardown_begin, teardown_end - teardown_begin)
+          : std::string{};
+  const std::size_t host_kgs_restore =
+      teardown_source.find("HOST_KGS_CONTEXT_SLOT");
+  const std::size_t host_kgs_wrmsr =
+      host_kgs_restore != std::string::npos
+          ? teardown_source.find("wrmsr", host_kgs_restore)
+          : std::string::npos;
+  const std::size_t teardown_marker =
+      teardown_source.find("MarkCurrentVcpuTearingDown");
+  Check(state, "native teardown restores host KERNEL_GS_BASE before marker",
+         host_kgs_restore != std::string::npos &&
+             host_kgs_wrmsr != std::string::npos &&
+             teardown_marker != std::string::npos &&
+             host_kgs_wrmsr < teardown_marker);
+  const std::size_t host_xcr0_restore =
+      teardown_source.find("HOST_XCR0_FRAME_SLOT");
+  const std::size_t host_xcr0_xsetbv =
+      host_xcr0_restore != std::string::npos
+          ? teardown_source.find("xsetbv", host_xcr0_restore)
+          : std::string::npos;
+  Check(state, "native teardown restores host XCR0 before marker",
+        host_xcr0_restore != std::string::npos &&
+            host_xcr0_xsetbv != std::string::npos &&
+            teardown_marker != std::string::npos &&
+            host_xcr0_xsetbv < teardown_marker);
   CheckPattern(state, "native teardown has an intermediate lifecycle state", vmm,
                R"(MarkCurrentVcpuTearingDown[\s\S]{0,500}VcpuTearingDown)");
   CheckPattern(state, "stop callback leaves a tearing down CPU alone", vmm,
                R"(state == VcpuTearingDown[\s\S]{0,220}return 0)");
+  Check(state, "stopped state requires teardown quiescence",
+        vmm.find("if (vcpu->TeardownQuiesced == 0) return;") !=
+                std::string::npos &&
+            vmm.find("InterlockedExchange(&vcpu->TeardownQuiesced, 1)") !=
+                std::string::npos &&
+            vmm.find("HvCall(HYPERVISOR_MAGIC, VMCALL_UNLOAD") !=
+                std::string::npos);
   CheckPattern(state, "live scan retains a tearing down CPU", vmm,
                R"(state == VcpuLaunched \|\| state == VcpuVmxOn[\s\S]{0,180}VcpuTearingDown)");
   Check(state, "fatal assembly does not VMREAD after VMXOFF",
@@ -303,9 +376,9 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "safe exit requires descriptor contract", vmm,
                R"(descriptorContractSafe[\s\S]{0,220}NativeTeardownSafe[\s\S]{0,260}c->AbortVm)");
   Check(state, "DEBUGCTL is virtualized",
-        vmm.find("if (msrIndex == MSR_IA32_DEBUGCTL)") != std::string::npos &&
-            vmm.find("VmWriteChecked(GUEST_DEBUGCTL") != std::string::npos &&
-             vmm.find("MSR_IA32_DEBUGCTL,\n") != std::string::npos);
+         vmm.find("if (msrIndex == MSR_IA32_DEBUGCTL)") != std::string::npos &&
+             vmm.find("VmWriteChecked(GUEST_DEBUGCTL") != std::string::npos &&
+             vmm.find("MSR_IA32_DEBUGCTL") != std::string::npos);
   CheckPattern(state, "DEBUGCTL reserved bits fail with #GP", vmm,
                R"(if\s*\(!IsValidDebugctl\(value\.QuadPart\)\)[\s\S]{0,180}InjectGuestException\(Ctx,\s*13)");
   CheckPattern(state, "guest CR3 state rejects no-flush bit", vmm,
@@ -333,6 +406,21 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(static bool HandleCrAccess\(GuestContext\* c\)[\s\S]{0,220}c->GuestCs\s*&\s*3U\)[\s\S]{0,120}InjectGuestException\(c,\s*13,\s*true,\s*0)");
   CheckPattern(state, "XSETBV rejects CPL3", vmm,
                R"(static bool HandleXsetbv\(GuestContext\* c,[\s\S]{0,220}c->GuestCs\s*&\s*3U\)[\s\S]{0,120}InjectGuestException\(c,\s*13,\s*true,\s*0)");
+  const std::size_t xsetbv_host_mask =
+      vmm.find("if (requested != vcpu->HostXcr0)");
+  const std::size_t xsetbv_host_mask_end =
+      vmm.find("c->GuestXcr0 = requested", xsetbv_host_mask);
+  const std::string xsetbv_host_mask_source =
+      xsetbv_host_mask != std::string::npos &&
+              xsetbv_host_mask_end > xsetbv_host_mask
+          ? vmm.substr(xsetbv_host_mask,
+                       xsetbv_host_mask_end - xsetbv_host_mask)
+          : std::string{};
+  Check(state, "XSETBV keeps the fixed host XCR0 contract",
+        xsetbv_host_mask != std::string::npos &&
+            xsetbv_host_mask_end > xsetbv_host_mask &&
+            xsetbv_host_mask_source.find("InjectGuestException(c, 13") !=
+                std::string::npos);
   CheckPattern(state, "CPL3 VMCALL injects GP", vmm,
                R"(The unload token is a ring-0 service call[\s\S]{0,180}InjectGuestException\(Ctx,\s*13,\s*true,\s*0)");
   Check(state, "CR0 writes synchronize the teardown snapshot",
@@ -383,17 +471,56 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(state, "CPU generation profile has explicit branches", vmm,
                R"(VmxProfileLegacyControls[\s\S]{0,900}VmxProfileTrueControls[\s\S]{0,900}VmxProfileXsaves[\s\S]{0,900}VmxProfileRdtscp[\s\S]{0,900}VmxProfileInvpcid)");
   CheckPattern(state, "CPU generation profile checks optional controls", vmm,
-               R"(BuildVmxCapabilityProfile\([\s\S]{0,1800}VmxProfileTertiaryControls)");
+               R"(BuildVmxCapabilityProfile\([\s\S]{0,3200}VmxProfileTertiaryControls)");
   CheckPattern(state, "CPU generation selects explicit VMX control branches", vmm,
                R"(SelectVmxControlGeneration[\s\S]{0,700}VmxGenerationLegacy[\s\S]{0,700}VmxGenerationTrueTertiary)");
   CheckPattern(state, "CPU generation controls use the local profile", vmm,
                R"(const u32 profile\s*=\s*Vcpu->VmxProfile[\s\S]{0,500}VmxProfileInvpcid[\s\S]{0,500}VmxProfileRdtscp)");
-  CheckPattern(state, "legacy CPUs hide unsupported optional instructions", vmm,
-               R"(VmxProfileInvpcid[\s\S]{0,260}regs\[1\]\s*&=\s*~\(1\s*<<\s*10\)[\s\S]{0,900}VmxProfileRdtscp[\s\S]{0,260}regs\[3\]\s*&=\s*~\(1\s*<<\s*27\))");
-  CheckPattern(state, "each CPU rejects a generation profile mismatch", vmm,
-               R"(immutableProfileMask[\s\S]{0,500}g_VmxCapabilityProfile[\s\S]{0,500}VcpuFailed)");
-  CheckPattern(state, "each CPU rejects optional profile drift", vmm,
-               R"(VmxProfileRdtscp\s*\|\s*VmxProfileInvpcid[\s\S]{0,500}VcpuFailed)");
+  Check(state, "legacy CPUs hide unsupported optional instructions",
+        vmm.find("VmxProfileInvpcid") != std::string::npos &&
+            vmm.find("regs[1] &= ~(1 << 10)") != std::string::npos &&
+            vmm.find("VmxProfileRdtscp") != std::string::npos &&
+            vmm.find("regs[3] &= ~(1 << 27)") != std::string::npos);
+  CheckPattern(state, "each CPU enforces only global VMX state contracts", vmm,
+               R"(globalProfileMask\s*=\s*VmxProfileXsaves\s*\|\s*VmxProfileCetVmcs[\s\S]{0,500}VcpuFailed)");
+  const std::size_t start_hypervisor =
+      vmm.find("extern \"C\" NTSTATUS StartHypervisor()");
+  const std::string start_source =
+      start_hypervisor != std::string::npos
+          ? vmm.substr(start_hypervisor)
+          : std::string{};
+  const std::size_t optional_reduce =
+      vmm.find("InterlockedAnd(&g_VmxGuestOptionalProfileCandidate");
+  Check(state, "guest optional profile uses all-CPU intersection",
+        optional_reduce != std::string::npos &&
+            vmm.find("kGuestOptionalProfileMask") != std::string::npos);
+  const std::size_t optional_seed = start_source.find(
+      "InterlockedExchange(&g_VmxGuestOptionalProfileCandidate");
+  const std::size_t optional_zero =
+      start_source.find("InterlockedExchange(&g_VmxGuestOptionalProfile,");
+  const bool optional_zero_value =
+      optional_zero != std::string::npos &&
+      start_source.substr(optional_zero, 96).find("0") != std::string::npos;
+  const std::size_t optional_broadcast =
+      start_source.find("BroadcastToAllProcessorGroups(EnableHvCallback)");
+  const std::size_t optional_publish = start_source.find(
+      "InterlockedExchange(&g_VmxGuestOptionalProfile,", optional_broadcast);
+  const std::size_t optional_publish_value =
+      optional_publish != std::string::npos
+          ? start_source.find("candidateOptionalProfile", optional_publish)
+          : std::string::npos;
+  const std::size_t launch_result = start_source.find("if (ok != expected)");
+  Check(state, "guest optional profile publishes after synchronized launch",
+        optional_zero_value &&
+            optional_seed != std::string::npos &&
+            optional_broadcast != std::string::npos &&
+            optional_publish != std::string::npos &&
+            optional_publish_value != std::string::npos &&
+            launch_result != std::string::npos &&
+            optional_seed < optional_broadcast &&
+            optional_broadcast < launch_result &&
+            launch_result < optional_publish &&
+            optional_publish < optional_publish_value);
   CheckPattern(state, "feature control is never provisioned by the driver", vmm,
                R"(EnsureFeatureControlForVmx\([\s\S]{0,500}return \(featureControl & required\) == required)");
   CheckPattern(state, "feature contract resets only while idle", vmm,
@@ -414,18 +541,45 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(IA32_XSS_IPT[\s\S]{0,500}MSR_IA32_RTIT_CTL[\s\S]{0,300}ptControl\s*&\s*IA32_RTIT_CTL_TRACEEN)");
   CheckPattern(state, "guest XSS is separated from host XSS", vmm,
                R"(vcpu->HostXss\s*=\s*hostXss[\s\S]{0,260}vcpu->GuestXss\s*=\s*hostXss\s*&\s*g_GuestXssWriteMask)");
-  CheckPattern(state, "guest XSS writes keep a fixed frame mask", vmm,
-               R"(g_XsavesEnabled\s*&&\s*msrIndex\s*==\s*MSR_IA32_XSS[\s\S]{0,520}g_GuestXssWriteMask[\s\S]{0,220}Ctx->GuestXss\s*=\s*value\.QuadPart)");
+  const std::size_t xss_msr_write_begin = vmm.find("bool HandleMsrWrite");
+  const std::size_t xss_msr_write_end =
+      vmm.find("bool Handle", xss_msr_write_begin + 1);
+  const std::string msr_write_source =
+      xss_msr_write_begin != std::string::npos &&
+              xss_msr_write_end > xss_msr_write_begin
+          ? vmm.substr(xss_msr_write_begin,
+                       xss_msr_write_end - xss_msr_write_begin)
+          : std::string{};
+  const std::size_t xss_branch =
+      msr_write_source.find("if (msrIndex == MSR_IA32_XSS)");
+  const std::size_t xss_legacy_gate =
+      msr_write_source.find("if (!g_XsavesEnabled)", xss_branch);
+  const std::size_t xss_nonzero_reject =
+      msr_write_source.find("value.QuadPart != 0", xss_legacy_gate);
+  const std::size_t xss_mask_check =
+      msr_write_source.find("g_GuestXssWriteMask", xss_nonzero_reject);
+  const std::size_t xss_guest_update =
+      msr_write_source.find("Ctx->GuestXss = value.QuadPart", xss_mask_check);
+  Check(state, "guest XSS writes keep a fixed frame mask",
+        xss_branch != std::string::npos &&
+            xss_legacy_gate > xss_branch &&
+            xss_nonzero_reject > xss_legacy_gate &&
+            xss_mask_check > xss_nonzero_reject &&
+            xss_guest_update > xss_mask_check);
   CheckPattern(state, "FS_BASE writes update the FS snapshot", vmm,
                R"(VmWriteChecked\(GUEST_FS_BASE[\s\S]{0,180}Ctx->GuestFsBase\s*=\s*value\.QuadPart)");
   CheckPattern(state, "PAT writes update the PAT snapshot", vmm,
                R"(VmWriteChecked\(GUEST_PAT[\s\S]{0,180}Ctx->GuestPat\s*=\s*value\.QuadPart)");
   CheckPattern(state, "guest XSS is installed before launch", vmm,
                R"(WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->GuestXss\)[\s\S]{0,1000}VMCS ready; entering VMLAUNCH)");
-  CheckPattern(state, "each CPU validates local XCR0 contract", vmm,
-              R"(localSupportedXcr0[\s\S]{0,2200}localXcr0\s*=\s*_xgetbv\(0\)[\s\S]{0,1200}localXcr0\s*&\s*~localSupportedXcr0)");
+  Check(state, "each CPU validates local XCR0 contract",
+        vmm.find("localSupportedXcr0") != std::string::npos &&
+            vmm.find("localXcr0 = _xgetbv(0)") != std::string::npos &&
+            vmm.find("localXcr0 & ~localSupportedXcr0") != std::string::npos);
+  CheckPattern(state, "each CPU validates local CR4 OSXSAVE contract", vmm,
+               R"(const u64 localCr4\s*=\s*__readcr4\(\)[\s\S]{0,700}localUsesXsave[\s\S]{0,260}CR4_OSXSAVE)");
   Check(state, "each CPU retains local XSAVE area size",
-        vmm.find("const u32 localXsaveAreaSize = static_cast<u32>(localCpuid[1]);") !=
+        vmm.find("localXsaveAreaSize = static_cast<u32>(localCpuid[1]);") !=
                 std::string::npos &&
             vmm.find("localXsaveAreaSize != g_XsaveStateSize") !=
                 std::string::npos);
@@ -435,12 +589,24 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(g_XsavesEnabled\s*\)[\s\S]{0,400}localXsaveFeatures\s*&\s*CPUID_D1_XSAVES)");
   CheckPattern(state, "each CPU validates complete XSS mask", vmm,
                R"(g_XsavesMask\s*&\s*~localXssMask)");
-  CheckPattern(state, "each CPU validates local CR4 CET contract", vmm,
-               R"(const u64 localCr4\s*=\s*__readcr4\(\)[\s\S]{0,900}localCet\s*=\s*\(localCr4\s*&\s*CR4_CET\)[\s\S]{0,900}localCet\s*!=\s*\(g_CetVmcsEnabled\s*!=\s*0\))");
+  Check(state, "each CPU validates local CR4 CET contract",
+        vmm.find("const u64 localCr4 = __readcr4()") != std::string::npos &&
+            vmm.find("const bool localCet = (localCr4 & CR4_CET)") !=
+                std::string::npos &&
+            vmm.find("localCet != (g_CetVmcsEnabled != 0)") !=
+                std::string::npos);
+  CheckPattern(state, "each CPU rejects active FRED", vmm,
+               R"(localCr4\s*&\s*CR4_FRED[\s\S]{0,260}VcpuFailed)");
+  CheckPattern(state, "each CPU rejects active user CET state", vmm,
+               R"(localCetEnumerated[\s\S]{0,900}ReadMsrSafe\(MSR_IA32_U_CET[\s\S]{0,260}IA32_CET_ENABLE_MASK[\s\S]{0,260}VcpuFailed)");
+  CheckPattern(state, "each CPU rejects active PL3 shadow stack", vmm,
+               R"(localCetShadowStackEnumerated[\s\S]{0,700}ReadMsrSafe\(MSR_IA32_PL3_SSP[\s\S]{0,260}localPl3Ssp\s*!=\s*0[\s\S]{0,260}VcpuFailed)");
   CheckPattern(state, "PT MSR window is intercepted", vmm,
                R"(MSR_IA32_RTIT_OUTPUT_BASE[\s\S]{0,220}0x58FU[\s\S]{0,220}setBit\(msr, false\))");
   CheckPattern(state, "XFD MSRs are intercepted", vmm,
                R"(MSR_IA32_XFD, MSR_IA32_XFD_ERR[\s\S]{0,180}setBit\(msr, false\))");
+  CheckPattern(state, "guest CPUID hides unvirtualized XCR1", vmm,
+               R"(leaf\s*==\s*0xD\s*&&\s*subleaf\s*==\s*1[\s\S]{0,320}CPUID_D1_XGETBV1[\s\S]{0,180}CPUID_D1_XFD)");
   CheckPattern(state, "FRED uses CPUID subleaf one", vmm,
                R"(localCpuid7MaxSubleaf\s*=\s*static_cast<u32>\(localCpuid\[0\]\)[\s\S]{0,500}__cpuidex\(localCpuid, 7, 1\)[\s\S]{0,180}CPUID_7_1_EAX_FRED)");
   CheckPattern(state, "diagnostic VM-exit log is rate limited", vmm,
@@ -464,8 +630,10 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos &&
             vmm.substr(launch_marker_begin,
                        launch_marker_end - launch_marker_begin)
-                    .find("VcpuLaunched,\n                                                         VcpuVmxOn") !=
-                std::string::npos);
+                     .find("VcpuLaunched") != std::string::npos &&
+             vmm.substr(launch_marker_begin,
+                        launch_marker_end - launch_marker_begin)
+                     .find("VcpuVmxOn") != std::string::npos);
   Check(state, "launch marker does not inspect guest CR4.VMXE",
         launch_marker_begin != std::string::npos &&
             launch_marker_end > launch_marker_begin &&
@@ -541,9 +709,13 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 "HvVmxOff") != std::string::npos);
   CheckPattern(state, "teardown restores guest XSS after stopped marker", asm_source,
                R"(vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped[\s\S]{0,2100}CTX_GUEST_XSS)");
-  CheckPattern(state, "native teardown keeps guest XSS after guest state",
-               asm_source,
-               R"(xrstors\s+\[r10\][\s\S]{0,260}CTX_GUEST_XSS[\s\S]{0,240}MSR_IA32_XSS[\s\S]{0,160}restoreGuestStateDone:)");
+  CheckPattern(state, "native teardown restores host state before guest mask", asm_source,
+               R"(HOST_XCR0_FRAME_SLOT[\s\S]{0,500}xrstors\s+\[r10\][\s\S]{0,260}CTX_GUEST_XCR0[\s\S]{0,120}xsetbv)");
+  Check(state, "native teardown keeps guest XSS after guest state",
+        asm_source.find("xrstors [r10]") != std::string::npos &&
+            asm_source.find("mov rax, [r10 + CTX_GUEST_XSS]") !=
+                std::string::npos &&
+            asm_source.find("restoreGuestStateDone:") != std::string::npos);
   CheckPattern(state, "VmxOn stop restores host XSS", vmm,
                R"(state\s*==\s*VcpuVmxOn[\s\S]{0,500}WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->HostXss\))");
   CheckPattern(state, "stop claims ownership with a lifecycle CAS", vmm,
@@ -573,9 +745,22 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(hostXcr0\s*&\s*~supportedXcr0)");
   CheckPattern(state, "active unsupported XSS fails before VMXON", vmm,
                R"(hostXss\s*&\s*~IA32_XSS_HOST_ALLOWED_MASK)");
-  Check(state, "FRED is rejected before VMXON",
-        main.find("CPUID_7_1_EAX_FRED") != std::string::npos &&
-            main.find("FRED is enumerated") != std::string::npos);
+  CheckPattern(state, "only active FRED is rejected before VMXON", main,
+               R"(fredEnumerated\s*&&\s*\(currentCr4\s*&\s*CR4_FRED\)\s*!=\s*0)");
+  CheckPattern(state, "FXSAVE gate uses CPUID leaf one FXSR bit", main,
+               R"(fxsrEnumerated\s*=\s*\(static_cast<u32>\(cpuInfo\[3\]\)\s*&\s*CPUID_1_EDX_FXSR\)\s*!=\s*0)");
+  CheckPattern(state, "FXSAVE gate rejects OSXSAVE state", main,
+               R"(fxsrEnumerated[\s\S]{0,220}CR4_OSFXSR[\s\S]{0,160}CR4_OSXSAVE)");
+  Check(state, "XSAVE gate requires CPUID and CR4 OSXSAVE",
+        main.find("const bool xsaveEnumerated") != std::string::npos &&
+            main.find("const bool osxsaveEnabled") != std::string::npos &&
+            main.find("const bool cr4OsxsaveEnabled") != std::string::npos &&
+            main.find("if (xsaveEnumerated && osxsaveEnabled && "
+                      "cr4OsxsaveEnabled)") != std::string::npos);
+  CheckPattern(state, "XSAVE feature leaf is gated by CPUID XSAVE", main,
+               R"(if\s*\(maxBasicLeaf\s*>=\s*0xD\s*&&\s*xsaveEnumerated\))");
+  CheckPattern(state, "each CPU validates the FXSAVE CR4 contract", vmm,
+               R"(g_XstateMode\s*==\s*XstateSaveFxsave[\s\S]{0,260}localFxsrEnumerated[\s\S]{0,220}CR4_OSFXSR[\s\S]{0,160}CR4_OSXSAVE)");
   Check(state, "XFD is rejected before VMXON",
         main.find("xfdEnumerated") != std::string::npos &&
             main.find("active XFD state is not virtualized") !=
@@ -596,16 +781,45 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 std::string::npos &&
             vmm.find("VmWriteChecked(GUEST_CR3, guestCr3)") !=
                 std::string::npos);
-  CheckPattern(state, "guest CR4.CET is contract gated", vmm,
-               R"(crNum\s*==\s*4[\s\S]{0,260}value\s*&\s*CR4_CET[\s\S]{0,260}g_CetVmcsEnabled)");
-  CheckPattern(state, "VMCS CR4 mask traps unsupported CET", vmm,
-               R"(cr4GuestHostMask[\s\S]{0,180}g_CetVmcsEnabled[\s\S]{0,180}CONTROL_CR4_GUEST_HOST_MASK)");
-  CheckPattern(state, "guest CPUID keeps optional control profile", vmm,
-               R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*0[\s\S]{0,700}VmxProfileInvpcid)");
-  CheckPattern(state, "guest CPUID hides PT capability", vmm,
-               R"(CPUID_7_EBX_INTEL_PT[\s\S]{0,400}regs\[1\]\s*&=)");
+  Check(state, "guest CR4.CET is contract gated",
+        vmm.find("value & CR4_CET") != std::string::npos &&
+            vmm.find("!g_CetVmcsEnabled") != std::string::npos);
+  CheckPattern(state, "guest CR4.FRED is contract gated", vmm,
+               R"(if\s*\(\(value\s*&\s*CR4_FRED\)[\s\S]{0,260}InjectGuestException\(c,\s*13)");
+  Check(state, "VMCS CR4 mask traps unsupported CET",
+        vmm.find("cr4GuestHostMask") != std::string::npos &&
+            vmm.find("g_CetVmcsEnabled") != std::string::npos &&
+            vmm.find("CONTROL_CR4_GUEST_HOST_MASK") != std::string::npos);
+  const std::size_t cr4_mask_begin = vmm.find("const u64 cr4GuestHostMask");
+  const std::size_t cr4_mask_end =
+      vmm.find("VmWriteChecked(CONTROL_CR4_GUEST_HOST_MASK", cr4_mask_begin);
+  const std::string cr4_mask_source =
+      cr4_mask_begin != std::string::npos && cr4_mask_end > cr4_mask_begin
+          ? vmm.substr(cr4_mask_begin, cr4_mask_end - cr4_mask_begin)
+          : std::string{};
+  Check(state, "VMCS CR4 mask traps unsupported FRED",
+        cr4_mask_source.find("CR4_OSXSAVE") != std::string::npos &&
+            cr4_mask_source.find("CR4_FRED") != std::string::npos);
+  Check(state, "VMCS CR4 mask traps unsaved PKRU",
+        vmm.find("g_XstateMode == XstateSaveFxsave") != std::string::npos &&
+            vmm.find("g_HostXcr0Mask & XCR0_PKRU") != std::string::npos &&
+            vmm.find("? CR4_PKE") != std::string::npos);
+  CheckPattern(state, "guest CPUID keeps optional capability intersection", vmm,
+               R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*0[\s\S]{0,700}g_VmxGuestOptionalProfile[\s\S]{0,180}VmxProfileInvpcid)");
+  Check(state, "guest CPUID hides PT capability",
+        vmm.find("regs[1] &= ~static_cast<int>(CPUID_7_EBX_INTEL_PT)") !=
+            std::string::npos);
   CheckPattern(state, "guest CPUID hides FRED capability", vmm,
-               R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*1[\s\S]{0,180}regs\[0\]\s*&=[\s\S]{0,120}CPUID_7_1_EAX_FRED)");
+               R"(leaf\s*==\s*7\s*&&\s*subleaf\s*==\s*1[\s\S]{0,320}regs\[0\]\s*&=[\s\S]{0,120}CPUID_7_1_EAX_FRED)");
+  CheckPattern(state, "guest CPUID hides LKGS with FRED",
+               vmm,
+               R"(CPUID_7_1_EAX_LKGS)" );
+  Check(state, "guest CPUID bounds leaf 7 subleafs",
+        vmm.find("bool subleafSupported = true") != std::string::npos &&
+            vmm.find("const u32 maxSubleaf") != std::string::npos &&
+            vmm.find("subleaf > maxSubleaf") != std::string::npos &&
+            vmm.find("RtlZeroMemory(regs, sizeof(regs))") !=
+                std::string::npos);
   CheckPattern(state, "guest CPUID hides incomplete CET capability", vmm,
                R"(if\s*\(!kGuestCetStateVirtualized\)\s*\{[\s\S]{0,240}CPUID_7_ECX_CET_SHSTK[\s\S]{0,180}CPUID_7_EDX_CET_IBT)");
   Check(state, "guest XSS contract hides incomplete CET state",
@@ -621,12 +835,35 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             std::string::npos);
   Check(state, "guest CPUID constrains D.0 XSAVE sizes",
          vmm.find("ComputeStandardXsaveAreaSize") != std::string::npos &&
-             vmm.find("guestXsaveCurrentSize") != std::string::npos &&
-             vmm.find("guestXsaveMaximumSize") != std::string::npos &&
-             vmm.find("regs[1] = static_cast<int>(guestXsaveCurrentSize)") !=
+         vmm.find("guestCurrentXsaveSize") != std::string::npos &&
+             vmm.find("guestMaximumXsaveSize") != std::string::npos &&
+             vmm.find("regs[1] = static_cast<int>(guestCurrentXsaveSize)") !=
                  std::string::npos &&
-             vmm.find("regs[2] = static_cast<int>(guestXsaveMaximumSize)") !=
+             vmm.find("regs[2] = static_cast<int>(guestMaximumXsaveSize)") !=
                  std::string::npos);
+  Check(state, "guest CPUID D.0 separates current and maximum masks",
+        vmm.find("guestCurrentXcr0") != std::string::npos &&
+            vmm.find("guestSupportedXcr0") != std::string::npos &&
+            vmm.find("guestCurrentXsaveSize") != std::string::npos &&
+            vmm.find("guestMaximumXsaveSize") != std::string::npos);
+  const std::size_t d1_begin = vmm.find("leaf == 0xD && subleaf == 1");
+  const std::string d1_source =
+      d1_begin != std::string::npos
+          ? vmm.substr(d1_begin, 1800)
+          : std::string{};
+  Check(state, "D.1 reports compacted area only when supported",
+        d1_source.find("const bool hostXsavec") != std::string::npos &&
+            d1_source.find("const bool compactedSupported") !=
+                std::string::npos &&
+            d1_source.find("g_XsavesEnabled != 0 || hostXsavec") !=
+                std::string::npos &&
+            d1_source.find("if (compactedSupported &&") !=
+                std::string::npos &&
+            d1_source.find("regs[1] = 0") != std::string::npos);
+  CheckPattern(state, "guest CPUID hides unsaved MPX and PKU", vmm,
+               R"(CPUID_7_EBX_MPX[\s\S]{0,380}XCR0_PKRU[\s\S]{0,380}CPUID_7_ECX_PKU[\s\S]{0,180}CPUID_7_ECX_OSPKE)");
+  CheckPattern(state, "guest CR4 PKE requires saved PKRU", vmm,
+               R"(CR4_PKE[\s\S]{0,300}XCR0_PKRU[\s\S]{0,300}InjectGuestException\(c, 13)");
   Check(state, "compacted XSAVE validates component ownership",
         vmm.find("const u32 componentFlags") != std::string::npos &&
             vmm.find("const bool xssComponent") != std::string::npos &&
@@ -643,6 +880,49 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(CET_U is enabled without an XSAVES CET_U component)");
   CheckPattern(state, "CET_U MSRs are trapped when guest CET is hidden", vmm,
                R"(const bool cetUserStateSupported\s*=\s*kGuestCetStateVirtualized[\s\S]{0,260}if\s*\(!cetUserStateSupported\)[\s\S]{0,220}MSR_IA32_U_CET[\s\S]{0,120}MSR_IA32_PL3_SSP)");
+  Check(state, "VMX control capability checks allowed-one bits",
+        vmm.find("static __forceinline bool ControlBitCanBeOne") !=
+                std::string::npos &&
+            vmm.find("(mandatoryOne | allowedOne) & mask") !=
+                std::string::npos &&
+            vmm.find("VmxControlAllows") != std::string::npos);
+  Check(state, "VMX mandatory-one bits use the capability low half",
+        vmm.find("static __forceinline u32 ControlMandatoryOn") !=
+                std::string::npos &&
+            vmm.find("return static_cast<u32>(__readmsr(msr))") !=
+                std::string::npos);
+  Check(state, "unknown VMX mandatory controls fail closed",
+        vmm.find("primaryMandatoryOn & ~VMX_PROCBASED_MANDATORY_ON") !=
+                std::string::npos &&
+            vmm.find("pinMandatoryOn & ~VMX_PINBASED_MANDATORY_ON") !=
+                std::string::npos &&
+            vmm.find("exitMandatoryOn & ~VMX_EXIT_MANDATORY_ON") !=
+                std::string::npos &&
+            vmm.find("entryMandatoryOn & ~VMX_ENTRY_MANDATORY_ON") !=
+                std::string::npos);
+  const std::size_t supported_primary =
+      vmm.find("constexpr u32 supportedPrimary");
+  const std::size_t cr3_load =
+      vmm.find("CPU_BASED_CR3_LOAD_EXITING", supported_primary);
+  const std::size_t cr3_store =
+      vmm.find("CPU_BASED_CR3_STORE_EXITING", cr3_load);
+  const std::size_t unsupported_primary =
+      vmm.find("constexpr u32 unsupportedPrimary", supported_primary);
+  const std::size_t unsupported_path =
+      vmm.find("unsupported exit path", unsupported_primary);
+  const std::string unsupported_primary_source =
+      unsupported_primary != std::string::npos &&
+              unsupported_path > unsupported_primary
+          ? vmm.substr(unsupported_primary,
+                       unsupported_path - unsupported_primary)
+          : std::string{};
+  Check(state, "CR3 load/store exits use the CR-access handler",
+        supported_primary != std::string::npos &&
+            cr3_load > supported_primary && cr3_store > cr3_load &&
+            unsupported_primary > cr3_store &&
+            unsupported_path > unsupported_primary &&
+            unsupported_primary_source.find("CR3_LOAD") == std::string::npos &&
+            unsupported_primary_source.find("CR3_STORE") == std::string::npos);
   CheckPattern(state, "VS Code config selects an active preset", vscode_settings,
                R"("cmake\.useCMakePresets"\s*:\s*"always")");
   CheckPattern(state, "VS Code config selects the debug configure preset",
@@ -774,18 +1054,34 @@ void TestHardware(TestState& state) {
   __cpuidex(leaf1, 1, 0);
   Check(state, "Intel VMX is enumerated", (leaf1[2] & (1 << 5)) != 0);
   Check(state, "no active hypervisor is enumerated", (leaf1[2] & (1u << 31)) == 0);
-  Check(state, "XSAVE and OSXSAVE are enabled", (leaf1[2] & (1 << 26)) &&
-                                                     (leaf1[2] & (1 << 27)));
-  if (!(leaf1[2] & (1 << 26)) || !(leaf1[2] & (1 << 27)) || max_basic < 0xd) return;
+  const bool fxsr = (leaf1[3] & (1 << 24)) != 0;
+  const bool xsave = (leaf1[2] & (1 << 26)) != 0;
+  const bool osxsave = (leaf1[2] & (1 << 27)) != 0;
+  Check(state, "legacy FXSR is enumerated", fxsr);
+  if (!fxsr) return;
+
+  if (!xsave || !osxsave || max_basic < 0xd) {
+    std::cout << "Hardware: backend=FXSAVE\n";
+    return;
+  }
 
   unsigned __int64 xcr0 = _xgetbv(0);
   Check(state, "XCR0 has x87 and SSE enabled", (xcr0 & 3) == 3);
 
+  int d0[4]{};
+  __cpuidex(d0, 0xd, 0);
+  Check(state, "XSAVE area fits the 4 KiB exit frame",
+        static_cast<unsigned>(d0[1]) <= 0x1000);
+
   int d1[4]{};
   __cpuidex(d1, 0xd, 1);
-  Check(state, "XSAVES is enumerated", (d1[0] & (1 << 3)) != 0);
-  Check(state, "XSAVE(S) area fits the 4 KiB exit frame", static_cast<unsigned>(d1[1]) <= 0x1000);
+  const bool xsaves = (d1[0] & (1 << 3)) != 0;
+  if (xsaves) {
+    Check(state, "XSAVES area fits the 4 KiB exit frame",
+          static_cast<unsigned>(d1[1]) <= 0x1000);
+  }
   std::cout << "Hardware: XCR0=0x" << std::hex << xcr0
+            << " backend=" << (xsaves ? "XSAVES" : "XSAVE")
             << " CPUID.0D.1:EBX=0x" << static_cast<unsigned>(d1[1])
             << " ECX:EDX=0x" << static_cast<unsigned>(d1[2]) << ":"
             << static_cast<unsigned>(d1[3]) << std::dec << "\n";

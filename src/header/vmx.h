@@ -13,7 +13,11 @@
 #define CR4_VMXE (1ULL << 13)
 #define CR4_LA57 (1ULL << 12)
 #define CR4_PCIDE (1ULL << 17)
+#define CR4_PKE   (1ULL << 22)
+#define CR4_OSFXSR (1ULL << 9)
+#define CR4_OSXSAVE (1ULL << 18)
 #define CR4_CET  (1ULL << 23)
+#define CR4_FRED (1ULL << 32)
 
 // MSR Index
 #define MSR_IA32_FEATURE_CONTROL        0x0000003A
@@ -86,8 +90,40 @@
 
 // CPUID feature bits hidden from a guest when their VMX state is not exposed.
 #define CPUID_7_EBX_INTEL_PT                 (1U << 25)
+#define CPUID_7_EBX_MPX                      (1U << 14)
 #define CPUID_7_ECX_CET_SHSTK                (1U << 7)
+#define CPUID_7_ECX_PKU                      (1U << 3)
+#define CPUID_7_ECX_OSPKE                    (1U << 4)
 #define CPUID_7_EDX_CET_IBT                  (1U << 20)
+#define CPUID_1_EDX_FXSR                     (1U << 24)
+#define CPUID_1_EDX_SSE                      (1U << 25)
+#define CPUID_1_ECX_XSAVE                     (1U << 26)
+#define CPUID_1_ECX_OSXSAVE                   (1U << 27)
+#define CPUID_1_ECX_AVX                       (1U << 28)
+#define CPUID_1_ECX_FMA                       (1U << 12)
+#define CPUID_1_ECX_F16C                      (1U << 29)
+#define CPUID_7_EBX_AVX2                      (1U << 5)
+#define CPUID_7_EBX_AVX512F                   (1U << 16)
+#define CPUID_7_EBX_AVX512DQ                  (1U << 17)
+#define CPUID_7_EBX_AVX512_IFMA               (1U << 21)
+#define CPUID_7_EBX_AVX512PF                  (1U << 26)
+#define CPUID_7_EBX_AVX512ER                  (1U << 27)
+#define CPUID_7_EBX_AVX512CD                  (1U << 28)
+#define CPUID_7_EBX_AVX512BW                  (1U << 30)
+#define CPUID_7_EBX_AVX512VL                  (1U << 31)
+#define CPUID_7_ECX_AVX512_VBMI               (1U << 1)
+#define CPUID_7_ECX_AVX512_VBMI2              (1U << 6)
+#define CPUID_7_ECX_AVX512_VNNI               (1U << 11)
+#define CPUID_7_EDX_AMX_BF16                  (1U << 22)
+#define CPUID_7_EDX_AMX_TILE                  (1U << 24)
+#define CPUID_7_EDX_AMX_INT8                  (1U << 25)
+#define CPUID_7_1_EAX_AVX_VNNI                (1U << 4)
+#define CPUID_7_1_EAX_AVX512_BF16             (1U << 5)
+#define XCR0_AVX                               (1ULL << 2)
+#define XCR0_MPX                               ((1ULL << 3) | (1ULL << 4))
+#define XCR0_PKRU                              (1ULL << 9)
+#define XCR0_AVX512                            ((1ULL << 5) | (1ULL << 6) | (1ULL << 7))
+#define XCR0_AMX                               ((1ULL << 17) | (1ULL << 18))
 
 // Enable bits in IA32_{U,S}_CET. Other bits are state/configuration fields,
 // not evidence that shadow-stack or IBT enforcement is currently running.
@@ -152,6 +188,7 @@
 #define CPUID_D1_XFD                             (1U << 4)
 // fred is enumerated by CPUID.(EAX=7,ECX=1):EAX, not subleaf zero
 #define CPUID_7_1_EAX_FRED                       (1U << 17)
+#define CPUID_7_1_EAX_LKGS                       (1U << 18)
 #define IA32_DEBUGCTL_LBR                        (1ULL << 0)
 #define IA32_DEBUGCTL_BTF                        (1ULL << 1)
 #define IA32_DEBUGCTL_BUS_LOCK_DETECT            (1ULL << 2)

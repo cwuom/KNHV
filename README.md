@@ -20,8 +20,8 @@ Designed for research and educational purposes, it transitions the running opera
   explicit bring-up builds.
 * **Generation-aware VMX contract**: Selects legacy/true controls and the
   available secondary, tertiary, XSAVES, CET, RDTSCP, and INVPCID capabilities
-  per processor. A heterogeneous profile is rejected before VMXON instead of
-  running different VM-exit ABIs at the same time.
+  per processor. The save-frame and CET transition contracts remain global,
+  while optional VMX controls are selected independently on each processor.
 * **State Transparency**: Preserves full GPR and Extended State (XSave/XRstor).
 * **Modern Toolchain**: Built using **VS Code**, **CMake**, and **Ninja** with MSVC.
 
@@ -52,6 +52,19 @@ are rejected before VMXON because this build does not virtualize those
 controls completely. The common Windows 11 25H2 state
 `CR4.CET=1`, `IA32_XSS=0x900`, `S_CET=0`, and zero SSP values is accepted only
 when the paired VMX CET entry/exit controls are available.
+
+Guest-visible optional instructions are the intersection of the capabilities
+validated on every participating logical processor, so RDTSCP and INVPCID are
+hidden when a single P/E core cannot safely pass them through. FRED and LKGS
+remain hidden, and guest writes that attempt to enable `CR4.FRED` are rejected
+because this build retains the legacy VM-exit event-delivery contract.
+
+The MASM `VMWRITE` wrapper follows the Intel encoding contract: `ModRM.reg`
+contains the VMCS field and `ModRM.r/m` contains the value. With
+`HvVmWrite(Field, Value)` on the Windows x64 ABI, `RCX=Field`, `RDX=Value`, and
+the instruction is `vmwrite rcx, rdx` (`0F 79 CA`). `VMREAD` remains
+`vmread destination, field`; the contract test checks both forms and the
+object-level encoding can be verified with `tools/Verify-VmwriteEncoding.ps1`.
 
 The debugger log is staged by contract and processor. `[HV] XSTATE contract`
 and `[HV] VMX control contract` describe the feature gate and selected
@@ -175,6 +188,10 @@ cmake --build --preset sys-debug
 .\build\vscode\Debug\Nested_HV_ContractTests.exe --root .
 .\build\vscode\Debug\Nested_HV_ContractTests.exe --root . --hardware
 ```
+
+The hardware check accepts either the legacy FXSAVE backend or the XSAVE
+backend. XSAVES is reported as an optional capability, not a universal
+requirement.
 
 `--signature --driver <path> --allow-test-root` validates the embedded
 Authenticode signature while allowing the expected untrusted private test root.
