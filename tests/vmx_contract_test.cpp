@@ -584,18 +584,22 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(g_VmxRequires32BitPhysicalAddress\s*=\s*\([\s\S]{0,180}VMX_BASIC_PHYSICAL_ADDRESS_32)");
   CheckPattern(state, "CPUID XSS mask is restricted to the guest contract", vmm,
                R"(g_SupportedXssMask\s*=\s*enumeratedXss\s*&\s*IA32_XSS_GUEST_KNOWN_MASK)");
-  CheckPattern(state, "XSAVES fixed mask follows host XSS", vmm,
-               R"(g_XsavesMask\s*=\s*g_XsavesEnabled[\s\S]{0,120}g_HostXssMask\s*&\s*IA32_XSS_VIRTUALIZABLE_MASK)");
+  CheckPattern(state, "XSAVES fixed mask preserves host XSS", vmm,
+               R"(g_XsavesMask\s*=\s*g_XsavesEnabled[\s\S]{0,120}\?\s*g_HostXssMask\s*:\s*0)");
   CheckPattern(state, "guest XSS stays inside fixed frame mask", vmm,
                R"(g_SupportedXssMask\s*&=\s*g_XsavesMask)");
   CheckPattern(state, "guest XSS excludes hidden IPT", vmm,
                R"(g_GuestXssWriteMask\s*=\s*g_SupportedXssMask\s*;)");
-  CheckPattern(state, "host XSS contract names CET_U", vmx,
-               R"(IA32_XSS_GUEST_KNOWN_MASK\s+IA32_XSS_CET_U)");
+  CheckPattern(state, "preservation contract includes PT and CET_U", vmx,
+               R"(IA32_XSS_PRESERVABLE_MASK\s+\(IA32_XSS_IPT\s*\|\s*IA32_XSS_CET_U\))");
+  Check(state, "XSAVES computed frame matches the live CPUID selection",
+        vmm.find("g_XsaveStateSize != xsavesSize") != std::string::npos &&
+            vmm.find("localXsavesSize != localXsaveStateSize") !=
+                std::string::npos);
   CheckPattern(state, "active PT is rejected before VMX", vmm,
                R"(IA32_XSS_IPT[\s\S]{0,500}MSR_IA32_RTIT_CTL[\s\S]{0,300}ptControl\s*&\s*IA32_RTIT_CTL_TRACEEN)");
-  CheckPattern(state, "guest XSS is separated from host XSS", vmm,
-               R"(vcpu->HostXss\s*=\s*hostXss[\s\S]{0,260}vcpu->GuestXss\s*=\s*hostXss\s*&\s*g_GuestXssWriteMask)");
+  CheckPattern(state, "guest XSS starts with the interrupted host state", vmm,
+               R"(vcpu->HostXss\s*=\s*hostXss[\s\S]{0,260}vcpu->GuestXss\s*=\s*hostXss\s*;)");
   const std::size_t xss_msr_write_begin = vmm.find("bool HandleMsrWrite");
   const std::size_t xss_msr_write_end =
       vmm.find("bool Handle", xss_msr_write_begin + 1);
@@ -609,18 +613,23 @@ void TestSourceContract(const fs::path& root, TestState& state) {
       msr_write_source.find("if (msrIndex == MSR_IA32_XSS)");
   const std::size_t xss_legacy_gate =
       msr_write_source.find("if (!g_XsavesEnabled)", xss_branch);
-  const std::size_t xss_nonzero_reject =
+  const std::size_t xss_legacy_change =
       msr_write_source.find("value.QuadPart != 0", xss_legacy_gate);
-  const std::size_t xss_mask_check =
-      msr_write_source.find("g_GuestXssWriteMask", xss_nonzero_reject);
-  const std::size_t xss_guest_update =
-      msr_write_source.find("Ctx->GuestXss = value.QuadPart", xss_mask_check);
-  Check(state, "guest XSS writes keep a fixed frame mask",
+  const std::size_t xss_legacy_exit =
+      msr_write_source.find("RequestSafeExit(Ctx)", xss_legacy_change);
+  const std::size_t xss_change =
+      msr_write_source.find("value.QuadPart != Ctx->GuestXss", xss_legacy_exit);
+  const std::size_t xss_native_exit =
+      msr_write_source.find("RequestSafeExit(Ctx)", xss_change);
+  Check(state, "guest XSS changes leave VMX for native execution",
         xss_branch != std::string::npos &&
             xss_legacy_gate > xss_branch &&
-            xss_nonzero_reject > xss_legacy_gate &&
-            xss_mask_check > xss_nonzero_reject &&
-            xss_guest_update > xss_mask_check);
+            xss_legacy_change > xss_legacy_gate &&
+            xss_legacy_exit > xss_legacy_change &&
+            xss_change > xss_legacy_exit &&
+            xss_native_exit > xss_change);
+  CheckPattern(state, "PT and unsupported CET accesses leave VMX natively", vmm,
+               R"(if\s*\(IsIntelPtMsr\(msrIndex\)\s*\|\|\s*IsCetStateMsr\(msrIndex\)\)\s*\{[\s\S]{0,180}RequestSafeExit\(Ctx\)[\s\S]{0,100}return true;)");
   CheckPattern(state, "FS_BASE writes update the FS snapshot", vmm,
                R"(VmWriteChecked\(GUEST_FS_BASE[\s\S]{0,180}Ctx->GuestFsBase\s*=\s*value\.QuadPart)");
   CheckPattern(state, "PAT writes update the PAT snapshot", vmm,
@@ -782,9 +791,9 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 "BroadcastToAllProcessorGroups(EnableHvCallback)",
                 launch_broadcast + 1) == std::string::npos);
   Check(state, "incomplete live XSS fails before VMXON",
-        launch_start_source.find("g_HostXssMask != g_XsavesMask") !=
+        launch_start_source.find("g_HostXssMask & ~g_XsavesMask") !=
                 std::string::npos &&
-            launch_start_source.find("g_HostXssMask != g_GuestXssWriteMask") !=
+            launch_start_source.find("g_XsaveStateSize == 0") !=
                 std::string::npos);
   Check(state, "fault injection stages are compile-time gated",
         vmm.find("enum HvFaultStage") != std::string::npos &&

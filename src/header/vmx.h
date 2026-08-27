@@ -68,20 +68,15 @@
 #define MSR_IA32_PL3_SSP                0x000006A7
 #define MSR_IA32_INTERRUPT_SSP_TABLE    0x000006A8
 
-// IA32_XSS state-component bits from the WDK/Intel XSTATE enumeration.
-// CET_U contains IA32_U_CET and IA32_PL3_SSP; CET_S contains supervisor
-// shadow-stack state. IPT is Intel Processor Trace state and is not included in
-// the XSAVES frame used by this monitor. It must remain inactive while the
-// monitor runs; the current guest profile hides CET until its full MSR contract
-// is implemented.
+// ia32_xss state-component bits from the WDK/Intel XSTATE enumeration
+// cet_u contains IA32_U_CET and IA32_PL3_SSP, while cet_s contains supervisor
+// shadow-stack state
 #define IA32_XSS_IPT                        (1ULL << 8)
 #define IA32_XSS_CET_U                      (1ULL << 11)
 #define IA32_XSS_CET_S                      (1ULL << 12)
-// The host frame may preserve CET_U. IPT and CET_U are hidden from the guest
-// because their complete MSR contracts are not virtualized here.
+// preservation and guest policy are separate contracts
+#define IA32_XSS_PRESERVABLE_MASK            (IA32_XSS_IPT | IA32_XSS_CET_U)
 #define IA32_XSS_GUEST_KNOWN_MASK            IA32_XSS_CET_U
-#define IA32_XSS_VIRTUALIZABLE_MASK          IA32_XSS_CET_U
-#define IA32_XSS_HOST_ALLOWED_MASK           (IA32_XSS_IPT | IA32_XSS_CET_U)
 
 // VMX_MISC[14] means that Intel PT may trace after VMXON. It does not by itself
 // provide guest PT virtualization; the guest profile below remains PT-hidden.

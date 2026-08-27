@@ -470,10 +470,15 @@ static bool EnsureFeatureControlForVmx() {
 }
 
 static __forceinline bool IsIntelPtMsr(u32 msr) {
-    // The Intel PT MSR block includes reserved holes. Intercepting the whole
-    // architectural block is intentional: this build hides PT from the
-    // guest and must not let a future PT MSR write alter host tracing state.
+    // pt has reserved holes, so keep the complete architectural window together
     return msr >= MSR_IA32_RTIT_OUTPUT_BASE && msr <= 0x58FU;
+}
+
+static __forceinline bool IsCetStateMsr(u32 msr) {
+    return msr == MSR_IA32_U_CET || msr == MSR_IA32_S_CET ||
+           msr == MSR_IA32_PL0_SSP || msr == MSR_IA32_PL1_SSP ||
+           msr == MSR_IA32_PL2_SSP || msr == MSR_IA32_PL3_SSP ||
+           msr == MSR_IA32_INTERRUPT_SSP_TABLE;
 }
 
 bool IsCETVmcsEnabled() {
@@ -643,11 +648,8 @@ bool InitializeVmxFeatureContract() {
     const bool xssRead = ReadMsrSafe(MSR_IA32_XSS, &hostXss);
     if (xsavesInstruction && !xssRead) return false;
     if (xssRead && (hostXss & ~enumeratedXss) != 0) return false;
-    // CPUID.(EAX=0xD,ECX=1) exposes every supervisor state component the
-    // processor can support, not only the components selected by Windows.
-    // Unselected components are hidden from the guest; a selected component
-    // must either be preserved by this frame or fail the late-launch gate.
-    if ((hostXss & ~IA32_XSS_HOST_ALLOWED_MASK) != 0) {
+    // a late launch must preserve every supervisor component selected by Windows
+    if ((hostXss & ~IA32_XSS_PRESERVABLE_MASK) != 0) {
         return false;
     }
 
@@ -659,8 +661,7 @@ bool InitializeVmxFeatureContract() {
              static_cast<ULONG>(xsavesSize), enumeratedXss, hostXss);
     if (xsavesInstruction != xrstorsInstruction) return false;
 
-    // Intel PT is not part of this monitor's XSAVES frame. Refuse a host that
-    // is actively tracing rather than running C++ with a stable PT state.
+    // active Intel PT needs VMX RTIT controls that this monitor does not provide
     if ((hostXss & IA32_XSS_IPT) != 0) {
         u64 ptControl = 0;
         if (!ReadMsrSafe(MSR_IA32_RTIT_CTL, &ptControl) ||
@@ -686,19 +687,20 @@ bool InitializeVmxFeatureContract() {
     if (xsavesInstruction && xssRead && secondaryControlsUsable &&
         VmxControlAllows(MSR_IA32_VMX_PROCBASED_CTLS2,
                           SECONDARY_ENABLE_XSAVES)) {
-        // late-launch rule: Windows has already booted with the live
-        // IA32_XSS selector, so preserve only the selected virtualizable state
-        const u64 fixedXssMask = hostXss & IA32_XSS_VIRTUALIZABLE_MASK;
+        // late launch begins with the live Windows selector, so the fixed frame
+        // must preserve every selected component rather than the guest policy
+        const u64 fixedXssMask = hostXss;
         if ((fixedXssMask & ~enumeratedXss) != 0 ||
-            (fixedXssMask & ~IA32_XSS_VIRTUALIZABLE_MASK) != 0) {
+            (fixedXssMask & ~IA32_XSS_PRESERVABLE_MASK) != 0) {
             return false;
         }
 
         u64 computedXssCapabilities = 0;
         if (!ComputeXsaveAreaSize(hostXcr0, fixedXssMask,
-                                  &computedXssCapabilities,
-                                  &g_XsaveStateSize) ||
-            (fixedXssMask & ~computedXssCapabilities) != 0) {
+                                   &computedXssCapabilities,
+                                   &g_XsaveStateSize) ||
+            (fixedXssMask & ~computedXssCapabilities) != 0 ||
+            g_XsaveStateSize != xsavesSize) {
             return false;
         }
         g_XsavesEnabled = 1;
@@ -716,32 +718,27 @@ bool InitializeVmxFeatureContract() {
         g_XstateMode = XstateSaveXsaves;
     }
 
-    // Keep this value immutable for the lifetime of the VMX run. PT remains
-    // selected in the host IA32_XSS register when Windows requested it, but it
-    // is intentionally excluded from this XSAVES layout because PT needs its
-    // own MSR context switching contract.
-    // Expanding it to all CPUID-enumerated XSS bits changes the XSAVES/XRSTORS
-    // contract after boot and can break exception/debugger paths.
+    // the frame mask is immutable for this VMX run and represents preservation,
+    // not guest feature exposure
     g_XsavesMask = g_XsavesEnabled
-                       ? (g_HostXssMask & IA32_XSS_VIRTUALIZABLE_MASK)
-                       : 0;
-    // the guest selector must stay within the immutable frame mask. A guest
-    // XSS bit that XSAVES does not capture would leak state across VM-exits
+                        ? g_HostXssMask
+                        : 0;
+    // the exposed selector stays inside the immutable preservation frame
     g_SupportedXssMask &= g_XsavesMask;
-    // IPT is host-only in this build. Keep the guest selector inside the
-    // same mask advertised by CPUID so a hidden PT component cannot be
-    // selected through IA32_XSS.
+    // guest writes remain disabled until the feature MSR contracts are complete
     g_GuestXssWriteMask = g_SupportedXssMask;
 
     if (g_XsaveStateSize == 0 || g_XsaveStateSize > VMEXIT_XSAVE_MAX) {
         return false;
     }
 
-    DbgPrint("[HV] XSTATE contract selected: XSAVES=%u frame=%lu "
-             "HOST_XSS=0x%llX GUEST_XSS_MASK=0x%llX FIXED_XSS=0x%llX\n",
+    DbgPrint("[HV] XSTATE preservation: XSAVES=%u HOST_XSS=0x%llX "
+             "PRESERVE_XSS=0x%llX GUEST_INITIAL_XSS=0x%llX "
+             "GUEST_WRITE_XSS=0x%llX frame=%lu D1.EBX=%lu\n",
              g_XsavesEnabled ? 1U : 0U,
-             static_cast<ULONG>(g_XsaveStateSize), g_HostXssMask,
-             g_SupportedXssMask, g_XsavesMask);
+             g_HostXssMask, g_XsavesMask, g_HostXssMask,
+             g_GuestXssWriteMask, static_cast<ULONG>(g_XsaveStateSize),
+             static_cast<ULONG>(xsavesSize));
 
     // CR4.CET is set on current Windows 11 builds even when supervisor CET
     // is inactive.  In that state VMX still requires the paired CET
@@ -1827,25 +1824,19 @@ bool HandleMsrRead(GuestContext* Ctx) {
         return true;
     }
 
-    if (IsIntelPtMsr(msrIndex)) {
-        InjectGuestException(Ctx, 13, true, 0);
-        return false;
+    if (IsIntelPtMsr(msrIndex) || IsCetStateMsr(msrIndex)) {
+        // the native instruction must observe its real host MSR after VMXOFF
+        RequestSafeExit(Ctx);
+        return true;
     }
     if (msrIndex == MSR_IA32_XFD || msrIndex == MSR_IA32_XFD_ERR) {
         InjectGuestException(Ctx, 13, true, 0);
         return false;
     }
 
-    // These accesses should not reach the handler when XSAVES is active (the
-    // bitmap leaves CET_U/PLx native).  Keep an explicit #GP fallback for a
-    // capability mismatch rather than exposing VMX-root state.
-    if (msrIndex == MSR_IA32_XSS || msrIndex == MSR_IA32_U_CET ||
-        msrIndex == MSR_IA32_S_CET || msrIndex == MSR_IA32_PL0_SSP ||
-        msrIndex == MSR_IA32_PL1_SSP || msrIndex == MSR_IA32_PL2_SSP ||
-        msrIndex == MSR_IA32_PL3_SSP ||
-        msrIndex == MSR_IA32_INTERRUPT_SSP_TABLE) {
-        InjectGuestException(Ctx, 13, true, 0);
-        return false;
+    if (msrIndex == MSR_IA32_XSS || IsCetStateMsr(msrIndex)) {
+        RequestSafeExit(Ctx);
+        return true;
     }
 
     InjectGuestException(Ctx, 13, true, 0);
@@ -1992,32 +1983,24 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     if (msrIndex == MSR_IA32_XSS) {
         if (!g_XsavesEnabled) {
             if (value.QuadPart != 0) {
-                InjectGuestException(Ctx, 13, true, 0);
-                return false;
+                RequestSafeExit(Ctx);
             }
             return true;
         }
-        // The assembly frame always uses g_XsavesMask, so the guest selector
-        // may change without changing the compacted memory layout. Reject only
-        // components outside the negotiated virtual XSS contract.
-        if ((value.QuadPart & ~g_GuestXssWriteMask) != 0) {
-            InjectGuestException(Ctx, 13, true, 0);
-            return false;
-        }
-        Ctx->GuestXss = value.QuadPart;
-        const u32 id = CurrentProcessorIndex();
-        if (g_VcpuData && id < g_ProcessorCount) {
-            g_VcpuData[id].GuestXss = value.QuadPart;
+        // a selector change needs a feature-specific MSR contract, so resume
+        // Windows natively without advancing the intercepted instruction
+        if ((value.QuadPart & ~g_XsavesMask) != 0 ||
+            value.QuadPart != Ctx->GuestXss) {
+            RequestSafeExit(Ctx);
+            return true;
         }
         return true;
     }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_S_CET) {
-        // Supervisor CET is intentionally kept inactive. A non-zero S_CET
-        // would require shadow-stack state that is not represented for every
-        // privilege level by this monitor's VMCS contract.
+        // a non-zero supervisor CET request needs native shadow-stack handling
         if (value.QuadPart != 0) {
-            InjectGuestException(Ctx, 13, true, 0);
-            return false;
+            RequestSafeExit(Ctx);
+            return true;
         }
         if (!VmWriteChecked(GUEST_S_CET, value.QuadPart)) {
             Ctx->HaltVm = 1;
@@ -2028,8 +2011,8 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_INTERRUPT_SSP_TABLE) {
         if (value.QuadPart != 0) {
-            InjectGuestException(Ctx, 13, true, 0);
-            return false;
+            RequestSafeExit(Ctx);
+            return true;
         }
         if (!VmWriteChecked(GUEST_INTR_SSP_TABLE, value.QuadPart)) {
             Ctx->HaltVm = 1;
@@ -2040,8 +2023,8 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_PL0_SSP) {
         if (value.QuadPart != 0) {
-            InjectGuestException(Ctx, 13, true, 0);
-            return false;
+            RequestSafeExit(Ctx);
+            return true;
         }
         if (!VmWriteChecked(GUEST_SSP, value.QuadPart)) {
             Ctx->HaltVm = 1;
@@ -2052,34 +2035,26 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     }
     if (g_CetVmcsEnabled &&
         (msrIndex == MSR_IA32_PL1_SSP || msrIndex == MSR_IA32_PL2_SSP)) {
-        // There are no VMCS fields for PL1/PL2 in this fixed contract. Keep
-        // the inactive supervisor CET state explicit and reject activation.
+        // PL1 and PL2 have no VMCS fields in this fixed contract
         if (value.QuadPart != 0) {
-            InjectGuestException(Ctx, 13, true, 0);
-            return false;
+            RequestSafeExit(Ctx);
+            return true;
         }
         return true;
     }
 
-    if (IsIntelPtMsr(msrIndex)) {
-        InjectGuestException(Ctx, 13, true, 0);
-        return false;
+    if (IsIntelPtMsr(msrIndex) || IsCetStateMsr(msrIndex)) {
+        RequestSafeExit(Ctx);
+        return true;
     }
     if (msrIndex == MSR_IA32_XFD || msrIndex == MSR_IA32_XFD_ERR) {
         InjectGuestException(Ctx, 13, true, 0);
         return false;
     }
 
-    // The fallback path is used only when the bitmap was configured without
-    // the corresponding state contract.  Never pass an intercepted CET MSR
-    // through to VMX root.
-    if (msrIndex == MSR_IA32_XSS || msrIndex == MSR_IA32_U_CET ||
-        msrIndex == MSR_IA32_S_CET || msrIndex == MSR_IA32_PL0_SSP ||
-        msrIndex == MSR_IA32_PL1_SSP || msrIndex == MSR_IA32_PL2_SSP ||
-        msrIndex == MSR_IA32_PL3_SSP ||
-        msrIndex == MSR_IA32_INTERRUPT_SSP_TABLE) {
-        InjectGuestException(Ctx, 13, true, 0);
-        return false;
+    if (msrIndex == MSR_IA32_XSS || IsCetStateMsr(msrIndex)) {
+        RequestSafeExit(Ctx);
+        return true;
     }
 
     InjectGuestException(Ctx, 13, true, 0);
@@ -2127,15 +2102,13 @@ static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
         if (!setBit(msr, false) || !setBit(msr, true)) return false;
     }
 
-    // Intel PT is not virtualized. Trap the complete RTIT MSR window so an
-    // unadvertised or future PT register cannot change host tracing state.
+    // trap the complete RTIT window and leave VMX before native PT access
     for (u32 msr = MSR_IA32_RTIT_OUTPUT_BASE; msr <= 0x58FU; ++msr) {
         if (!setBit(msr, false) || !setBit(msr, true)) return false;
     }
 
-    // IA32_XSS is the selector consumed by XSAVES and has no VMCS field, so
-    // it is always trapped and kept per virtual CPU. CET MSRs stay trapped
-    // until the complete user and supervisor CET contract is implemented.
+    // IA32_XSS has no VMCS field, so keep the initial selector per virtual CPU
+    // and leave VMX before a later selector or CET contract change
     if (!setBit(MSR_IA32_XSS, false) || !setBit(MSR_IA32_XSS, true)) {
         return false;
     }
@@ -3877,10 +3850,12 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             return 0;
         }
         u32 localXsaveFeatures = 0;
+        u32 localXsavesSize = 0;
         u64 localXssMask = 0;
         if (localUsesXsave) {
             __cpuidex(localCpuid, 0xD, 1);
             localXsaveFeatures = static_cast<u32>(localCpuid[0]);
+            localXsavesSize = static_cast<u32>(localCpuid[1]);
             localXssMask = (static_cast<u32>(localCpuid[2]) |
                             (static_cast<u64>(static_cast<u32>(localCpuid[3])) << 32)) &
                            ~(1ULL << 63);
@@ -3893,7 +3868,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             return 0;
         }
         if ((localXssRead && (localXss & ~localXssMask) != 0) ||
-            (localXssRead && (localXss & ~IA32_XSS_HOST_ALLOWED_MASK) != 0) ||
+            (localXssRead && (localXss & ~IA32_XSS_PRESERVABLE_MASK) != 0) ||
             (localXssRead && (localXss & ~g_EnumeratedXssMask) != 0) ||
             (g_XsavesEnabled && localXss != g_HostXssMask) ||
             (!g_XsavesEnabled && localXssRead && localXss != 0) ||
@@ -3981,16 +3956,18 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                 (g_XsavesMask & ~localXssMask) != 0 ||
                 !localXsaveLayoutValid ||
                 localEnumeratedXss != localXssMask ||
+                localXsavesSize != localXsaveStateSize ||
                 localXsaveStateSize != g_XsaveStateSize ||
                 localXsaveStateSize > VMEXIT_XSAVE_MAX ||
                 !VmxControlAllows(MSR_IA32_VMX_PROCBASED_CTLS2,
                                   SECONDARY_ENABLE_XSAVES)) {
                 HV_VERBOSE_PRINT("[HV] CPU %u local XSAVES layout mismatch: "
-                                 "features=0x%X xss=0x%llX fixed=0x%llX "
-                                 "frame=%lu expected=%lu\n", id,
-                                 localXsaveFeatures, localXssMask, g_XsavesMask,
-                                 static_cast<ULONG>(localXsaveStateSize),
-                                 static_cast<ULONG>(g_XsaveStateSize));
+                "features=0x%X xss=0x%llX fixed=0x%llX "
+                "frame=%lu d1_ebx=%lu expected=%lu\n", id,
+                localXsaveFeatures, localXssMask, g_XsavesMask,
+                static_cast<ULONG>(localXsaveStateSize),
+                static_cast<ULONG>(localXsavesSize),
+                static_cast<ULONG>(g_XsaveStateSize));
                 InterlockedExchange(&vcpu->State, VcpuFailed);
                 return 0;
             }
@@ -4127,7 +4104,8 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         u64 hostXss = 0;
         if (g_XsavesEnabled) {
             if (!ReadMsrSafe(MSR_IA32_XSS, &hostXss) ||
-                (hostXss & ~g_EnumeratedXssMask) != 0) {
+                (hostXss & ~g_EnumeratedXssMask) != 0 ||
+                (hostXss & ~g_XsavesMask) != 0) {
                 InterlockedExchange(&vcpu->State, VcpuFailed);
                 return 0;
             }
@@ -4153,7 +4131,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         vcpu->HostXcr0 = hostXcr0;
         vcpu->GuestXcr0 = hostXcr0;
         vcpu->HostXss = hostXss;
-        vcpu->GuestXss = hostXss & g_GuestXssWriteMask;
+        vcpu->GuestXss = hostXss;
 
         vcpu->OriginalCr0 = localCr0;
         vcpu->OriginalCr4 = localCr4;
@@ -4433,16 +4411,17 @@ extern "C" NTSTATUS StartHypervisor() {
         DbgPrint("[HV] StartHypervisor rejected by the VMX capability gate\n");
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
-    // A guest begins with the interrupted Windows XSTATE. Do not enter VMX
-    // while any live IA32_XSS component is absent from either the fixed save
-    // frame or the guest-visible selector. Supporting that case requires a
-    // complete component virtualization contract, not a masked launch value.
+    // a late-launch guest begins with interrupted Windows XSTATE, so each live
+    // supervisor component must fit in the fixed preservation frame
     if (g_XsavesEnabled &&
-        (g_HostXssMask != g_XsavesMask ||
-         g_HostXssMask != g_GuestXssWriteMask)) {
-        DbgPrint("[HV] StartHypervisor rejected: IA32_XSS requires full "
-                 "preservation host=0x%llX frame=0x%llX guest=0x%llX\n",
-                 g_HostXssMask, g_XsavesMask, g_GuestXssWriteMask);
+        ((g_HostXssMask & ~g_XsavesMask) != 0 ||
+         g_XsaveStateSize == 0 ||
+         g_XsaveStateSize > VMEXIT_XSAVE_MAX ||
+         g_XsaveStateSize > sizeof(GuestContext{}.FxArea))) {
+        DbgPrint("[HV] StartHypervisor rejected: unsupported live XSS "
+                 "host=0x%llX preserve=0x%llX frame=%lu\n",
+                 g_HostXssMask, g_XsavesMask,
+                 static_cast<ULONG>(g_XsaveStateSize));
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
     DbgPrint("[HV] StartHypervisor: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
