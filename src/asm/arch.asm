@@ -1,9 +1,20 @@
 ; Created by cwuom on 17 Feb 2026.
 
+.data
+align 8
+PUBLIC g_HvVmxOffFailureFlagsAsm
+g_HvVmxOffFailureFlagsAsm dq 0
+
 .code
 
 extern VmExitHandler:proc
 extern PrepareHvCallback:proc
+extern g_HvLaunchAssemblyEntered:dword
+extern g_HvLaunchGuestEntered:dword
+extern g_HvLaunchVmlaunchIssued:dword
+extern g_HvLaunchVmlaunchReturned:dword
+extern g_HvLaunchGuestStarted:dword
+extern g_HvLaunchVmExitAsmReached:dword
 extern AbortHvLaunch:proc
 extern HvTraceCurrentVcpuEvent:proc
 extern HvFaultInjectedCurrent:proc
@@ -108,10 +119,10 @@ HOST_XSS_FRAME_SLOT   equ 01170h
 HOST_DR7_FRAME_SLOT   equ 01158h
 HOST_DEBUGCTL_FRAME_SLOT equ 01160h
 
-; HvRestoreStateAndReturn stages state in [guest-rsp - 100h].  This area is
-; below the active guest stack and is kept separate from the iret frame near
-; guest-rsp.  The stack pointer itself remains the only address used after
-; loading guest CR3, so the host VM-exit stack is never dereferenced there.
+; HvRestoreStateAndReturn stages state in a 100h-byte spill below the
+; five-qword IRETQ frame so it cannot overlap the active guest stack
+; The stack pointer itself remains the only address used after loading guest
+; CR3, so the host VM-exit stack is never dereferenced there
 RST_RAX         equ 000h
 RST_RCX         equ 008h
 RST_RDX         equ 010h
@@ -151,6 +162,8 @@ HV_TRACE_PRE_VMRESUME    equ 20
 HV_TRACE_PRE_VMXOFF      equ 23
 HV_TRACE_POST_VMXOFF     equ 24
 HV_TRACE_VMRESUME_FAIL   equ 21
+HV_TRACE_FATAL_SNAPSHOT_COMPLETE equ 29
+HV_TRACE_FATAL_PARKED   equ 30
 HV_FAULT_BEFORE_VMLAUNCH equ 8
 HV_FAULT_VMLAUNCH_FAIL  equ 9
 
@@ -163,6 +176,10 @@ HvVmExitEntryPoint proc
     ; before allocating the private frame so an IRQ cannot enter the kernel
     ; while RSP still points at the VMX host stack.
     cli
+    cmp dword ptr [g_HvLaunchVmExitAsmReached], 0
+    jne vmExitAsmRecorded
+    lock bts dword ptr [g_HvLaunchVmExitAsmReached], 0
+vmExitAsmRecorded:
     ; 1180h is this driver's fixed frame size and is independent of VMCS
     ; encodings; the capability gate keeps the XSAVE area below 1000h.
     sub rsp, 1180h
@@ -330,6 +347,21 @@ vmxHostMasksReady:
     call VmExitHandler
     add rsp, 20h
 
+    ; Record the resume boundary while the host XSTATE/GPR contract is still
+    ; active.  No C++ call may occur after the final guest restore because a
+    ; normal Win64 callee may clobber every volatile guest register and XMM
+    ; component before VMRESUME consumes the live processor state.
+    cmp qword ptr [rsp + CTX_HALT_VM], 0
+    jne vmxPreVmresumeTraceDone
+    cmp qword ptr [rsp + CTX_ABORT_VM], 0
+    jne vmxPreVmresumeTraceDone
+    mov ecx, HV_TRACE_PRE_VMRESUME
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+vmxPreVmresumeTraceDone:
+
+vmxGuestStateCommit:
     ; The handler ran with the host XCR0/XSS contract. Restore the complete
     ; host-saved state first, then switch to the guest mask. This keeps state
     ; for components the guest temporarily disabled from leaking across exits.
@@ -426,12 +458,8 @@ vmxStateRestored:
     mov r15, [rsp + 1070h]
 
     ; Keep rsp at the GuestContext until VMRESUME has definitively succeeded.
-    ; A failed VMRESUME returns in VMX root with the same stack pointer; adding
-    ; 1100h first would make the caller pass the host return stack as context.
-    mov ecx, HV_TRACE_PRE_VMRESUME
-    sub rsp, 20h
-    call HvTraceCurrentVcpuEvent
-    add rsp, 20h
+    ; A failed VMRESUME returns in VMX root with the same stack pointer. This
+    ; commit tail must remain free of calls after guest XSTATE/GPR restoration.
     vmresume
     jc vmxResumeFailure
     jz vmxResumeFailure
@@ -485,10 +513,20 @@ vmxHaltHostMasksReady:
     sub rsp, 20h
     call HvCaptureFatalSnapshotPreVmxoff
     add rsp, 20h
+    mov ecx, HV_TRACE_FATAL_SNAPSHOT_COMPLETE
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     sub rsp, 20h
     call MarkCurrentVcpuParked
     add rsp, 20h
+    mov ecx, HV_TRACE_FATAL_PARKED
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     vmxoff
+    jc vmxHaltVmxoffFailed
+    jz vmxHaltVmxoffFailed
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
@@ -496,6 +534,17 @@ vmxHaltHostMasksReady:
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
     add rsp, 20h
+    jmp vmxHaltBugCheck
+vmxHaltVmxoffFailed:
+    ; Capture VMXOFF's failure flags before any instruction can overwrite them
+    ; Bit 63 marks the first-wins slot as committed; bits 0 and 6 retain CF/ZF
+    pushfq
+    pop rax
+    mov rdx, rax
+    bts rdx, 3Fh
+    xor eax, eax
+    lock cmpxchg qword ptr [g_HvVmxOffFailureFlagsAsm], rdx
+vmxHaltBugCheck:
     mov rcx, rsp
     sub rsp, 20h
     call HvFatalBugCheck
@@ -659,28 +708,16 @@ restoreRipCanonicalCompare:
     ; than manufacturing an IRET frame that could fault under KPTI.
     jmp restoreInvalid
 
-    ; iretq pops RIP, CS, RFLAGS and, for CPL3, RSP and SS.  Build the frame
-    ; while the host page table is active.  The 0x100-byte gap below it stores
-    ; all GPRs and control values.
-    lea r8, [r11 - 28h]                   ; CPL3 five-word frame
-    mov [r8 + 00h], r14
-    mov [r8 + 08h], r12
-    mov [r8 + 10h], r15
-    mov [r8 + 18h], r11
-    mov [r8 + 20h], r13
-    jmp short restoreFrameReady
-
+    ; In 64-bit mode IRETQ consumes the complete interrupt frame, including
+    ; RSP and SS even for a same-CPL target. Keep all five slots contiguous.
 restoreRing0:
-    lea r8, [r11 - 18h]                   ; CPL0 three-word frame
-    mov [r8 + 00h], r14
-    mov [r8 + 08h], r12
-    mov [r8 + 10h], r15
-
-restoreFrameReady:
+    lea r8, [r11 - 28h]                   ; complete IRETQ frame
     lea r9, [r8 - 100h]                   ; guest stack spill area
 
-    ; Subtracting from a canonical RSP can cross the 48-bit sign boundary.
-    ; Validate both derived addresses before the first guest-stack store.
+    ; Subtracting from a canonical RSP can cross the sign boundary or wrap.
+    ; Validate both derived addresses and their ordering before the first
+    ; guest-stack store. Canonicality does not prove page presence; the
+    ; teardown contract must keep this kernel stack mapped under both CR3s.
     mov rax, r8
     mov rdx, rax
     movzx ecx, byte ptr [g_LinearAddressBits]
@@ -709,6 +746,17 @@ restoreSpillCanonical57:
 restoreSpillCanonicalCompare:
     cmp rdx, rax
     jne restoreInvalid
+    cmp r8, r11
+    ja restoreInvalid
+    cmp r9, r8
+    ja restoreInvalid
+
+restoreFrameReady:
+    mov [r8 + 00h], r14
+    mov [r8 + 08h], r12
+    mov [r8 + 10h], r15
+    mov [r8 + 18h], r11
+    mov [r8 + 20h], r13
 
     mov rax, [r10 + CTX_RAX]
     mov [r9 + RST_RAX], rax
@@ -762,6 +810,8 @@ restoreSpillCanonicalCompare:
     call HvTraceCurrentVcpuEvent
     add rsp, 20h
     vmxoff
+    jc teardownVmxoffFailed
+    jz teardownVmxoffFailed
     mov r10, rbx
     mov ecx, HV_TRACE_POST_VMXOFF
     sub rsp, 20h
@@ -930,6 +980,44 @@ restoreGuestCetDone:
     mov r11, [r11 + RST_R11]
     iretq
 
+teardownVmxoffFailed:
+    ; VMXOFF failed, so VMX root and the host stack are still authoritative.
+    ; Preserve that diagnosable state instead of clearing VMXE or attempting
+    ; the guest CR3/IRET transition with an active VMCS.
+    cli
+    ; Record the raw VMXOFF flags before calls or stores change them
+    pushfq
+    pop rax
+    mov rdx, rax
+    bts rdx, 3Fh
+    xor eax, eax
+    lock cmpxchg qword ptr [g_HvVmxOffFailureFlagsAsm], rdx
+    mov r10, rbx
+    mov qword ptr [r10 + CTX_HALT_VM], 1
+    mov rcx, r10
+    sub rsp, 20h
+    call HvCaptureFatalSnapshotPreVmxoff
+    add rsp, 20h
+    mov ecx, HV_TRACE_FATAL_SNAPSHOT_COMPLETE
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+    sub rsp, 20h
+    call MarkCurrentVcpuParked
+    add rsp, 20h
+    mov ecx, HV_TRACE_FATAL_PARKED
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+    mov r10, rbx
+    mov rcx, r10
+    sub rsp, 20h
+    call HvFatalBugCheck
+    add rsp, 20h
+teardownVmxoffFailedLoop:
+    hlt
+    jmp teardownVmxoffFailedLoop
+
 restoreInvalid:
     ; There is no safe architectural return for malformed state.  Park this
     ; processor with interrupts disabled instead of executing a guessed RET or
@@ -966,18 +1054,31 @@ restoreInvalidHostMasksReady:
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
     add rsp, 20h
+    ; HvTraceCurrentVcpuEvent is a normal Win64 callee and may clobber R10.
+    ; Reload the nonvolatile context anchor before passing it to the snapshot.
+    mov r10, rbx
     mov rcx, r10
     sub rsp, 20h
     call HvCaptureFatalSnapshotPreVmxoff
+    add rsp, 20h
+    mov ecx, HV_TRACE_FATAL_SNAPSHOT_COMPLETE
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
     add rsp, 20h
     mov r10, rbx
     sub rsp, 20h
     call MarkCurrentVcpuParked
     add rsp, 20h
+    mov ecx, HV_TRACE_FATAL_PARKED
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     ; the park callback may clobber volatile R10
     ; restore the frame pointer before VMXOFF and the fatal diagnostic call
     mov r10, rbx
     vmxoff
+    jc restoreInvalidVmxoffFailed
+    jz restoreInvalidVmxoffFailed
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
@@ -985,6 +1086,17 @@ restoreInvalidHostMasksReady:
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
     add rsp, 20h
+    jmp restoreInvalidBugCheck
+restoreInvalidVmxoffFailed:
+    ; Keep the original VMXOFF CF/ZF in the first-wins diagnostic slot
+    pushfq
+    pop rax
+    mov rdx, rax
+    bts rdx, 3Fh
+    xor eax, eax
+    lock cmpxchg qword ptr [g_HvVmxOffFailureFlagsAsm], rdx
+restoreInvalidBugCheck:
+    mov r10, rbx
     mov rcx, r10
     sub rsp, 20h
     call HvFatalBugCheck
@@ -1006,7 +1118,41 @@ HvVmxOn endp
 
 HvVmxOff proc
     vmxoff
+    pushfq
+    pop rax
+    ; VMXOFF reports VMfailInvalid/VMfailValid in CF/ZF. All existing C++
+    ; cleanup callers historically ignore a return value, so a failed
+    ; transition must not return to code that clears CR4 or frees VMX state.
+    jc hvVmxOffFailed
+    jz hvVmxOffFailed
     ret
+
+hvVmxOffFailed:
+    ; The caller is still in VMX root with its ordinary host stack. Keep
+    ; interrupts disabled, preserve the first diagnostic snapshot while VMX
+    ; state is still available, and never execute the caller's cleanup tail.
+    cli
+    ; Keep the raw VMXOFF flags in a lock-free, debugger-readable slot. The
+    ; high bit marks the slot committed; compare-exchange preserves the first
+    ; failure when more than one processor reaches this path.
+    mov rdx, rax
+    bts rdx, 3Fh
+    xor eax, eax
+    lock cmpxchg qword ptr [g_HvVmxOffFailureFlagsAsm], rdx
+    xor ecx, ecx
+    sub rsp, 28h
+    call HvCaptureFatalSnapshotPreVmxoff
+    add rsp, 28h
+    sub rsp, 28h
+    call MarkCurrentVcpuParked
+    add rsp, 28h
+    xor ecx, ecx
+    sub rsp, 28h
+    call HvFatalBugCheck
+    add rsp, 28h
+hvVmxOffFailedLoop:
+    hlt
+    jmp hvVmxOffFailedLoop
 HvVmxOff endp
 
 HvVmClear proc
@@ -1052,6 +1198,7 @@ HvLaunchGuest proc frame
     sub rsp, 200h
     .allocstack 200h
     .endprolog
+    lock inc dword ptr [g_HvLaunchGuestEntered]
 
     ; Never execute a VMX instruction after a failed preparation or an
     ; unexpected VMXOFF. The C++ caller treats this token as a non-VMX path.
@@ -1078,9 +1225,11 @@ HvLaunchGuest proc frame
     jc launchVmwriteFailure
     jz launchVmwriteFailure
 
+    lock inc dword ptr [g_HvLaunchVmlaunchIssued]
     vmlaunch
     pushfq
     pop rax
+    lock inc dword ptr [g_HvLaunchVmlaunchReturned]
     add rsp, 200h
     ret
 
@@ -1199,6 +1348,9 @@ GuestStartThunk proc
     ; directly to that frame's continuation leaves the monitor active and lets
     ; the IPI wrapper return to Windows in VMX non-root mode. StopHypervisor()
     ; later uses the reserved VMCALL path to leave VMX on each processor.
+    pushfq
+    lock inc dword ptr [g_HvLaunchGuestStarted]
+    popfq
     mov rax, VMX_LAUNCH_SUCCESS_MAGIC
     ret
 GuestStartThunk endp
@@ -1263,6 +1415,7 @@ EnableHvCallback proc frame
     ; setup so the dynamic guest RSP matches the VMX launch path.
     lea rdx, [rsp - 8]
     lea r8, GuestStartThunk
+    lock inc dword ptr [g_HvLaunchAssemblyEntered]
     call PrepareHvCallback
     ; PrepareHvCallback is an explicit ULONG contract. Test the low byte as
     ; well so older binaries that still return a C++ bool fail closed.

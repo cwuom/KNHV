@@ -23,6 +23,8 @@ extern "C" PDRIVER_OBJECT g_HvDriverObject;
 #define NESTED_HV_BUILD_ID 0
 #endif
 static constexpr u64 kHvBuildId = static_cast<u64>(NESTED_HV_BUILD_ID);
+// "HVMX" keeps driver-originated fatal dumps distinct from Windows bugchecks
+static constexpr ULONG kHvFatalBugCheck = 0x48564D58UL;
 
 // ==============================================================================
 // External Assembly Linking
@@ -68,6 +70,26 @@ extern "C" {
     void MarkCurrentVcpuStopped();
     ULONG HandleVmResumeFailure(GuestContext* Ctx, u64 ResumeFlags);
     __declspec(noreturn) void HvFatalBugCheck(GuestContext* Ctx);
+    extern volatile LONG g_HvLaunchTelemetrySignature;
+    extern volatile LONG g_HvLaunchExpectedProcessors;
+    extern volatile LONG g_HvLaunchProbeEntered;
+    extern volatile LONG g_HvLaunchProbeCompleted;
+    extern volatile LONG g_HvLaunchDispatchEntered;
+    extern volatile LONG g_HvLaunchAssemblyEntered;
+    extern volatile LONG g_HvLaunchPrepareEntered;
+    extern volatile LONG g_HvLaunchPrepareSucceeded;
+    extern volatile LONG g_HvLaunchGuestEntered;
+    extern volatile LONG g_HvLaunchVmlaunchIssued;
+    extern volatile LONG g_HvLaunchVmlaunchReturned;
+    extern volatile LONG g_HvLaunchGuestStarted;
+    extern volatile LONG g_HvLaunchMarkedLaunched;
+    extern volatile LONG g_HvLaunchVmExitAsmReached;
+    extern volatile LONG g_HvLaunchFirstVmExitEntered;
+    extern volatile LONG g_HvLaunchDispatchReturned;
+    extern volatile LONG g_HvLaunchLastProbeProcessor;
+    extern volatile LONG g_HvLaunchLastDispatchProcessor;
+    extern volatile LONG g_HvLaunchLastPrepareProcessor;
+    extern volatile LONG g_HvLaunchLastReturnProcessor;
 }
 
 // ==============================================================================
@@ -82,11 +104,48 @@ static constexpr LONG kHvLifecycleStarting = 1;
 static constexpr LONG kHvLifecycleRunning = 2;
 static constexpr LONG kHvLifecycleStopping = 3;
 static constexpr LONG kHvLifecycleQuarantined = 4;
+
+enum TargetOperation : LONG {
+    TargetOperationNone = 0,
+    TargetOperationProbe = 1,
+    TargetOperationLaunch = 2,
+    TargetOperationStop = 3,
+};
+
+enum TargetWorkState : LONG {
+    TargetWorkIdle = 0,
+    TargetWorkQueued = 1,
+    TargetWorkEntered = 2,
+    TargetWorkExecuting = 3,
+    TargetWorkSucceeded = 4,
+    TargetWorkFailed = 5,
+    TargetWorkCancelled = 6,
+};
+
+struct __declspec(align(64)) TargetCpuWork {
+    PROCESSOR_NUMBER Target;
+    u32 ProcessorIndex;
+    volatile LONG Generation;
+    volatile LONG Operation;
+    volatile LONG State;
+    volatile LONG TimedOut;
+    volatile LONG ObservedProcessorTag;
+    NTSTATUS Result;
+    HANDLE ThreadHandle;
+    u64 QueueTime;
+    u64 EnterTime;
+    u64 ReturnTime;
+};
+
+static TargetCpuWork* g_HvTargetCpuWork = nullptr;
+static volatile LONG g_HvTargetWorkGeneration = 0;
+static volatile LONG g_HvTargetActiveProcessor = -1;
+static constexpr u64 kTargetOperationTimeout100ns = 50000000ULL;
+static constexpr LONGLONG kTargetCancelGrace100ns = 10000000LL;
 static u64 g_VmxBasic = 0;
 // VMX host CR3 must always reference the kernel/system address space.  A
-// KeIpiGenericCall callback may run while the interrupted thread belongs to a
-// user process; capturing that process CR3 would leave the VM-exit stack and
-// driver image unmapped under KPTI/25H2.
+// A future caller may invoke the launch path from an arbitrary process, so the
+// VMX host CR3 is captured from the system process explicitly
 static u64 g_HostCr3 = 0;
 static bool g_VmxRequires32BitPhysicalAddress = false;
 extern "C" volatile u8 g_LinearAddressBits = 48;
@@ -161,15 +220,28 @@ static VmxControlGeneration SelectVmxControlGeneration(u32 profile) {
 // Detailed messages are emitted only from passive-level code. Root/IPI paths
 // use the binary recorder so enabling diagnostics cannot stall all processors.
 extern "C" volatile LONG g_HvVerboseLogging = 0;
-#define HV_VERBOSE_PRINT(...) \
+#define HV_PASSIVE_PRINT(...) \
     do { \
-        if (g_HvVerboseLogging != 0 && KeGetCurrentIrql() == PASSIVE_LEVEL) { \
-            DbgPrint(__VA_ARGS__); \
+        if (KeGetCurrentIrql() == PASSIVE_LEVEL) { \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, __VA_ARGS__); \
         } \
     } while (0)
-// Supervisor CET is not fully virtualized yet. Keep the guest CPUID contract
-// honest until all S_CET/SSP transitions and exception paths are implemented.
+#define HV_VERBOSE_PRINT(...) \
+    do { \
+        if (g_HvVerboseLogging != 0) { \
+            HV_PASSIVE_PRINT(__VA_ARGS__); \
+        } \
+    } while (0)
+// Supervisor CET is not fully virtualized yet. CET_U MSRs may execute natively
+// only when the fixed XSAVES frame owns their complete state component. This
+// compatibility path does not advertise CET to a guest that did not already
+// discover it before the late launch.
 static constexpr bool kGuestCetStateVirtualized = false;
+
+static __forceinline bool IsCetUserStatePreserved() {
+    return g_XsavesEnabled != 0 &&
+           (g_XsavesMask & IA32_XSS_CET_U) != 0;
+}
 
 static constexpr long kExitActionNone = 0;
 static constexpr long kExitActionResume = 1;
@@ -653,7 +725,7 @@ bool InitializeVmxFeatureContract() {
         return false;
     }
 
-    DbgPrint("[HV] XSTATE contract: XSAVES=%u XRSTORS=%u XFD=%u D1.EBX=%lu "
+    HV_PASSIVE_PRINT("[HV] XSTATE contract: XSAVES=%u XRSTORS=%u XFD=%u D1.EBX=%lu "
              "XSS_ENUM=0x%llX HOST_XSS=0x%llX\n",
              xsavesInstruction ? 1U : 0U,
              xrstorsInstruction ? 1U : 0U,
@@ -732,7 +804,7 @@ bool InitializeVmxFeatureContract() {
         return false;
     }
 
-    DbgPrint("[HV] XSTATE preservation: XSAVES=%u HOST_XSS=0x%llX "
+    HV_PASSIVE_PRINT("[HV] XSTATE preservation: XSAVES=%u HOST_XSS=0x%llX "
              "PRESERVE_XSS=0x%llX GUEST_INITIAL_XSS=0x%llX "
              "GUEST_WRITE_XSS=0x%llX frame=%lu D1.EBX=%lu\n",
              g_XsavesEnabled ? 1U : 0U,
@@ -760,7 +832,7 @@ bool InitializeVmxFeatureContract() {
     g_VmxCapabilityProfile = BuildVmxCapabilityProfile(
         vmxBasic, g_XsavesEnabled != 0, g_CetVmcsEnabled != 0);
 
-    DbgPrint("[HV] VMX control contract: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
+    HV_PASSIVE_PRINT("[HV] VMX control contract: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
              g_VmxCapabilityProfile, g_CetVmcsEnabled ? 1U : 0U,
              g_XsavesEnabled ? 1U : 0U);
 
@@ -774,7 +846,7 @@ constexpr u32 TAG_HVST = 0x54535648; // 'HVST' little endian
 constexpr u32 TAG_HVCB = 0x42435648; // 'HVCB' little endian
 constexpr u32 TAG_HVTR = 0x52545648; // 'HVTR' little endian
 static constexpr u64 kHvCrashBlobSignature = 0x48564342524D5541; // HVCBRMA
-static constexpr u32 kHvCrashBlobVersion = 1;
+static constexpr u32 kHvCrashBlobVersion = 4;
 static const GUID kHvCrashBlobGuid = {
     0xC6A3D9F0, 0x2F6F, 0x4E4A,
     {0xA5, 0x9E, 0x61, 0x34, 0x12, 0x88, 0x4B, 0xE6}
@@ -786,6 +858,9 @@ struct HvFatalSnapshot {
     u32 Lifecycle;
     u32 LaunchStage;
     u32 VmInstructionError;
+    u32 VmExitCount;
+    u32 VmcsSetupPhase;
+    u64 LaunchFlags;
 
     u64 ExitReasonRaw;
     u64 ExitQualification;
@@ -814,6 +889,10 @@ struct HvFatalSnapshot {
     u64 GuestPtCtl;
 
     u64 VmInstructionRflags;
+    u32 NativeTeardownRejectMask;
+    // bit 63 marks a committed first-wins sample; the low RFLAGS bits retain
+    // the VMfailInvalid or VMfailValid status from the assembly VMXOFF path
+    u64 VmxOffFailureFlags;
 };
 
 struct HvCrashBlob {
@@ -832,6 +911,26 @@ struct HvCrashBlob {
     u64 BugcheckArg4;
     u32 TraceRecordsPerCpu;
     u32 TraceReserved;
+    u32 LaunchTelemetrySignature;
+    u32 LaunchExpectedProcessors;
+    u32 LaunchProbeEntered;
+    u32 LaunchProbeCompleted;
+    u32 LaunchDispatchEntered;
+    u32 LaunchAssemblyEntered;
+    u32 LaunchPrepareEntered;
+    u32 LaunchPrepareSucceeded;
+    u32 LaunchGuestEntered;
+    u32 LaunchVmlaunchIssued;
+    u32 LaunchVmlaunchReturned;
+    u32 LaunchGuestStarted;
+    u32 LaunchMarkedLaunched;
+    u32 LaunchVmExitAsmReached;
+    u32 LaunchFirstVmExitEntered;
+    u32 LaunchDispatchReturned;
+    u32 LaunchLastProbeProcessor;
+    u32 LaunchLastDispatchProcessor;
+    u32 LaunchLastPrepareProcessor;
+    u32 LaunchLastReturnProcessor;
     HvFatalSnapshot CpuSnapshots[1];
 };
 
@@ -840,6 +939,8 @@ static bool g_HvBugCheckReasonRegistered = false;
 static HvCrashBlob* g_HvCrashBlob = nullptr;
 static SIZE_T g_HvCrashBlobSize = 0;
 static volatile LONG g_HvCrashBlobCaptured = 0;
+static volatile LONG g_HvCrashBlobReleaseAuthorized = 0;
+extern "C" volatile u64 g_HvVmxOffFailureFlagsAsm;
 
 static __forceinline bool VmxOk(u64 rflags) {
     return ((rflags & 1ULL) == 0) && ((rflags & (1ULL << 6)) == 0);
@@ -1002,10 +1103,10 @@ static __forceinline bool IsValidGuestState(const GuestContext* c) {
         return false;
     }
 
-    // The restore path writes a three-word IRET frame below RSP.  Reject
-    // values that would underflow that frame or point at the low, unmapped
-    // portion of the address space.  A kernel-mode Windows stack is always
-    // well above this floor; this is intentionally conservative.
+    // The restore path writes a five-word IRETQ frame and its private spill
+    // below RSP. Reject values that would underflow that frame or point at the
+    // low, unmapped portion of the address space. A kernel-mode Windows stack
+    // is always well above this floor; this is intentionally conservative.
     if (c->GuestRsp < 0x200 || c->GuestRip < 0x10000) return false;
 
     // CR3 may carry a PCID in bits 11:0 when CR4.PCIDE is set (Windows uses
@@ -1055,22 +1156,126 @@ static __forceinline bool IsValidGuestState(const GuestContext* c) {
                                     (1ULL << 14) | (1ULL << 16) |
                                     (1ULL << 18) | (1ULL << 21);
     constexpr u64 kRflagsReserved = ~kRflagsAllowed;
+    // IRETQ with NT set faults in IA-32e mode. Do not turn an observable VMX
+    // failure into #GP while the processor is leaving the diagnostic path.
+    constexpr u64 kRflagsNt = 1ULL << 14;
     if ((c->Rflags & (1ULL << 1)) == 0 ||
+        (c->Rflags & kRflagsNt) != 0 ||
         (c->Rflags & kRflagsReserved) != 0) {
         return false;
     }
     return true;
 }
 
-static __forceinline void RequestSafeExit(GuestContext* c) {
+static __forceinline long AcquireFatalSnapshotCommitState(VcpuContext* vcpu) {
+    if (!vcpu) return HvFatalSnapshotCommitted;
+    return InterlockedCompareExchange(&vcpu->FatalSnapshotCommitState,
+                                      HvFatalSnapshotEmpty,
+                                      HvFatalSnapshotEmpty);
+}
+
+static __forceinline u32 ReadNativeTeardownRejectMask(
+    const VcpuContext* vcpu) {
+    if (!vcpu) return HvNativeTeardownRejectNone;
+    return static_cast<u32>(InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu->NativeTeardownRejectMask), 0, 0));
+}
+
+static __forceinline void RequestFatalStop(GuestContext* c) {
+    if (!c) return;
+    c->AbortVm = 0;
+    c->HaltVm = 1;
+}
+
+static __forceinline void RequestAuthenticatedUnload(GuestContext* c,
+                                                     u32 exitReason) {
     const u32 id = CurrentProcessorIndex();
+    VcpuContext* vcpu =
+        g_VcpuData && id < g_ProcessorCount ? &g_VcpuData[id] : nullptr;
+    u32 rejectMask = ReadNativeTeardownRejectMask(vcpu);
+    u64 entryIntrInfo = 0;
+    u64 exitIntrInfo = 0;
+    u64 idtVectoringInfo = 0;
+    u64 guestInterruptibility = 0;
+    u64 guestActivity = 0;
+    u64 pendingDebug = 0;
+    const bool eventStateKnown =
+        vcpu &&
+        VmReadChecked(CONTROL_VM_ENTRY_INTR_INFO_FIELD, &entryIntrInfo) &&
+        VmReadChecked(VM_EXIT_INTR_INFO, &exitIntrInfo) &&
+        VmReadChecked(VM_EXIT_IDT_VECTORING_INFO, &idtVectoringInfo) &&
+        VmReadChecked(GUEST_INTERRUPTIBILITY_INFO, &guestInterruptibility) &&
+        VmReadChecked(GUEST_ACTIVITY_STATE, &guestActivity) &&
+        VmReadChecked(GUEST_PENDING_DBG_EXCEPTIONS, &pendingDebug);
+    if (!eventStateKnown) {
+        rejectMask |= HvNativeTeardownRejectVmcsRead;
+    } else {
+        if ((entryIntrInfo & VM_ENTRY_INTR_INFO_VALID) != 0) {
+            rejectMask |= HvNativeTeardownRejectVmEntryEvent;
+        }
+        if ((exitIntrInfo & VM_ENTRY_INTR_INFO_VALID) != 0) {
+            rejectMask |= HvNativeTeardownRejectExitEvent;
+        }
+        if ((idtVectoringInfo & VM_ENTRY_INTR_INFO_VALID) != 0) {
+            rejectMask |= HvNativeTeardownRejectIdtVectoring;
+        }
+        if (guestActivity != 0) {
+            rejectMask |= HvNativeTeardownRejectActivity;
+        }
+        if (guestInterruptibility != 0) {
+            rejectMask |= HvNativeTeardownRejectInterruptibility;
+        }
+        if (pendingDebug != 0) {
+            rejectMask |= HvNativeTeardownRejectPendingDebug;
+        }
+    }
+    const bool noPendingEvent =
+        eventStateKnown &&
+        (entryIntrInfo & VM_ENTRY_INTR_INFO_VALID) == 0 &&
+        (exitIntrInfo & VM_ENTRY_INTR_INFO_VALID) == 0 &&
+        (idtVectoringInfo & VM_ENTRY_INTR_INFO_VALID) == 0 &&
+        guestInterruptibility == 0 && guestActivity == 0 &&
+        pendingDebug == 0;
+    const bool authenticatedUnload =
+        c && exitReason == VM_EXIT_REASON_VMCALL &&
+        (c->GuestCs & 3U) == 0 &&
+        c->Rcx == HYPERVISOR_MAGIC && c->Rdx == VMCALL_UNLOAD;
+    if (!c || exitReason != VM_EXIT_REASON_VMCALL) {
+        rejectMask |= HvNativeTeardownRejectParameters;
+    }
+    if (!c || (c->GuestCs & 3U) != 0) {
+        rejectMask |= HvNativeTeardownRejectCpl;
+    }
+    if (!c || c->Rcx != HYPERVISOR_MAGIC || c->Rdx != VMCALL_UNLOAD) {
+        rejectMask |= HvNativeTeardownRejectParameters;
+    }
     const bool descriptorContractSafe =
-        g_VcpuData && id < g_ProcessorCount &&
-        g_VcpuData[id].NativeTeardownSafe != 0;
-    if (c && descriptorContractSafe && (c->GuestCs & 3) == 0 &&
-        IsValidGuestState(c)) {
+        vcpu && vcpu->NativeTeardownSafe != 0;
+    constexpr u32 kDescriptorRejectBits =
+        static_cast<u32>(HvNativeTeardownRejectSelector) |
+        static_cast<u32>(HvNativeTeardownRejectCsSsLimitAr) |
+        static_cast<u32>(HvNativeTeardownRejectGdt) |
+        static_cast<u32>(HvNativeTeardownRejectIdt) |
+        static_cast<u32>(HvNativeTeardownRejectTr) |
+        static_cast<u32>(HvNativeTeardownRejectVmcsRead);
+    if (!descriptorContractSafe &&
+        (rejectMask & kDescriptorRejectBits) == 0) {
+        rejectMask |= HvNativeTeardownRejectDescriptorContract;
+    }
+    const bool guestStateValid = IsValidGuestState(c);
+    if (!guestStateValid) {
+        rejectMask |= HvNativeTeardownRejectGuestState;
+    }
+    if (vcpu) {
+        InterlockedExchange(&vcpu->NativeTeardownRejectMask,
+                            static_cast<LONG>(rejectMask));
+    }
+    if (authenticatedUnload && descriptorContractSafe && noPendingEvent &&
+        guestStateValid) {
         c->AbortVm = 1;
+        c->HaltVm = 0;
     } else if (c) {
+        c->AbortVm = 0;
         c->HaltVm = 1;
     }
 }
@@ -1083,7 +1288,6 @@ extern "C" ULONG HandleVmResumeFailure(GuestContext* c, u64 resumeFlags) {
     const u32 id = CurrentProcessorIndex();
     VcpuContext* vcpu =
         g_VcpuData && id < g_ProcessorCount ? &g_VcpuData[id] : nullptr;
-    const bool vmFailInvalid = (resumeFlags & 1ULL) != 0;
     const bool vmFailValid = (resumeFlags & (1ULL << 6)) != 0;
     if (vcpu) {
         vcpu->LastVmResumeFlags = resumeFlags;
@@ -1097,31 +1301,56 @@ extern "C" ULONG HandleVmResumeFailure(GuestContext* c, u64 resumeFlags) {
             !VmReadChecked(VM_INSTRUCTION_ERROR,
                            &vcpu->LastVmInstructionError)) {
             vcpu->LastExitAction = kExitActionHalt;
-            if (c) c->HaltVm = 1;
+            if (c) {
+                c->AbortVm = 0;
+                c->HaltVm = 1;
+            }
+            HvCaptureFatalSnapshotPreVmxoff(c);
             return 0;
         }
-        if (!UpdateNativeTeardownContract(vcpu)) {
-            vcpu->LastExitAction = kExitActionHalt;
-        }
+        vcpu->LastExitAction = kExitActionHalt;
     }
-    if (c && vmFailValid && !vmFailInvalid &&
-        vcpu && vcpu->NativeTeardownSafe != 0 && IsValidGuestState(c) &&
-        (!g_XsavesEnabled ||
-         (c->GuestXss & ~g_GuestXssWriteMask) == 0)) {
-        c->AbortVm = 1;
-        c->HaltVm = 0;
-        return 1;
+    const bool xssPreservationValid = !g_XsavesEnabled ||
+        (c && (c->GuestXss & ~g_XsavesMask) == 0);
+    if (c && vcpu && !xssPreservationValid) {
+        WriteHvTrace(vcpu, id, HvTraceEventXssPreservationFail,
+                     c->GuestXss, g_XsavesMask,
+                     g_GuestXssWriteMask, g_HostXssMask);
     }
-    if (c) c->HaltVm = 1;
+    if (c) {
+        c->AbortVm = 0;
+        c->HaltVm = 1;
+    }
+    // A failed VMRESUME is never a proven native continuation. Freeze the
+    // first VMCS image while VMX is still active and let the assembly fatal
+    // path leave VMX without manufacturing an IRETQ return.
+    HvCaptureFatalSnapshotPreVmxoff(c);
     return 0;
 }
 
 static void ReleaseHvCrashBlob() {
-    if (!g_HvCrashBlob) return;
+    const LONG lifecycle =
+        InterlockedCompareExchange(&g_HvLifecycle, 0, 0);
+    const bool deregisteredOwner =
+        InterlockedCompareExchange(&g_HvCrashBlobReleaseAuthorized, 0, 0) != 0;
+    // A registered callback may still publish this buffer at bugcheck time.
+    // Quarantine likewise retains every diagnostic allocation used by a live
+    // or parked VCPU. A never-registered startup failure may free only after
+    // the lifecycle has completed its transition back to Idle.
+    if (g_HvBugCheckReasonRegistered ||
+        lifecycle == kHvLifecycleQuarantined ||
+        (!deregisteredOwner && lifecycle != kHvLifecycleIdle)) {
+        return;
+    }
+    if (!g_HvCrashBlob) {
+        InterlockedExchange(&g_HvCrashBlobReleaseAuthorized, 0);
+        return;
+    }
     ExFreePoolWithTag(g_HvCrashBlob, TAG_HVCB);
     g_HvCrashBlob = nullptr;
     g_HvCrashBlobSize = 0;
     g_HvCrashBlobCaptured = 0;
+    InterlockedExchange(&g_HvCrashBlobReleaseAuthorized, 0);
 }
 
 static bool InitializeHvCrashBlob(u32 cpuCount) {
@@ -1147,9 +1376,10 @@ static bool InitializeHvCrashBlob(u32 cpuCount) {
         return true;
     }
 
-    if (g_HvCrashBlob) {
-        ReleaseHvCrashBlob();
-    }
+    // Never replace callback storage whose ownership did not complete a full
+    // deregistration/Idle transition. Losing the old pointer would make a
+    // later bugcheck callback dereference freed or unreachable evidence.
+    if (g_HvCrashBlob) return false;
 
     void* memory = ExAllocatePoolWithTag(NonPagedPoolNx, size, TAG_HVCB);
     if (!memory) return false;
@@ -1200,6 +1430,50 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
     blob->BugcheckArg3 = bugcheckParam3;
     blob->BugcheckArg4 = bugcheckParam4;
     blob->Reserved = g_HvImagePinned != 0 ? 1U : 0U;
+    blob->LaunchTelemetrySignature = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchTelemetrySignature, 0, 0));
+    blob->LaunchExpectedProcessors = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchExpectedProcessors, 0, 0));
+    blob->LaunchProbeEntered = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchProbeEntered, 0, 0));
+    blob->LaunchProbeCompleted = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchProbeCompleted, 0, 0));
+    blob->LaunchDispatchEntered = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchDispatchEntered, 0, 0));
+    blob->LaunchAssemblyEntered = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchAssemblyEntered, 0, 0));
+    blob->LaunchPrepareEntered = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchPrepareEntered, 0, 0));
+    blob->LaunchPrepareSucceeded = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchPrepareSucceeded, 0, 0));
+    blob->LaunchGuestEntered = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchGuestEntered, 0, 0));
+    blob->LaunchVmlaunchIssued = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchVmlaunchIssued, 0, 0));
+    blob->LaunchVmlaunchReturned = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchVmlaunchReturned, 0, 0));
+    blob->LaunchGuestStarted = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchGuestStarted, 0, 0));
+    blob->LaunchMarkedLaunched = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchMarkedLaunched, 0, 0));
+    blob->LaunchVmExitAsmReached = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchVmExitAsmReached, 0, 0));
+    blob->LaunchFirstVmExitEntered = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchFirstVmExitEntered, 0, 0));
+    blob->LaunchDispatchReturned = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchDispatchReturned, 0, 0));
+    blob->LaunchLastProbeProcessor = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchLastProbeProcessor, 0, 0));
+    blob->LaunchLastDispatchProcessor = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchLastDispatchProcessor, 0, 0));
+    blob->LaunchLastPrepareProcessor = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchLastPrepareProcessor, 0, 0));
+    blob->LaunchLastReturnProcessor = static_cast<u32>(
+        InterlockedCompareExchange(&g_HvLaunchLastReturnProcessor, 0, 0));
+    const u64 vmxOffFailureFlags = static_cast<u64>(
+        InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_HvVmxOffFailureFlagsAsm),
+            0, 0));
 
     for (u32 i = 0; i < snapshotCount; ++i) {
         HvFatalSnapshot& out = snapshots[i];
@@ -1207,6 +1481,9 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
         out.Lifecycle = static_cast<u32>(g_HvLifecycle);
         out.LaunchStage = 0;
         out.VmInstructionError = 0;
+        out.VmExitCount = 0;
+        out.VmcsSetupPhase = 0;
+        out.LaunchFlags = 0;
         out.ExitReasonRaw = 0;
         out.ExitQualification = 0;
         out.GuestRip = 0;
@@ -1229,12 +1506,17 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
         out.GuestInterruptSspTable = 0;
         out.GuestPtCtl = 0;
         out.VmInstructionRflags = 0;
+        out.NativeTeardownRejectMask = 0;
+        out.VmxOffFailureFlags = 0;
 
         if (g_VcpuData && i < g_ProcessorCount) {
             const VcpuContext& vcpu = g_VcpuData[i];
             out.Lifecycle = static_cast<u32>(vcpu.State);
             out.LaunchStage = static_cast<u32>(vcpu.LaunchStage);
             out.VmInstructionError = static_cast<u32>(vcpu.LastVmInstructionError);
+            out.VmExitCount = static_cast<u32>(vcpu.VmExitCount);
+            out.VmcsSetupPhase = static_cast<u32>(vcpu.VmcsSetupPhase);
+            out.LaunchFlags = vcpu.LastLaunchFlags;
             out.ExitReasonRaw = vcpu.LastExitReasonRaw;
             out.ExitQualification = vcpu.LastExitQualification;
             out.GuestRip = vcpu.LastGuestRip;
@@ -1257,7 +1539,9 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
             out.GuestInterruptSspTable = vcpu.LastGuestInterruptSspTable;
             out.GuestPtCtl = vcpu.LastPtCtl;
             out.VmInstructionRflags = vcpu.LastVmInstructionRflags;
+            out.NativeTeardownRejectMask = ReadNativeTeardownRejectMask(&vcpu);
         }
+        out.VmxOffFailureFlags = vmxOffFailureFlags;
     }
 
     auto* traceTail = reinterpret_cast<HvTraceRecord*>(
@@ -1310,6 +1594,13 @@ extern "C" VOID HvSecondaryDumpDataCallback(
 
     PKBUGCHECK_SECONDARY_DUMP_DATA_EX dumpData =
         static_cast<PKBUGCHECK_SECONDARY_DUMP_DATA_EX>(ReasonSpecificData);
+    if (InterlockedCompareExchange(&g_HvCrashBlobCaptured, 1, 0) == 0) {
+        CaptureHvCrashBlob(dumpData->BugCheckCode,
+                           dumpData->BugCheckParameter1,
+                           dumpData->BugCheckParameter2,
+                           dumpData->BugCheckParameter3,
+                           dumpData->BugCheckParameter4);
+    }
     dumpData->Guid = kHvCrashBlobGuid;
     const UCHAR* base = reinterpret_cast<const UCHAR*>(g_HvCrashBlob);
     const SIZE_T cursor = reinterpret_cast<SIZE_T>(dumpData->Context);
@@ -1360,10 +1651,28 @@ bool RegisterSecondaryDumpCallback() {
 }
 
 void UnregisterSecondaryDumpCallback() {
-    if (!g_HvBugCheckReasonRegistered) return;
+    if (!g_HvBugCheckReasonRegistered) {
+        ReleaseHvCrashBlob();
+        return;
+    }
 
+    if (InterlockedCompareExchange(&g_HvLifecycle, 0, 0) ==
+        kHvLifecycleQuarantined) {
+        return;
+    }
+    if (!KeDeregisterBugCheckReasonCallback(&g_HvBugCheckReasonRecord)) {
+        // Returning would let later teardown free callback-owned nonpaged
+        // storage. Keep ownership intact and use the driver's bugcheck code.
+        KeBugCheckEx(kHvFatalBugCheck,
+                     0xCB01,
+                     reinterpret_cast<ULONG_PTR>(&g_HvBugCheckReasonRecord),
+                     reinterpret_cast<ULONG_PTR>(g_HvCrashBlob),
+                     static_cast<ULONG_PTR>(g_HvCrashBlobSize));
+        __assume(0);
+    }
     g_HvBugCheckReasonRegistered = false;
-    (void)KeDeregisterBugCheckReasonCallback(&g_HvBugCheckReasonRecord);
+    InterlockedExchange(&g_HvCrashBlobReleaseAuthorized, 1);
+    ReleaseHvCrashBlob();
 }
 
 // Capture the VMCS while VMX is still active. The fatal assembly path calls
@@ -1374,6 +1683,19 @@ extern "C" void HvCaptureFatalSnapshotPreVmxoff(GuestContext* c) {
     if (cpu >= g_ProcessorCount) return;
 
     VcpuContext* vcpu = &g_VcpuData[cpu];
+    if (InterlockedCompareExchange(&vcpu->FatalSnapshotCommitState,
+                                   HvFatalSnapshotWriting,
+                                   HvFatalSnapshotEmpty) !=
+        HvFatalSnapshotEmpty) {
+        return;
+    }
+    const u64 vmxOffFailureFlags = static_cast<u64>(
+        InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&g_HvVmxOffFailureFlagsAsm),
+            0, 0));
+    if (vmxOffFailureFlags != 0) {
+        vcpu->LastVmInstructionRflags = vmxOffFailureFlags;
+    }
     u64 value = 0;
     if (VmReadChecked(VM_EXIT_REASON, &value)) {
         vcpu->LastExitReasonRaw = static_cast<u32>(value);
@@ -1429,29 +1751,29 @@ extern "C" void HvCaptureFatalSnapshotPreVmxoff(GuestContext* c) {
                  vcpu->LastExitReasonRaw, vcpu->LastVmInstructionError,
                  vcpu->LastGuestRip, vcpu->LastGuestRsp);
     MemoryBarrier();
+    InterlockedExchange(&vcpu->FatalSnapshotCommitState,
+                        HvFatalSnapshotCommitted);
 }
 
 // A frame that cannot pass native teardown validation has no safe instruction
 // pointer or stack. Fail fast with a debugger-visible dump instead of waiting
 // for CLOCK_WATCHDOG_TIMEOUT to obscure the original VMX failure.
 extern "C" __declspec(noreturn) void HvFatalBugCheck(GuestContext* c) {
-    constexpr ULONG kHvFatalBugCheck = 0x200;
+    // VMXOFF may have invalidated the transition frame.  Do not dereference it
+    // or call the trace path here; the pre-VMXOFF snapshot is the only trusted
+    // source for bugcheck parameters after the processor leaves VMX operation.
+    (void)c;
     const ULONG_PTR cpu = CurrentProcessorIndex();
     ULONG_PTR reason = 0;
-    const ULONG_PTR rip = c ? static_cast<ULONG_PTR>(c->GuestRip) : 0;
-    const ULONG_PTR rsp = c ? static_cast<ULONG_PTR>(c->GuestRsp) : 0;
-    if (c && g_VcpuData && cpu < g_ProcessorCount) {
-        // VMXOFF has already ended VMX operation on this path.  Use the
-        // per-CPU snapshot instead of issuing an invalid post-VMX VMREAD
-        // while collecting bugcheck parameters
-        reason = static_cast<ULONG_PTR>(g_VcpuData[cpu].LastExitReasonRaw);
-        WriteHvTrace(&g_VcpuData[cpu], static_cast<u32>(cpu),
-                     HvTraceEventPreBugcheck, reason,
-                     static_cast<u64>(rip), static_cast<u64>(rsp));
+    ULONG_PTR rip = 0;
+    ULONG_PTR rsp = 0;
+    if (g_VcpuData && cpu < g_ProcessorCount) {
+        const VcpuContext& vcpu = g_VcpuData[cpu];
+        reason = static_cast<ULONG_PTR>(vcpu.LastExitReasonRaw);
+        rip = static_cast<ULONG_PTR>(vcpu.LastGuestRip);
+        rsp = static_cast<ULONG_PTR>(vcpu.LastGuestRsp);
     }
-    if (InterlockedCompareExchange(&g_HvCrashBlobCaptured, 1, 0) == 0) {
-        CaptureHvCrashBlob(kHvFatalBugCheck, cpu, reason, rip, rsp);
-    }
+    MemoryBarrier();
     KeBugCheckEx(kHvFatalBugCheck, cpu, reason, rip, rsp);
     __assume(0);
 }
@@ -1515,6 +1837,8 @@ static bool UpdateNativeTeardownContract(VcpuContext* vcpu) {
         VmReadChecked(GUEST_TR_LIMIT, &guestTrLimit) &&
         VmReadChecked(GUEST_TR_AR_BYTES, &guestTrAr);
     if (!readOk) {
+        InterlockedExchange(&vcpu->NativeTeardownRejectMask,
+                            static_cast<LONG>(HvNativeTeardownRejectVmcsRead));
         InterlockedExchange(&vcpu->NativeTeardownSafe, 0);
         return false;
     }
@@ -1525,19 +1849,29 @@ static bool UpdateNativeTeardownContract(VcpuContext* vcpu) {
     const u64 guestSelectorsHigh =
         PackSegmentSelectors(static_cast<u16>(guestFs), static_cast<u16>(guestGs),
                              static_cast<u16>(guestLdtr), static_cast<u16>(guestTr));
-    const bool same =
+    const bool selectorsSame =
         guestSelectorsLow == vcpu->HostSegmentSelectorsLow &&
-        guestSelectorsHigh == vcpu->HostSegmentSelectorsHigh &&
+        guestSelectorsHigh == vcpu->HostSegmentSelectorsHigh;
+    const bool csSsSame =
         guestCsLimit == vcpu->HostCsLimit &&
         guestSsLimit == vcpu->HostSsLimit &&
-        guestCsAr == vcpu->HostCsAr && guestSsAr == vcpu->HostSsAr &&
-        guestGdtBase == vcpu->HostGdtBase &&
-        guestGdtLimit == vcpu->HostGdtLimit &&
-        guestIdtBase == vcpu->HostIdtBase &&
-        guestIdtLimit == vcpu->HostIdtLimit &&
-        guestTrBase == vcpu->HostTrBase &&
-        guestTrLimit == vcpu->HostTrLimit &&
-        guestTrAr == vcpu->HostTrAr;
+        guestCsAr == vcpu->HostCsAr && guestSsAr == vcpu->HostSsAr;
+    const bool gdtSame = guestGdtBase == vcpu->HostGdtBase &&
+                         guestGdtLimit == vcpu->HostGdtLimit;
+    const bool idtSame = guestIdtBase == vcpu->HostIdtBase &&
+                         guestIdtLimit == vcpu->HostIdtLimit;
+    const bool trSame = guestTrBase == vcpu->HostTrBase &&
+                        guestTrLimit == vcpu->HostTrLimit &&
+                        guestTrAr == vcpu->HostTrAr;
+    const bool same = selectorsSame && csSsSame && gdtSame && idtSame && trSame;
+    u32 rejectMask = HvNativeTeardownRejectNone;
+    if (!selectorsSame) rejectMask |= HvNativeTeardownRejectSelector;
+    if (!csSsSame) rejectMask |= HvNativeTeardownRejectCsSsLimitAr;
+    if (!gdtSame) rejectMask |= HvNativeTeardownRejectGdt;
+    if (!idtSame) rejectMask |= HvNativeTeardownRejectIdt;
+    if (!trSame) rejectMask |= HvNativeTeardownRejectTr;
+    InterlockedExchange(&vcpu->NativeTeardownRejectMask,
+                        static_cast<LONG>(rejectMask));
     InterlockedExchange(&vcpu->NativeTeardownSafe, same ? 1 : 0);
     return same;
 }
@@ -1571,6 +1905,7 @@ extern "C" void MarkCurrentVcpuLaunched() {
             return;
         }
         WriteHvTrace(vcpu, id, HvTraceEventGuestStart);
+        InterlockedIncrement(&g_HvLaunchMarkedLaunched);
     }
 }
 
@@ -1676,6 +2011,19 @@ void* AllocContiguous(SIZE_T Size, u64* Phys) {
 static void InjectGuestException(GuestContext* c, u8 vector, bool hasErrorCode,
                                  u32 errorCode = 0) {
     if (!c) return;
+    u64 entryIntrInfo = 0;
+    u64 idtVectoringInfo = 0;
+    if (!VmReadChecked(CONTROL_VM_ENTRY_INTR_INFO_FIELD, &entryIntrInfo) ||
+        !VmReadChecked(VM_EXIT_IDT_VECTORING_INFO, &idtVectoringInfo) ||
+        (entryIntrInfo & VM_ENTRY_INTR_INFO_VALID) != 0 ||
+        (idtVectoringInfo & VM_ENTRY_INTR_INFO_VALID) != 0) {
+        // Combining an injected exception with an in-flight event requires
+        // Intel's exception-pair state machine. Until that is implemented,
+        // preserve the first event and stop instead of risking #DF/#TF.
+        c->AbortVm = 0;
+        c->HaltVm = 1;
+        return;
+    }
     u32 info = VM_ENTRY_INTR_INFO_VALID | VM_ENTRY_INTR_TYPE_HARDWARE_EXCEPTION |
                static_cast<u32>(vector);
     if (hasErrorCode) info |= VM_ENTRY_INTR_INFO_DELIVER_ERROR_CODE;
@@ -1693,24 +2041,11 @@ bool HandleVmCall(GuestContext* Ctx) {
     // calling convention: rcx = magic, rdx = command
     if ((Ctx->GuestCs & 3U) == 0 &&
         Ctx->Rcx == HYPERVISOR_MAGIC && Ctx->Rdx == VMCALL_UNLOAD) {
-        u64 exitLength = 0;
-        const u32 cpuId = CurrentProcessorIndex();
-        if (g_VcpuData && cpuId < g_ProcessorCount) {
-            exitLength = g_VcpuData[cpuId].LastExitInstructionLength;
-        }
-        HV_VERBOSE_PRINT("[HV] unload VMCALL: cpu=%u rip=0x%llX rsp=0x%llX "
-                         "rflags=0x%llX IF=%u cs=0x%llX ss=0x%llX\n",
-                         CurrentProcessorIndex(), Ctx->GuestRip, Ctx->GuestRsp,
-                         Ctx->Rflags, (Ctx->Rflags & (1ULL << 9)) != 0 ? 1U : 0U,
-                         Ctx->GuestCs, Ctx->GuestSs);
         // VmExitHandler advances GUEST_RIP exactly once after this routine.
         // The assembly epilogue then VMXOFFs and returns through a real IRET
         // frame, allowing StopHvCallback's normal C++ epilogue to run.
-        RequestSafeExit(Ctx);
-        HV_VERBOSE_PRINT("[HV] unload VMCALL decision: cpu=%u abort=%llu halt=%llu "
-                         "next_rip=0x%llX\n", CurrentProcessorIndex(), Ctx->AbortVm,
-                         Ctx->HaltVm, Ctx->GuestRip + exitLength);
-        return true;
+        RequestAuthenticatedUnload(Ctx, VM_EXIT_REASON_VMCALL);
+        return Ctx->AbortVm != 0;
     }
     // The unload token is a ring-0 service call.  A guest CPL3 attempt must
     // not be allowed to select the native teardown path.
@@ -1799,6 +2134,14 @@ bool HandleMsrRead(GuestContext* Ctx) {
         Ctx->Rdx = static_cast<u32>(value >> 32);
         return true;
     }
+    if (msrIndex == MSR_IA32_U_CET || msrIndex == MSR_IA32_PL3_SSP) {
+        // This exit is configured only when CET_U cannot be preserved. Keep
+        // the hidden guest contract deterministic instead of exposing root
+        // state through the VM-exit handler.
+        Ctx->Rax = 0;
+        Ctx->Rdx = 0;
+        return true;
+    }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_S_CET) {
         const u64 value = Ctx->GuestSCet;
         Ctx->Rax = static_cast<u32>(value);
@@ -1826,8 +2169,8 @@ bool HandleMsrRead(GuestContext* Ctx) {
 
     if (IsIntelPtMsr(msrIndex) || IsCetStateMsr(msrIndex)) {
         // the native instruction must observe its real host MSR after VMXOFF
-        RequestSafeExit(Ctx);
-        return true;
+        RequestFatalStop(Ctx);
+        return false;
     }
     if (msrIndex == MSR_IA32_XFD || msrIndex == MSR_IA32_XFD_ERR) {
         InjectGuestException(Ctx, 13, true, 0);
@@ -1835,8 +2178,8 @@ bool HandleMsrRead(GuestContext* Ctx) {
     }
 
     if (msrIndex == MSR_IA32_XSS || IsCetStateMsr(msrIndex)) {
-        RequestSafeExit(Ctx);
-        return true;
+        RequestFatalStop(Ctx);
+        return false;
     }
 
     InjectGuestException(Ctx, 13, true, 0);
@@ -1983,7 +2326,8 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     if (msrIndex == MSR_IA32_XSS) {
         if (!g_XsavesEnabled) {
             if (value.QuadPart != 0) {
-                RequestSafeExit(Ctx);
+                RequestFatalStop(Ctx);
+                return false;
             }
             return true;
         }
@@ -1991,16 +2335,23 @@ bool HandleMsrWrite(GuestContext* Ctx) {
         // Windows natively without advancing the intercepted instruction
         if ((value.QuadPart & ~g_XsavesMask) != 0 ||
             value.QuadPart != Ctx->GuestXss) {
-            RequestSafeExit(Ctx);
-            return true;
+            RequestFatalStop(Ctx);
+            return false;
         }
         return true;
+    }
+    if (msrIndex == MSR_IA32_U_CET || msrIndex == MSR_IA32_PL3_SSP) {
+        // This branch is reachable only when CET_U is enumerated but is not
+        // owned by the fixed XSAVES frame. Match the hidden guest contract
+        // with an architectural fault rather than changing root-mode state.
+        InjectGuestException(Ctx, 13, true, 0);
+        return false;
     }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_S_CET) {
         // a non-zero supervisor CET request needs native shadow-stack handling
         if (value.QuadPart != 0) {
-            RequestSafeExit(Ctx);
-            return true;
+            RequestFatalStop(Ctx);
+            return false;
         }
         if (!VmWriteChecked(GUEST_S_CET, value.QuadPart)) {
             Ctx->HaltVm = 1;
@@ -2011,8 +2362,8 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_INTERRUPT_SSP_TABLE) {
         if (value.QuadPart != 0) {
-            RequestSafeExit(Ctx);
-            return true;
+            RequestFatalStop(Ctx);
+            return false;
         }
         if (!VmWriteChecked(GUEST_INTR_SSP_TABLE, value.QuadPart)) {
             Ctx->HaltVm = 1;
@@ -2023,8 +2374,8 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     }
     if (g_CetVmcsEnabled && msrIndex == MSR_IA32_PL0_SSP) {
         if (value.QuadPart != 0) {
-            RequestSafeExit(Ctx);
-            return true;
+            RequestFatalStop(Ctx);
+            return false;
         }
         if (!VmWriteChecked(GUEST_SSP, value.QuadPart)) {
             Ctx->HaltVm = 1;
@@ -2037,15 +2388,15 @@ bool HandleMsrWrite(GuestContext* Ctx) {
         (msrIndex == MSR_IA32_PL1_SSP || msrIndex == MSR_IA32_PL2_SSP)) {
         // PL1 and PL2 have no VMCS fields in this fixed contract
         if (value.QuadPart != 0) {
-            RequestSafeExit(Ctx);
-            return true;
+            RequestFatalStop(Ctx);
+            return false;
         }
         return true;
     }
 
     if (IsIntelPtMsr(msrIndex) || IsCetStateMsr(msrIndex)) {
-        RequestSafeExit(Ctx);
-        return true;
+        RequestFatalStop(Ctx);
+        return false;
     }
     if (msrIndex == MSR_IA32_XFD || msrIndex == MSR_IA32_XFD_ERR) {
         InjectGuestException(Ctx, 13, true, 0);
@@ -2053,8 +2404,8 @@ bool HandleMsrWrite(GuestContext* Ctx) {
     }
 
     if (msrIndex == MSR_IA32_XSS || IsCetStateMsr(msrIndex)) {
-        RequestSafeExit(Ctx);
-        return true;
+        RequestFatalStop(Ctx);
+        return false;
     }
 
     InjectGuestException(Ctx, 13, true, 0);
@@ -2112,10 +2463,10 @@ static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
     if (!setBit(MSR_IA32_XSS, false) || !setBit(MSR_IA32_XSS, true)) {
         return false;
     }
-    const bool cetUserStateSupported =
-        kGuestCetStateVirtualized && g_XsavesEnabled &&
-        (g_SupportedXssMask & IA32_XSS_CET_U) != 0;
-    if (!cetUserStateSupported) {
+    const bool cetUserStateEnumerated =
+        (g_EnumeratedXssMask & IA32_XSS_CET_U) != 0;
+    const bool cetUserStatePreserved = IsCetUserStatePreserved();
+    if (cetUserStateEnumerated && !cetUserStatePreserved) {
         constexpr u32 cetUserMsrs[] = {
             MSR_IA32_U_CET, MSR_IA32_PL3_SSP,
         };
@@ -2245,24 +2596,14 @@ static bool HandleCrAccess(GuestContext* c) {
             constexpr u64 kRequiredCr4Bits = 1ULL << 5;
             const bool requiredOsxsave = g_XstateMode != XstateSaveFxsave;
             if (((value & CR4_OSXSAVE) != 0) != requiredOsxsave) {
-                HV_VERBOSE_PRINT("[HV] CPU %u rejected guest CR4.OSXSAVE "
-                                 "transition: value=0x%llX required=%u\n",
-                                 CurrentProcessorIndex(), value,
-                                 requiredOsxsave ? 1U : 0U);
                 InjectGuestException(c, 13, true, 0);
                 return 0;
             }
             if ((value & CR4_FRED) != 0) {
-                HV_VERBOSE_PRINT("[HV] CPU %u rejected guest CR4.FRED without "
-                                 "a FRED transition contract: value=0x%llX\n",
-                                 CurrentProcessorIndex(), value);
                 InjectGuestException(c, 13, true, 0);
                 return 0;
             }
             if ((value & CR4_CET) != 0 && !g_CetVmcsEnabled) {
-                HV_VERBOSE_PRINT("[HV] CPU %u rejected guest CR4.CET without VMCS "
-                                 "CET contract: value=0x%llX\n",
-                                 CurrentProcessorIndex(), value);
                 InjectGuestException(c, 13, true, 0);
                 return 0;
             }
@@ -2273,9 +2614,6 @@ static bool HandleCrAccess(GuestContext* c) {
                     : nullptr;
             if ((value & CR4_PKE) != 0 &&
                 (!currentVcpu || (currentVcpu->HostXcr0 & XCR0_PKRU) == 0)) {
-                HV_VERBOSE_PRINT("[HV] CPU %u rejected guest CR4.PKE without "
-                                 "saved PKRU state: value=0x%llX\n",
-                                 cpuId, value);
                 InjectGuestException(c, 13, true, 0);
                 return 0;
             }
@@ -2293,9 +2631,6 @@ static bool HandleCrAccess(GuestContext* c) {
                 return false;
             }
             if (!IsValidArchitecturalCr3(currentCr3, requestedCr4)) {
-                HV_VERBOSE_PRINT("[HV] CPU %u rejected guest CR4 transition: "
-                                 "cr4=0x%llX cr3=0x%llX\n",
-                                 CurrentProcessorIndex(), requestedCr4, currentCr3);
                 InjectGuestException(c, 13, true, 0);
                 return false;
             }
@@ -2390,8 +2725,6 @@ static bool HandleXsetbv(GuestContext* c, const VcpuContext* vcpu) {
         return false;
     }
     if (liveXcr0 != vcpu->HostXcr0) {
-        HV_VERBOSE_PRINT("[HV] XCR0 diverged on processor %u (live 0x%llX host 0x%llX)\n",
-                         CurrentProcessorIndex(), liveXcr0, vcpu->HostXcr0);
         c->HaltVm = 1;
         return false;
     }
@@ -2466,10 +2799,18 @@ static bool HandleXsetbv(GuestContext* c, const VcpuContext* vcpu) {
 extern "C" void VmExitHandler(GuestContext* Ctx) {
     if (!Ctx) return;
     const u32 cpuId = CurrentProcessorIndex();
+    if (g_VcpuData && cpuId < g_ProcessorCount &&
+        AcquireFatalSnapshotCommitState(&g_VcpuData[cpuId]) !=
+            HvFatalSnapshotEmpty) {
+        Ctx->AbortVm = 0;
+        Ctx->HaltVm = 1;
+        return;
+    }
     u64 rawReasonValue = 0;
     u64 exitLen = 0;
     if (!VmReadChecked(VM_EXIT_REASON, &rawReasonValue) ||
         !VmReadChecked(VM_EXIT_INSTRUCTION_LEN, &exitLen)) {
+        Ctx->AbortVm = 0;
         Ctx->HaltVm = 1;
         return;
     }
@@ -2479,8 +2820,6 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     const u64 ExitReason = basicExitReason;
     const u64 ExitLen = exitLen;
     if (!g_VcpuData || cpuId >= g_ProcessorCount) {
-        HV_VERBOSE_PRINT("[HV] VM-exit without a valid VCPU: cpu=%u reason=%llu\n",
-                         cpuId, ExitReason);
         Ctx->HaltVm = 1;
         return;
     }
@@ -2503,35 +2842,27 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                            &vcpu->LastVmInstructionError) ||
             !VmReadChecked(EXIT_QUALIFICATION,
                            &vcpu->LastExitQualification)) {
+            Ctx->AbortVm = 0;
             Ctx->HaltVm = 1;
             vcpu->LastExitAction = kExitActionHalt;
             return;
         }
         vcpu->LastExitAction = kExitActionHalt;
+        Ctx->AbortVm = 0;
         Ctx->HaltVm = 1;
-        HV_VERBOSE_PRINT("[HV] VM-entry failure cpu=%u raw=0x%08X basic=%u "
-                         "instruction_error=0x%llX qualification=0x%llX\n",
-                         cpuId, rawExitReason, basicExitReason,
-                         vcpu->LastVmInstructionError,
-                         vcpu->LastExitQualification);
         return;
     }
     const long exitCount = InterlockedIncrement(&vcpu->VmExitCount);
-    // Keep the first exits verbose and retain power-of-two checkpoints so a
-    // long-running guest still leaves a bounded, useful trace in KD.
-    const bool logExit = g_HvVerboseLogging != 0 &&
-                         (exitCount <= 16 ||
-                          (exitCount > 16 &&
-                           (exitCount & (exitCount - 1)) == 0));
-
+    if (exitCount == 1) {
+        InterlockedIncrement(&g_HvLaunchFirstVmExitEntered);
+    }
     // A VM-entry interruption field is consumed only once by hardware. Clear
     // it at the start of every exit so a previous injected #GP/#UD cannot be
     // accidentally delivered again after the guest resumes.
     if (!VmWriteChecked(CONTROL_VM_ENTRY_INTR_INFO_FIELD, 0) ||
         !VmWriteChecked(CONTROL_VM_ENTRY_EXCEPTION_ERROR_CODE, 0) ||
         !VmWriteChecked(CONTROL_VM_ENTRY_INSTRUCTION_LENGTH, 0)) {
-        HV_VERBOSE_PRINT("[HV] VM-entry injection state clear failed: cpu=%u "
-                         "reason=%llu\n", cpuId, ExitReason);
+        Ctx->AbortVm = 0;
         Ctx->HaltVm = 1;
         return;
     }
@@ -2628,13 +2959,6 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     // identical to the launch snapshot before any exit handler can request
     // VMXOFF/IRET.
     UpdateNativeTeardownContract(vcpu);
-    if (logExit) {
-        HV_VERBOSE_PRINT("[HV] VM-exit cpu=%u count=%ld reason=%llu len=%llu "
-                         "rip=0x%llX rsp=0x%llX rflags=0x%llX qual=0x%llX\n",
-                         cpuId, exitCount, ExitReason, ExitLen, Ctx->GuestRip,
-                         Ctx->GuestRsp, Ctx->Rflags,
-                         vcpu->LastExitQualification);
-    }
     // IA32_KERNEL_GS_BASE is not represented in the VMCS.  The VM-exit
     // assembly stub snapshots the guest value before restoring the host
     // per-CPU value; copy that snapshot into the teardown context so the
@@ -2645,9 +2969,13 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     // from VMCS on VM-entry/exit. The assembly snapshot is authoritative for
     // the guest KGS value; do not infer SWAPGS parity from an old GS/KGS pair.
     if (g_XsavesEnabled) {
-        if ((Ctx->GuestXss & ~g_GuestXssWriteMask) != 0) {
-            HV_VERBOSE_PRINT("[HV] Guest IA32_XSS contains unsupported bits: 0x%llX\n",
-                             Ctx->GuestXss);
+        // live state is validated against the immutable save frame. Guest MSR
+        // write policy is enforced separately by the WRMSR exit handler
+        if ((Ctx->GuestXss & ~g_XsavesMask) != 0) {
+            WriteHvTrace(vcpu, cpuId, HvTraceEventXssPreservationFail,
+                         Ctx->GuestXss, g_XsavesMask,
+                         g_GuestXssWriteMask, g_HostXssMask);
+            vcpu->LastExitAction = kExitActionHalt;
             Ctx->HaltVm = 1;
             return;
         }
@@ -2660,9 +2988,9 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         ShouldInjectFault(cpuId, HvFaultFirstVmexit)) {
         WriteHvTrace(vcpu, cpuId, HvTraceEventVmEntryFailure,
                      static_cast<u64>(HvFaultLateVmEntry));
-        Ctx->AbortVm = 1;
-        Ctx->HaltVm = 0;
-        vcpu->LastExitAction = kExitActionAbort;
+        Ctx->AbortVm = 0;
+        Ctx->HaltVm = 1;
+        vcpu->LastExitAction = kExitActionHalt;
         return;
     }
 
@@ -2672,8 +3000,6 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         case VM_EXIT_REASON_CPUID: // CPUID
         {
             if (Ctx->Rax == 0x13371337) {
-                HV_VERBOSE_PRINT("[HV] Magic CPUID Intercepted on Core %d!\n",
-                                 KeGetCurrentProcessorNumber());
                 Ctx->Rax = 0x13371337;
                 Ctx->Rbx = 0xDEADC0DE; // dead code
                 Ctx->Rcx = 0xC0FFEE;   // coffee
@@ -2929,12 +3255,6 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
             break;
 
         case VM_EXIT_REASON_CR_ACCESS: // control-register access
-            if (logExit) {
-            HV_VERBOSE_PRINT("[HV] CR access cpu=%u count=%ld qual=0x%llX "
-                             "cr3=0x%llX cr4=0x%llX\n", cpuId, exitCount,
-                             vcpu->LastExitQualification, Ctx->GuestCr3,
-                             Ctx->GuestCr4);
-            }
             AdvanceRip = HandleCrAccess(Ctx);
             break;
 
@@ -2961,12 +3281,11 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
 
         case VM_EXIT_REASON_XSAVES:
         case VM_EXIT_REASON_XRSTORS:
-            // The fixed XSAVE mask makes the guest state recoverable even if a
-            // future CPU reports this instruction unexpectedly. Leave VMX and
-            // execute the instruction natively rather than parking a CPU.
-            HV_VERBOSE_PRINT("[HV] Unexpected XSAVES/XRSTORS VM-exit cpu=%u reason=%llu\n",
-                             cpuId, ExitReason);
-            RequestSafeExit(Ctx);
+            // This exit is outside the published instruction contract. Keep
+            // the VMCS available to the fatal path instead of guessing that
+            // the interrupted instruction is safe to execute natively.
+            Ctx->AbortVm = 0;
+            Ctx->HaltVm = 1;
             AdvanceRip = false;
             break;
 
@@ -2975,21 +3294,21 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
             // this reason is nevertheless observed (for example after a
             // firmware/VMX capability mismatch), leave VMX and let the host
             // execute the interrupted context natively.
-            RequestSafeExit(Ctx);
+            Ctx->AbortVm = 0;
+            Ctx->HaltVm = 1;
             AdvanceRip = false;
             break;
 
         case VM_EXIT_REASON_TRIPLE_FAULT: // triple fault
         case VM_EXIT_REASON_INVALID_GUEST_STATE: // invalid guest state
-            // There is no architectural continuation for these exits.  Park
-            // the processor only when the saved state is not safe for native
-            // teardown. A valid late-launch frame can leave VMX and resume the
-            // interrupted Windows context without creating a watchdog park.
-            HV_VERBOSE_PRINT("[HV] FATAL VM-exit cpu=%u count=%ld reason=%llu "
-                             "rip=0x%llX rsp=0x%llX cr3=0x%llX cr4=0x%llX\n",
-                             cpuId, exitCount, ExitReason, Ctx->GuestRip,
-                             Ctx->GuestRsp, Ctx->GuestCr3, Ctx->GuestCr4);
-            RequestSafeExit(Ctx);
+            // Neither exit has an architectural continuation. Returning the
+            // saved frame natively can replay the same exception cascade in
+            // VMX root and turn a diagnosable exit into processor shutdown.
+            WriteHvTrace(vcpu, cpuId, HvTraceEventFatalVmexit,
+                         rawExitReason, static_cast<u64>(exitCount),
+                         Ctx->GuestRip, Ctx->GuestRsp);
+            Ctx->AbortVm = 0;
+            Ctx->HaltVm = 1;
             AdvanceRip = false;
             break;
 
@@ -2998,11 +3317,8 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
             // These exits are not requested by our control bitmap.  There is
             // no generic emulation is available, so leave VMX and execute the
             // interrupted kernel context natively instead of looping in VMX.
-            HV_VERBOSE_PRINT("[HV] UNSUPPORTED VM-exit cpu=%u count=%ld reason=%llu "
-                             "rip=0x%llX rsp=0x%llX qual=0x%llX\n",
-                             cpuId, exitCount, ExitReason, Ctx->GuestRip,
-                             Ctx->GuestRsp, vcpu->LastExitQualification);
-            RequestSafeExit(Ctx);
+            Ctx->AbortVm = 0;
+            Ctx->HaltVm = 1;
             AdvanceRip = false;
             break;
     }
@@ -3026,6 +3342,7 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     if (AdvanceRip && ExitLen != 0 && IsCanonical(Ctx->GuestRip)) {
         const u64 nextRip = Ctx->GuestRip + ExitLen;
         if (!IsCanonical(nextRip) || nextRip < Ctx->GuestRip) {
+            Ctx->AbortVm = 0;
             Ctx->HaltVm = 1;
             vcpu->LastExitAction = kExitActionHalt;
             return;
@@ -3035,6 +3352,7 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
             // A failed VMWRITE leaves the VMCS/software RIP pair
             // inconsistent.  Do not attempt VMRESUME with partially updated
             // guest state; the assembly epilogue will take the park path.
+            Ctx->AbortVm = 0;
             Ctx->HaltVm = 1;
             vcpu->LastExitAction = kExitActionHalt;
             return;
@@ -3047,6 +3365,7 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
          g_VcpuData[id].VmcsReadFailed != 0)) {
         // A failed VMCS access means the software context is not trustworthy.
         // Never attempt VMRESUME with partially updated state.
+        Ctx->AbortVm = 0;
         Ctx->HaltVm = 1;
     }
 
@@ -3063,9 +3382,9 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         ShouldInjectFault(cpuId, HvFaultVmresumeFailure)) {
         WriteHvTrace(vcpu, cpuId, HvTraceEventPreVmresume,
                      static_cast<u64>(HvFaultBeforeVmresume));
-        Ctx->AbortVm = 1;
-        Ctx->HaltVm = 0;
-        vcpu->LastExitAction = kExitActionAbort;
+        Ctx->AbortVm = 0;
+        Ctx->HaltVm = 1;
+        vcpu->LastExitAction = kExitActionHalt;
     }
     if (!Ctx->HaltVm && !Ctx->AbortVm) {
         InterlockedIncrement(&vcpu->VmResumeAttempts);
@@ -3110,6 +3429,10 @@ u64 GetTssBase(const u64 GdtBase, const u16 GdtLimit, const u16 Selector) {
 bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if (!Vcpu) return false;
     VcpuContext* mutableVcpu = const_cast<VcpuContext*>(Vcpu);
+    InterlockedExchange(&mutableVcpu->FatalSnapshotCommitState,
+                        HvFatalSnapshotEmpty);
+    InterlockedExchange(&mutableVcpu->NativeTeardownRejectMask,
+                        static_cast<LONG>(HvNativeTeardownRejectNone));
     InterlockedExchange(&mutableVcpu->VmcsWriteFailed, 0);
     InterlockedExchange(&mutableVcpu->VmcsReadFailed, 0);
     mutableVcpu->FirstVmcsWriteField = 0;
@@ -3350,10 +3673,9 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         !IsCanonical(reinterpret_cast<u64>(GuestSp))) return false;
     VmWriteChecked(GUEST_RIP, reinterpret_cast<u64>(GuestIp));
     VmWriteChecked(GUEST_RSP, reinterpret_cast<u64>(GuestSp));
-    // Preserve the callback's interrupt flag. KeIpiGenericCall invokes the
-    // callback at IPI_LEVEL, and the VMX guest must retain the interrupted
-    // Windows context until the wrapper returns to the dispatcher. Intel only
-    // requires RFLAGS.IF=1 when an external interrupt is being injected; this
+    // Preserve the targeted worker's interrupt flag so the late-launch guest
+    // resumes the Windows execution state observed on this processor. Intel
+    // requires RFLAGS.IF=1 only when an external interrupt is injected; this
     // monitor injects none during the launch handoff.
     u64 guestRflags = GetRflags();
     const u64 callbackRflags = guestRflags;
@@ -3691,10 +4013,66 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
 // ==============================================================================
 
 
+// these symbols form a debugger-readable recorder for the launch rendezvous
+// producers only use atomic memory operations because they run at IPI_LEVEL
+extern "C" {
+__declspec(align(64)) volatile LONG g_HvLaunchTelemetrySignature = 0;
+volatile LONG g_HvLaunchExpectedProcessors = 0;
+volatile LONG g_HvLaunchProbeEntered = 0;
+volatile LONG g_HvLaunchProbeCompleted = 0;
+volatile LONG g_HvLaunchDispatchEntered = 0;
+volatile LONG g_HvLaunchAssemblyEntered = 0;
+volatile LONG g_HvLaunchPrepareEntered = 0;
+volatile LONG g_HvLaunchPrepareSucceeded = 0;
+volatile LONG g_HvLaunchGuestEntered = 0;
+volatile LONG g_HvLaunchVmlaunchIssued = 0;
+volatile LONG g_HvLaunchVmlaunchReturned = 0;
+volatile LONG g_HvLaunchGuestStarted = 0;
+volatile LONG g_HvLaunchMarkedLaunched = 0;
+volatile LONG g_HvLaunchVmExitAsmReached = 0;
+volatile LONG g_HvLaunchFirstVmExitEntered = 0;
+volatile LONG g_HvLaunchDispatchReturned = 0;
+volatile LONG g_HvLaunchLastProbeProcessor = -1;
+volatile LONG g_HvLaunchLastDispatchProcessor = -1;
+volatile LONG g_HvLaunchLastPrepareProcessor = -1;
+volatile LONG g_HvLaunchLastReturnProcessor = -1;
+}
+
+static LONG CurrentProcessorTag() {
+    PROCESSOR_NUMBER number = {};
+    KeGetCurrentProcessorNumberEx(&number);
+    return static_cast<LONG>((static_cast<ULONG>(number.Group) << 16) |
+                             static_cast<ULONG>(number.Number));
+}
+
+static void RecordLaunchBoundary(volatile LONG* counter,
+                                 volatile LONG* lastProcessor) {
+    InterlockedExchange(lastProcessor, CurrentProcessorTag());
+    InterlockedIncrement(counter);
+}
+
+extern "C" ULONG_PTR ProbeIpiRendezvousCallback(ULONG_PTR Context) {
+    UNREFERENCED_PARAMETER(Context);
+    RecordLaunchBoundary(&g_HvLaunchProbeEntered,
+                         &g_HvLaunchLastProbeProcessor);
+    return 0;
+}
+
+extern "C" ULONG_PTR LaunchIpiDispatchCallback(ULONG_PTR Context) {
+    RecordLaunchBoundary(&g_HvLaunchDispatchEntered,
+                         &g_HvLaunchLastDispatchProcessor);
+    const ULONG_PTR result = EnableHvCallback(Context);
+    RecordLaunchBoundary(&g_HvLaunchDispatchReturned,
+                         &g_HvLaunchLastReturnProcessor);
+    return result;
+}
+
 // Called by the fixed-frame assembly IPI wrapper.  It performs every action
 // that may need a compiler-generated stack frame, then returns before
 // VMLAUNCH so the wrapper can own the successful guest continuation.
 extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* GuestIp) {
+    RecordLaunchBoundary(&g_HvLaunchPrepareEntered,
+                         &g_HvLaunchLastPrepareProcessor);
     UNREFERENCED_PARAMETER(Context);
     if (!g_VcpuData) return 0;
     if (!GuestSp || !GuestIp) return 0;
@@ -4248,6 +4626,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         // from a successful VMLAUNCH. Until then this CPU is merely VMXON.
         InterlockedExchange(&vcpu->LaunchStage, 4);
         WriteHvTrace(vcpu, id, HvTraceEventContractOk);
+        InterlockedIncrement(&g_HvLaunchPrepareSucceeded);
         HV_VERBOSE_PRINT("[HV] CPU %u VMCS ready; entering VMLAUNCH: revision=0x%X "
                          "vmcs_pa=0x%llX host_rsp=0x%llX\n", id, vcpu->RevisionId,
                          vcpu->VmcsPhys, vcpu->HostStackTop);
@@ -4312,7 +4691,7 @@ extern "C" void AbortHvLaunch(u64 Rflags) {
 // Stop Logic
 // ==============================================================================
 
-// this ipi callback must return ULONG_PTR
+// this targeted callback must return ULONG_PTR
 ULONG_PTR StopHvCallback(ULONG_PTR Context) {
     UNREFERENCED_PARAMETER(Context);
 
@@ -4378,18 +4757,252 @@ ULONG_PTR StopHvCallback(ULONG_PTR Context) {
 // ===============================================================================
 
 static void StopHypervisorInternal(bool startRollback);
+static void PinImageForParkedCpu();
 
-// KeIpiGenericCall already sends one synchronized IPI to every active
-// processor, including processors in all processor groups. Calling it once is
-// important: repeating the broadcast per group would invoke VMXON/VMLAUNCH a
-// second time on processors that already own a live VMCS.
-static ULONG_PTR BroadcastToAllProcessorGroups(
-    PKIPI_BROADCAST_WORKER callback) {
-    return callback ? KeIpiGenericCall(callback, 0) : 0;
+static bool IsTargetWorkTerminal(LONG state) {
+    return state == TargetWorkSucceeded || state == TargetWorkFailed ||
+           state == TargetWorkCancelled;
+}
+
+static bool IsVcpuStopTerminal(long state) {
+    return state == VcpuStopped || state == VcpuFailed ||
+           state == VcpuUninitialized;
+}
+
+static VOID TargetCpuWorker(PVOID Context) {
+    auto* work = static_cast<TargetCpuWork*>(Context);
+    if (!work) {
+        return;
+    }
+
+    if (!g_VcpuData || work->ProcessorIndex >= g_ProcessorCount) {
+        work->Result = STATUS_INVALID_DEVICE_STATE;
+        work->ReturnTime = KeQueryInterruptTime();
+        MemoryBarrier();
+        InterlockedExchange(&work->State, TargetWorkFailed);
+        return;
+    }
+
+    if (InterlockedCompareExchange(&work->State,
+                                   TargetWorkEntered,
+                                   TargetWorkQueued) != TargetWorkQueued) {
+        const LONG state = InterlockedCompareExchange(&work->State, 0, 0);
+        if (state != TargetWorkCancelled && !IsTargetWorkTerminal(state)) {
+            work->Result = STATUS_CANCELLED;
+            work->ReturnTime = KeQueryInterruptTime();
+            MemoryBarrier();
+            InterlockedExchange(&work->State, TargetWorkFailed);
+        }
+        return;
+    }
+
+    work->EnterTime = KeQueryInterruptTime();
+    GROUP_AFFINITY affinity{};
+    GROUP_AFFINITY previousAffinity{};
+    affinity.Group = work->Target.Group;
+    affinity.Mask = static_cast<KAFFINITY>(1) << work->Target.Number;
+    KeSetSystemGroupAffinityThread(&affinity, &previousAffinity);
+
+    PROCESSOR_NUMBER current{};
+    KeGetCurrentProcessorNumberEx(&current);
+    work->ObservedProcessorTag =
+        static_cast<LONG>((static_cast<ULONG>(current.Group) << 16) |
+                          static_cast<ULONG>(current.Number));
+
+    NTSTATUS result = STATUS_INVALID_DEVICE_STATE;
+    if (current.Group == work->Target.Group &&
+        current.Number == work->Target.Number &&
+        InterlockedCompareExchange(&work->State,
+                                   TargetWorkExecuting,
+                                   TargetWorkEntered) == TargetWorkEntered) {
+        InterlockedExchange(&g_HvTargetActiveProcessor,
+                            static_cast<LONG>(work->ProcessorIndex));
+        const LONG operation = work->Operation;
+        if (operation == TargetOperationProbe) {
+            ProbeIpiRendezvousCallback(0);
+            result = STATUS_SUCCESS;
+        } else if (operation == TargetOperationLaunch) {
+            LaunchIpiDispatchCallback(
+                static_cast<ULONG_PTR>(work->Generation));
+            result = g_VcpuData[work->ProcessorIndex].State == VcpuLaunched
+                         ? STATUS_SUCCESS
+                         : STATUS_UNSUCCESSFUL;
+        } else if (operation == TargetOperationStop) {
+            StopHvCallback(static_cast<ULONG_PTR>(work->Generation));
+            result = IsVcpuStopTerminal(
+                         g_VcpuData[work->ProcessorIndex].State)
+                         ? STATUS_SUCCESS
+                         : STATUS_UNSUCCESSFUL;
+        }
+        InterlockedExchange(&g_HvTargetActiveProcessor, -1);
+    } else if (work->State == TargetWorkCancelled) {
+        result = STATUS_CANCELLED;
+    }
+
+    KeRevertToUserGroupAffinityThread(&previousAffinity);
+    work->Result = result;
+    work->ReturnTime = KeQueryInterruptTime();
+    MemoryBarrier();
+    if (work->State != TargetWorkCancelled) {
+        InterlockedExchange(&work->State,
+                            NT_SUCCESS(result) ? TargetWorkSucceeded
+                                               : TargetWorkFailed);
+    }
+}
+
+static NTSTATUS QueueTargetOperation(u32 processorIndex,
+                                     TargetOperation operation) {
+    if (!g_HvTargetCpuWork || !g_HvDriverObject ||
+        processorIndex >= g_ProcessorCount) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    TargetCpuWork* work = &g_HvTargetCpuWork[processorIndex];
+    if (work->ThreadHandle != nullptr) return STATUS_DEVICE_BUSY;
+
+    RtlZeroMemory(work, sizeof(*work));
+    NTSTATUS status = KeGetProcessorNumberFromIndex(processorIndex,
+                                                     &work->Target);
+    if (!NT_SUCCESS(status)) return status;
+
+    work->ProcessorIndex = processorIndex;
+    work->Generation = InterlockedIncrement(&g_HvTargetWorkGeneration);
+    work->Operation = operation;
+    work->Result = STATUS_PENDING;
+    work->QueueTime = KeQueryInterruptTime();
+    InterlockedExchange(&work->State, TargetWorkQueued);
+
+    OBJECT_ATTRIBUTES attributes{};
+    InitializeObjectAttributes(&attributes, nullptr, OBJ_KERNEL_HANDLE,
+                               nullptr, nullptr);
+    HANDLE threadHandle = nullptr;
+    status = IoCreateSystemThread(g_HvDriverObject,
+                                  &threadHandle,
+                                  SYNCHRONIZE,
+                                  &attributes,
+                                  nullptr,
+                                  nullptr,
+                                  TargetCpuWorker,
+                                  work);
+    if (!NT_SUCCESS(status)) {
+        work->Result = status;
+        InterlockedExchange(&work->State, TargetWorkFailed);
+        return status;
+    }
+
+    work->ThreadHandle = threadHandle;
+    MemoryBarrier();
+    return STATUS_SUCCESS;
+}
+
+static LARGE_INTEGER RemainingTargetTimeout(u64 deadline) {
+    LARGE_INTEGER timeout{};
+    const u64 now = KeQueryInterruptTime();
+    if (now < deadline) {
+        timeout.QuadPart = -static_cast<LONGLONG>(deadline - now);
+    }
+    return timeout;
+}
+
+static NTSTATUS CloseCompletedTargetWork(TargetCpuWork* work) {
+    const NTSTATUS result = work->Result;
+    HANDLE threadHandle = work->ThreadHandle;
+    work->ThreadHandle = nullptr;
+    if (threadHandle) ZwClose(threadHandle);
+    return result;
+}
+
+static NTSTATUS WaitTargetOperation(u32 processorIndex,
+                                    u64 deadline,
+                                    bool* unresolved) {
+    if (!g_HvTargetCpuWork || processorIndex >= g_ProcessorCount ||
+        !unresolved) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    TargetCpuWork* work = &g_HvTargetCpuWork[processorIndex];
+    HANDLE threadHandle = work->ThreadHandle;
+    if (!threadHandle) return work->Result;
+
+    LARGE_INTEGER timeout = RemainingTargetTimeout(deadline);
+    NTSTATUS waitStatus = ZwWaitForSingleObject(threadHandle, FALSE, &timeout);
+    if (waitStatus == STATUS_SUCCESS) {
+        return CloseCompletedTargetWork(work);
+    }
+
+    if (waitStatus == STATUS_TIMEOUT) {
+        bool cancelled =
+            InterlockedCompareExchange(&work->State,
+                                       TargetWorkCancelled,
+                                       TargetWorkQueued) == TargetWorkQueued;
+        if (!cancelled) {
+            cancelled =
+                InterlockedCompareExchange(&work->State,
+                                           TargetWorkCancelled,
+                                           TargetWorkEntered) == TargetWorkEntered;
+        }
+
+        const LONG state = InterlockedCompareExchange(&work->State, 0, 0);
+        if (cancelled || IsTargetWorkTerminal(state)) {
+            LARGE_INTEGER grace{};
+            grace.QuadPart = -kTargetCancelGrace100ns;
+            if (ZwWaitForSingleObject(threadHandle, FALSE, &grace) ==
+                STATUS_SUCCESS) {
+                (void)CloseCompletedTargetWork(work);
+                return STATUS_IO_TIMEOUT;
+            }
+        }
+    }
+
+    InterlockedExchange(&work->TimedOut, 1);
+    *unresolved = true;
+    return waitStatus == STATUS_TIMEOUT ? STATUS_IO_TIMEOUT : waitStatus;
+}
+
+static bool BindCoordinatorToProcessor(u32 processorIndex,
+                                       GROUP_AFFINITY* previousAffinity) {
+    if (!previousAffinity || processorIndex >= g_ProcessorCount) return false;
+    PROCESSOR_NUMBER target{};
+    if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(processorIndex, &target))) {
+        return false;
+    }
+
+    GROUP_AFFINITY affinity{};
+    affinity.Group = target.Group;
+    affinity.Mask = static_cast<KAFFINITY>(1) << target.Number;
+    KeSetSystemGroupAffinityThread(&affinity, previousAffinity);
+
+    PROCESSOR_NUMBER current{};
+    KeGetCurrentProcessorNumberEx(&current);
+    if (current.Group == target.Group && current.Number == target.Number) {
+        return true;
+    }
+
+    KeRevertToUserGroupAffinityThread(previousAffinity);
+    return false;
+}
+
+static bool HasUnresolvedTargetWork() {
+    if (!g_HvTargetCpuWork) return false;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        // A timeout is unresolved only while its worker handle remains open.
+        // The grace path closes the handle after publishing a terminal result.
+        if (g_HvTargetCpuWork[i].ThreadHandle != nullptr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static NTSTATUS QuarantineUnresolvedTargetWork() {
+    PinImageForParkedCpu();
+    InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
+    return STATUS_SUCCESS;
 }
 
 extern "C" NTSTATUS StartHypervisor() {
-    if (g_HvImagePinned != 0 || g_VcpuData != nullptr) {
+    if (g_HvImagePinned != 0 || g_VcpuData != nullptr ||
+        g_HvTargetCpuWork != nullptr) {
         return STATUS_DEVICE_BUSY;
     }
     if (InterlockedCompareExchange(&g_HvLifecycle,
@@ -4408,7 +5021,7 @@ extern "C" NTSTATUS StartHypervisor() {
     // DriverEntry's initial gate.  The helper performs only read-only CPUID,
     // VMX capability, and IA32_FEATURE_CONTROL checks.
     if (!IsVmxSupported()) {
-        DbgPrint("[HV] StartHypervisor rejected by the VMX capability gate\n");
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected by the VMX capability gate\n");
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
     // a late-launch guest begins with interrupted Windows XSTATE, so each live
@@ -4418,13 +5031,13 @@ extern "C" NTSTATUS StartHypervisor() {
          g_XsaveStateSize == 0 ||
          g_XsaveStateSize > VMEXIT_XSAVE_MAX ||
          g_XsaveStateSize > sizeof(GuestContext{}.FxArea))) {
-        DbgPrint("[HV] StartHypervisor rejected: unsupported live XSS "
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: unsupported live XSS "
                  "host=0x%llX preserve=0x%llX frame=%lu\n",
                  g_HostXssMask, g_XsavesMask,
                  static_cast<ULONG>(g_XsaveStateSize));
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
-    DbgPrint("[HV] StartHypervisor: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
+    HV_PASSIVE_PRINT("[HV] StartHypervisor: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
              g_VmxCapabilityProfile, g_CetVmcsEnabled ? 1U : 0U,
              g_XsavesEnabled ? 1U : 0U);
 
@@ -4443,7 +5056,7 @@ extern "C" NTSTATUS StartHypervisor() {
     RtlZeroMemory(regs, sizeof(regs));
     if (g_XstateMode == XstateSaveFxsave) {
         if (g_XsaveStateSize != FXSAVE_AREA_SIZE) {
-            DbgPrint("[HV] FXSAVE contract has an invalid frame size: %lu\n",
+            HV_PASSIVE_PRINT("[HV] FXSAVE contract has an invalid frame size: %lu\n",
                      static_cast<ULONG>(g_XsaveStateSize));
             return rejectStart(STATUS_NOT_SUPPORTED);
         }
@@ -4454,7 +5067,7 @@ extern "C" NTSTATUS StartHypervisor() {
         u32 xsaveSize = g_XsaveStateSize;
         if (xsaveSize > VMEXIT_XSAVE_MAX ||
             xsaveSize > sizeof(GuestContext{}.FxArea)) {
-            DbgPrint("[HV] XSAVES area too large: need %lu bytes, have %lu\n",
+            HV_PASSIVE_PRINT("[HV] XSAVES area too large: need %lu bytes, have %lu\n",
                      static_cast<ULONG>(xsaveSize),
                      static_cast<ULONG>(sizeof(GuestContext{}.FxArea)));
             return rejectStart(STATUS_NOT_SUPPORTED);
@@ -4464,7 +5077,7 @@ extern "C" NTSTATUS StartHypervisor() {
         u32 xsaveSize = static_cast<u32>(regs[1]);
         if (xsaveSize > VMEXIT_XSAVE_MAX ||
             xsaveSize > sizeof(GuestContext{}.FxArea)) {
-            DbgPrint("[HV] XSAVE area too large: need %lu bytes, have %lu\n",
+            HV_PASSIVE_PRINT("[HV] XSAVE area too large: need %lu bytes, have %lu\n",
                      static_cast<ULONG>(xsaveSize),
                      static_cast<ULONG>(sizeof(GuestContext{}.FxArea)));
             return rejectStart(STATUS_NOT_SUPPORTED);
@@ -4475,7 +5088,7 @@ extern "C" NTSTATUS StartHypervisor() {
         g_VmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrint("[HV] StartHypervisor rejected: IA32_VMX_BASIC read faulted\n");
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: IA32_VMX_BASIC read faulted\n");
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
     // Honor the boot processor's VMX_BASIC address-width capability for the
@@ -4488,7 +5101,7 @@ extern "C" NTSTATUS StartHypervisor() {
     const u64 vmxRegionSize = (g_VmxBasic >> 32) & 0x1FFFULL;
     if (((g_VmxBasic >> 50) & 0xFULL) != 6 ||
         vmxRegionSize == 0 || vmxRegionSize > PAGE_SIZE) {
-        DbgPrint("[HV] StartHypervisor rejected: VMX_BASIC=0x%llX regionSize=0x%llX\n",
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: VMX_BASIC=0x%llX regionSize=0x%llX\n",
                  g_VmxBasic, vmxRegionSize);
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
@@ -4503,21 +5116,21 @@ extern "C" NTSTATUS StartHypervisor() {
     g_HostCr3 = __readcr3();
     KeUnstackDetachProcess(&apcState);
     if ((g_HostCr3 & ~static_cast<u64>(PAGE_SIZE - 1)) == 0) {
-        DbgPrint("[HV] StartHypervisor rejected: system CR3 is invalid (0x%llX)\n",
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: system CR3 is invalid (0x%llX)\n",
                  g_HostCr3);
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
 
     g_ProcessorCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     if (g_ProcessorCount == 0) {
-        DbgPrint("[HV] StartHypervisor rejected: no active processors\n");
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: no active processors\n");
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
     if (!InitializeHvCrashBlob(g_ProcessorCount)) {
-        DbgPrint("[HV] StartHypervisor rejected: failed to initialize crash blob\n");
+        HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: failed to initialize crash blob\n");
         return rejectStart(STATUS_INSUFFICIENT_RESOURCES);
     }
-    DbgPrint("[HV] StartHypervisor: processors=%u host_cr3=0x%llX "
+    HV_PASSIVE_PRINT("[HV] StartHypervisor: processors=%u host_cr3=0x%llX "
              "vmx_basic=0x%llX xsave_frame=%lu\n", g_ProcessorCount,
              g_HostCr3, g_VmxBasic, static_cast<ULONG>(g_XsaveStateSize));
 
@@ -4527,6 +5140,16 @@ extern "C" NTSTATUS StartHypervisor() {
 
     if (!g_VcpuData) return rejectStart(STATUS_INSUFFICIENT_RESOURCES);
     RtlZeroMemory(g_VcpuData, sizeof(VcpuContext) * g_ProcessorCount);
+    g_HvTargetCpuWork = static_cast<TargetCpuWork*>(
+        ExAllocatePoolWithTag(NonPagedPoolNx,
+                              sizeof(TargetCpuWork) * g_ProcessorCount,
+                              TAG_HV00));
+    if (!g_HvTargetCpuWork) {
+        StopHypervisorInternal(true);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(g_HvTargetCpuWork,
+                  sizeof(TargetCpuWork) * g_ProcessorCount);
 
     for (u32 i = 0; i < g_ProcessorCount; i++) {
         g_VcpuData[i].VmxOnVirt     = AllocContiguous(PAGE_SIZE, &g_VcpuData[i].VmxOnPhys);
@@ -4554,7 +5177,7 @@ extern "C" NTSTATUS StartHypervisor() {
         if (!g_VcpuData[i].VmxOnVirt || !g_VcpuData[i].VmcsVirt ||
             !g_VcpuData[i].MsrBitmapVirt || !g_VcpuData[i].HostStack ||
             !g_VcpuData[i].TraceRing) {
-                DbgPrint("[HV] CPU %u allocation failed: vmxon=%u vmcs=%u "
+                HV_PASSIVE_PRINT("[HV] CPU %u allocation failed: vmxon=%u vmcs=%u "
                           "msr_bitmap=%u host_stack=%u trace_ring=%u\n", i,
                           g_VcpuData[i].VmxOnVirt ? 1U : 0U,
                           g_VcpuData[i].VmcsVirt ? 1U : 0U,
@@ -4565,32 +5188,153 @@ extern "C" NTSTATUS StartHypervisor() {
                 ReleaseHvCrashBlob();
                 return STATUS_INSUFFICIENT_RESOURCES;
         }
-        DbgPrint("[HV] CPU %u allocations: vmxon_pa=0x%llX vmcs_pa=0x%llX "
-                 "msr_bitmap_pa=0x%llX host_stack=0x%llX\n", i,
-                 g_VcpuData[i].VmxOnPhys, g_VcpuData[i].VmcsPhys,
-                 g_VcpuData[i].MsrBitmapPhys,
-                 reinterpret_cast<u64>(g_VcpuData[i].HostStack));
     }
+    HV_PASSIVE_PRINT("[HV] allocations complete: processors=%u\n", g_ProcessorCount);
 
     // VMXON, the live Windows snapshot, guest XSS installation, and VMLAUNCH
-    // must remain in one IPI callback. A second stateful rendezvous would
-    // resume Windows between capture and VM entry, leaving stale VMCS state.
+    // remain in one targeted callback while an independent CPU owns timeout
+    // coordination
     InterlockedExchange(&g_VmxGuestOptionalProfile,
                         0);
     InterlockedExchange(&g_VmxGuestOptionalProfileCandidate,
                         static_cast<LONG>(kGuestOptionalProfileMask));
-    BroadcastToAllProcessorGroups(EnableHvCallback);
+    InterlockedExchange(&g_HvLaunchTelemetrySignature, 0x374C5648L);
+    InterlockedExchange(&g_HvLaunchExpectedProcessors,
+                        static_cast<LONG>(ExpectedLaunchProcessorCount()));
+    InterlockedExchange(&g_HvLaunchProbeEntered, 0);
+    InterlockedExchange(&g_HvLaunchProbeCompleted, 0);
+    InterlockedExchange(&g_HvLaunchDispatchEntered, 0);
+    InterlockedExchange(&g_HvLaunchAssemblyEntered, 0);
+    InterlockedExchange(&g_HvLaunchPrepareEntered, 0);
+    InterlockedExchange(&g_HvLaunchPrepareSucceeded, 0);
+    InterlockedExchange(&g_HvLaunchGuestEntered, 0);
+    InterlockedExchange(&g_HvLaunchVmlaunchIssued, 0);
+    InterlockedExchange(&g_HvLaunchVmlaunchReturned, 0);
+    InterlockedExchange(&g_HvLaunchGuestStarted, 0);
+    InterlockedExchange(&g_HvLaunchMarkedLaunched, 0);
+    InterlockedExchange(&g_HvLaunchVmExitAsmReached, 0);
+    InterlockedExchange(&g_HvLaunchFirstVmExitEntered, 0);
+    InterlockedExchange(&g_HvLaunchDispatchReturned, 0);
+    InterlockedExchange(&g_HvLaunchLastProbeProcessor, -1);
+    InterlockedExchange(&g_HvLaunchLastDispatchProcessor, -1);
+    InterlockedExchange(&g_HvLaunchLastPrepareProcessor, -1);
+    InterlockedExchange(&g_HvLaunchLastReturnProcessor, -1);
+
+    if (g_ProcessorCount < 2 ||
+        ExpectedLaunchProcessorCount() != g_ProcessorCount) {
+        StopHypervisorInternal(true);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    u32 reservedProcessor = CurrentProcessorIndex();
+    if (reservedProcessor >= g_ProcessorCount) reservedProcessor = 0;
+    GROUP_AFFINITY coordinatorAffinity{};
+    if (!BindCoordinatorToProcessor(reservedProcessor,
+                                    &coordinatorAffinity)) {
+        StopHypervisorInternal(true);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    bool unresolved = false;
+    NTSTATUS targetStatus = STATUS_SUCCESS;
+
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        const NTSTATUS queueStatus =
+            QueueTargetOperation(i, TargetOperationProbe);
+        if (!NT_SUCCESS(queueStatus) && NT_SUCCESS(targetStatus)) {
+            targetStatus = queueStatus;
+        }
+    }
+    u64 deadline = KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        if (g_HvTargetCpuWork[i].ThreadHandle == nullptr) continue;
+        const NTSTATUS waitStatus =
+            WaitTargetOperation(i, deadline, &unresolved);
+        if (!NT_SUCCESS(waitStatus) && NT_SUCCESS(targetStatus)) {
+            targetStatus = waitStatus;
+        }
+    }
+    if (unresolved) {
+        KeRevertToUserGroupAffinityThread(&coordinatorAffinity);
+        return QuarantineUnresolvedTargetWork();
+    }
+    if (!NT_SUCCESS(targetStatus)) {
+        KeRevertToUserGroupAffinityThread(&coordinatorAffinity);
+        StopHypervisorInternal(true);
+        return targetStatus;
+    }
+    InterlockedExchange(&g_HvLaunchProbeCompleted, 1);
+
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        if (i == reservedProcessor) continue;
+        const NTSTATUS queueStatus =
+            QueueTargetOperation(i, TargetOperationLaunch);
+        if (!NT_SUCCESS(queueStatus) && NT_SUCCESS(targetStatus)) {
+            targetStatus = queueStatus;
+        }
+    }
+    deadline = KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        if (i == reservedProcessor ||
+            g_HvTargetCpuWork[i].ThreadHandle == nullptr) {
+            continue;
+        }
+        const NTSTATUS waitStatus =
+            WaitTargetOperation(i, deadline, &unresolved);
+        if (!NT_SUCCESS(waitStatus) && NT_SUCCESS(targetStatus)) {
+            targetStatus = waitStatus;
+        }
+    }
+
+    u32 firstLaunchedProcessor = MAXULONG;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        if (i != reservedProcessor && g_VcpuData[i].State == VcpuLaunched) {
+            firstLaunchedProcessor = i;
+            break;
+        }
+    }
+    KeRevertToUserGroupAffinityThread(&coordinatorAffinity);
+
+    if (unresolved) return QuarantineUnresolvedTargetWork();
+    if (!NT_SUCCESS(targetStatus) || firstLaunchedProcessor == MAXULONG) {
+        StopHypervisorInternal(true);
+        return IsHypervisorQuarantined() ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+    }
+
+    GROUP_AFFINITY finalAffinity{};
+    if (!BindCoordinatorToProcessor(firstLaunchedProcessor, &finalAffinity)) {
+        StopHypervisorInternal(true);
+        return IsHypervisorQuarantined() ? STATUS_SUCCESS
+                                         : STATUS_INVALID_DEVICE_STATE;
+    }
+    targetStatus = QueueTargetOperation(reservedProcessor,
+                                        TargetOperationLaunch);
+    if (NT_SUCCESS(targetStatus)) {
+        deadline = KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+        targetStatus = WaitTargetOperation(reservedProcessor,
+                                           deadline,
+                                           &unresolved);
+    }
+    KeRevertToUserGroupAffinityThread(&finalAffinity);
+
+    if (unresolved) return QuarantineUnresolvedTargetWork();
+    if (!NT_SUCCESS(targetStatus) ||
+        g_VcpuData[reservedProcessor].State != VcpuLaunched) {
+        StopHypervisorInternal(true);
+        return IsHypervisorQuarantined() ? STATUS_SUCCESS
+                                         : STATUS_NOT_SUPPORTED;
+    }
+
     const u32 expected = ExpectedLaunchProcessorCount();
     const ULONG candidateOptionalProfile =
         static_cast<ULONG>(InterlockedCompareExchange(
             &g_VmxGuestOptionalProfileCandidate, 0, 0));
-    DbgPrint("[HV] guest optional VMX profile candidate=0x%X\n",
-             candidateOptionalProfile);
+    HV_VERBOSE_PRINT("[HV] guest optional VMX profile candidate=0x%X\n",
+                     candidateOptionalProfile);
 
     u32 ok = 0;
 
     for (u32 i = 0; i < g_ProcessorCount; i++) {
-        DbgPrint("[HV] CPU %u launch result: state=%ld stage=%ld vmexits=%ld "
+        HV_VERBOSE_PRINT("[HV] CPU %u launch result: state=%ld stage=%ld vmexits=%ld "
                  "launch_flags=0x%llX raw_reason=0x%08X basic=%u "
                  "entry_failure=%u action=%ld resumes=%ld rip=0x%llX "
                  "instrerr=0x%llX resume_flags=0x%llX setup_phase=%ld "
@@ -4630,16 +5374,23 @@ extern "C" NTSTATUS StartHypervisor() {
         }
     }
 
-    DbgPrint("[HV] Launched on %u/%u expected processors, active=%u\n",
-            ok, expected, g_ProcessorCount);
+    HV_VERBOSE_PRINT("[HV] Launched on %u/%u expected processors, active=%u\n",
+                     ok, expected, g_ProcessorCount);
 
     if (ok != expected) {
-        DbgPrint("[HV] StartHypervisor rejected: only %u/%u expected processors entered VMX\n",
-                ok, expected);
+        HV_VERBOSE_PRINT("[HV] StartHypervisor rejected: only %u/%u expected processors entered VMX\n",
+                         ok, expected);
 
         StopHypervisorInternal(true);
         ReleaseHvCrashBlob();
         return STATUS_NOT_SUPPORTED;
+    }
+
+    if (KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) !=
+        g_ProcessorCount) {
+        StopHypervisorInternal(true);
+        return IsHypervisorQuarantined() ? STATUS_SUCCESS
+                                         : STATUS_DEVICE_CONFIGURATION_ERROR;
     }
 
     // The synchronized launch completed on every participating processor.
@@ -4647,8 +5398,8 @@ extern "C" NTSTATUS StartHypervisor() {
     // changes while a CPU is still preparing its VMCS.
     InterlockedExchange(&g_VmxGuestOptionalProfile,
                         static_cast<LONG>(candidateOptionalProfile));
-    DbgPrint("[HV] guest optional VMX profile published=0x%X\n",
-             candidateOptionalProfile);
+    HV_VERBOSE_PRINT("[HV] guest optional VMX profile published=0x%X\n",
+                     candidateOptionalProfile);
 
     InterlockedExchange(&g_HvLifecycle, kHvLifecycleRunning);
     return STATUS_SUCCESS;
@@ -4736,11 +5487,83 @@ static void StopHypervisorInternal(bool startRollback) {
         return;
     }
 
-    // Broadcast the unload VMCALL. A fatal path publishes VcpuParked before
-    // its final VMXOFF, so the post-rendezvous scan closes the park race.
-    BroadcastToAllProcessorGroups(StopHvCallback);
+    if (HasUnresolvedTargetWork()) {
+        PinImageForParkedCpu();
+        InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
+        return;
+    }
 
-    if (HasParkedVcpu() || HasLiveVcpu() || HasUnresolvedVcpu()) {
+    u32 reservedProcessor = CurrentProcessorIndex();
+    if (reservedProcessor >= g_ProcessorCount) reservedProcessor = 0;
+    GROUP_AFFINITY coordinatorAffinity{};
+    bool coordinatorBound =
+        BindCoordinatorToProcessor(reservedProcessor, &coordinatorAffinity);
+    bool unresolved = false;
+    bool stopFailed = !coordinatorBound;
+
+    if (coordinatorBound) {
+        for (u32 i = 0; i < g_ProcessorCount; ++i) {
+            if (i == reservedProcessor) continue;
+            const long state = g_VcpuData[i].State;
+            if (state != VcpuLaunched && state != VcpuVmxOn) continue;
+            if (!NT_SUCCESS(QueueTargetOperation(i, TargetOperationStop))) {
+                stopFailed = true;
+            }
+        }
+
+        const u64 deadline =
+            KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+        for (u32 i = 0; i < g_ProcessorCount; ++i) {
+            if (i == reservedProcessor ||
+                g_HvTargetCpuWork[i].ThreadHandle == nullptr) {
+                continue;
+            }
+            if (!NT_SUCCESS(WaitTargetOperation(i, deadline, &unresolved))) {
+                stopFailed = true;
+            }
+        }
+        KeRevertToUserGroupAffinityThread(&coordinatorAffinity);
+        coordinatorBound = false;
+    }
+
+    const long reservedState = g_VcpuData[reservedProcessor].State;
+    if (!unresolved &&
+        (reservedState == VcpuLaunched || reservedState == VcpuVmxOn)) {
+        u32 nativeProcessor = MAXULONG;
+        for (u32 i = 0; i < g_ProcessorCount; ++i) {
+            if (i != reservedProcessor &&
+                IsVcpuStopTerminal(g_VcpuData[i].State)) {
+                nativeProcessor = i;
+                break;
+            }
+        }
+        GROUP_AFFINITY finalAffinity{};
+        if (nativeProcessor == MAXULONG ||
+            !BindCoordinatorToProcessor(nativeProcessor, &finalAffinity)) {
+            stopFailed = true;
+        } else {
+            coordinatorBound = true;
+            NTSTATUS status = QueueTargetOperation(reservedProcessor,
+                                                   TargetOperationStop);
+            if (NT_SUCCESS(status)) {
+                const u64 deadline =
+                    KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+                status = WaitTargetOperation(reservedProcessor,
+                                             deadline,
+                                             &unresolved);
+            }
+            if (!NT_SUCCESS(status)) stopFailed = true;
+            KeRevertToUserGroupAffinityThread(&finalAffinity);
+            coordinatorBound = false;
+        }
+    }
+
+    if (coordinatorBound) {
+        KeRevertToUserGroupAffinityThread(&coordinatorAffinity);
+    }
+
+    if (unresolved || stopFailed || HasParkedVcpu() || HasLiveVcpu() ||
+        HasUnresolvedVcpu() || HasUnresolvedTargetWork()) {
         PinImageForParkedCpu();
         InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
         return;
@@ -4765,6 +5588,10 @@ static void StopHypervisorInternal(bool startRollback) {
         if (g_VcpuData[i].TraceRing) {
             ExFreePoolWithTag(g_VcpuData[i].TraceRing, TAG_HVTR);
         }
+    }
+    if (g_HvTargetCpuWork) {
+        ExFreePoolWithTag(g_HvTargetCpuWork, TAG_HV00);
+        g_HvTargetCpuWork = nullptr;
     }
     ExFreePoolWithTag(g_VcpuData, TAG_HV00);
     g_VcpuData = nullptr;
@@ -4792,5 +5619,6 @@ extern "C" bool IsHypervisorQuarantined() {
 extern "C" void QuarantineHypervisorImage() {
     if (!g_VcpuData) return;
     PinImageForParkedCpu();
+    if (g_HvDriverObject) g_HvDriverObject->DriverUnload = nullptr;
     InterlockedExchange(&g_HvLifecycle, kHvLifecycleQuarantined);
 }

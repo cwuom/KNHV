@@ -64,6 +64,10 @@ enum HvTraceEvent : u32 {
     HvTraceEventRollbackDone = 25,
     HvTraceEventFatalSnapshot = 26,
     HvTraceEventPreBugcheck = 27,
+    HvTraceEventXssPreservationFail = 28,
+    HvTraceEventFatalSnapshotComplete = 29,
+    HvTraceEventFatalParked = 30,
+    HvTraceEventFatalVmexit = 31,
 };
 // these offsets belong to this software frame, not to CPU-specific VMCS fields
 // HvVmExitEntryPoint reserves the first 0x1000 bytes for XSAVE and starts the
@@ -114,6 +118,33 @@ enum VcpuState : long {
     VcpuParked        = 6,
     // native teardown has left the guest path and is completing VMXOFF
     VcpuTearingDown   = 7,
+};
+
+enum HvFatalSnapshotCommitState : long {
+    HvFatalSnapshotEmpty = 0,
+    HvFatalSnapshotWriting = 1,
+    HvFatalSnapshotCommitted = 2,
+};
+
+// 记录原生拆除被拒绝的具体契约原因，供崩溃后的离线分析使用
+enum HvNativeTeardownReject : u32 {
+    HvNativeTeardownRejectNone = 0,
+    HvNativeTeardownRejectSelector = 1U << 0,
+    HvNativeTeardownRejectCsSsLimitAr = 1U << 1,
+    HvNativeTeardownRejectGdt = 1U << 2,
+    HvNativeTeardownRejectIdt = 1U << 3,
+    HvNativeTeardownRejectTr = 1U << 4,
+    HvNativeTeardownRejectVmEntryEvent = 1U << 5,
+    HvNativeTeardownRejectExitEvent = 1U << 6,
+    HvNativeTeardownRejectIdtVectoring = 1U << 7,
+    HvNativeTeardownRejectActivity = 1U << 8,
+    HvNativeTeardownRejectInterruptibility = 1U << 9,
+    HvNativeTeardownRejectPendingDebug = 1U << 10,
+    HvNativeTeardownRejectGuestState = 1U << 11,
+    HvNativeTeardownRejectCpl = 1U << 12,
+    HvNativeTeardownRejectParameters = 1U << 13,
+    HvNativeTeardownRejectVmcsRead = 1U << 14,
+    HvNativeTeardownRejectDescriptorContract = 1U << 15,
 };
 
 struct __declspec(align(64)) GuestContext {
@@ -347,4 +378,15 @@ struct VcpuContext {
     u64 LastGuestSsp;
     u64 LastGuestInterruptSspTable;
     u64 LastVmInstructionError;
+
+    // The first fatal VMCS image is immutable after Committed is published.
+    // Interlocked operations provide the release/acquire boundary; root paths
+    // must not depend on allocation, locks, formatting, or debugger output.
+    volatile long FatalSnapshotCommitState;
+    volatile long NativeTeardownRejectMask;
 };
+
+static_assert((offsetof(VcpuContext, FatalSnapshotCommitState) % alignof(long)) == 0,
+              "fatal snapshot commit state must be naturally aligned");
+static_assert((offsetof(VcpuContext, NativeTeardownRejectMask) % alignof(long)) == 0,
+              "native teardown reject mask must be naturally aligned");
