@@ -62,6 +62,14 @@ find_package(WDK REQUIRED)
 
 option(NESTED_HV_SIGN "Sign the driver as a post-build step" OFF)
 option(NESTED_HV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
+option(NESTED_HV_FAULT_INJECTION
+       "Enable deterministic launch fault injection for isolated tests" OFF)
+set(HV_TEST_FAIL_CPU "-1" CACHE STRING
+    "Logical processor index used by fault injection (-1 disables it)")
+set(HV_TEST_FAIL_STAGE "0" CACHE STRING
+    "Fault injection stage number (0 disables it)")
+set(NESTED_HV_BUILD_ID "0" CACHE STRING
+    "Numeric build identifier embedded in crash telemetry")
 set(NESTED_HV_SIGNTOOL "" CACHE FILEPATH "Path to signtool.exe (required when NESTED_HV_SIGN=ON)")
 set(NESTED_HV_SIGN_CERT "" CACHE FILEPATH "PFX containing the signing private key (required when NESTED_HV_SIGN=ON)")
 set(NESTED_HV_SIGN_PASSWORD "" CACHE STRING "PFX password (optional; avoid storing secrets in CMake cache)")
@@ -98,6 +106,13 @@ target_compile_options(Nested_HV PRIVATE
         "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:wchar_t->"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/std:c++17>"
 )
+target_compile_definitions(Nested_HV PRIVATE
+        NESTED_HV_BUILD_ID=${NESTED_HV_BUILD_ID})
+if(NESTED_HV_FAULT_INJECTION)
+    target_compile_definitions(Nested_HV PRIVATE
+            HV_TEST_FAIL_CPU=${HV_TEST_FAIL_CPU}
+            HV_TEST_FAIL_STAGE=${HV_TEST_FAIL_STAGE})
+endif()
 
 # link. WDK targets point at the selected kit, so no machine-specific library
 # directory is needed here.

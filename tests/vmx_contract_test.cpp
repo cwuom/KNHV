@@ -213,6 +213,29 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             vmx.find("CPUID_7_ECX_OSPKE") != std::string::npos &&
             vmx.find("XCR0_PKRU") != std::string::npos);
 
+  Check(state, "flight recorder has fixed-size records", common.find(
+        "struct HvTraceRecord") != std::string::npos &&
+        common.find("HV_TRACE_RECORDS_PER_CPU = 512") != std::string::npos &&
+        common.find("HV_TRACE_TAIL_RECORDS = 32") != std::string::npos);
+  const std::size_t trace_begin =
+      vmm.find("static __forceinline void WriteHvTrace");
+  const std::size_t trace_end =
+      vmm.find("extern \"C\" void HvTraceCurrentVcpuEvent", trace_begin);
+  const std::string trace_source =
+      trace_begin != std::string::npos && trace_end > trace_begin
+          ? vmm.substr(trace_begin, trace_end - trace_begin)
+          : std::string{};
+  Check(state, "flight recorder writes atomically without formatting",
+        trace_source.find("InterlockedIncrement64") != std::string::npos &&
+            trace_source.find("MemoryBarrier();") != std::string::npos &&
+            trace_source.find("DbgPrint") == std::string::npos);
+  CheckPattern(state, "fatal snapshot is captured before VMXOFF", asm_source,
+               R"(call HvCaptureFatalSnapshotPreVmxoff[\s\S]{0,500}vmxoff)");
+  Check(state, "crash blob carries a trace tail",
+        vmm.find("TraceRecordsPerCpu = HV_TRACE_TAIL_RECORDS") != std::string::npos &&
+        vmm.find("snapshotCount * HV_TRACE_TAIL_RECORDS") != std::string::npos &&
+            vmm.find("traceTail") != std::string::npos);
+
   CheckPattern(state, "MASM GuestContext XCR0 offset", asm_source,
                R"(CTX_GUEST_XCR0\s+equ\s+01108h)");
   CheckPattern(state, "MASM GuestContext XSS offset", asm_source,
@@ -280,8 +303,20 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(vmxResumeFailure:[\s\S]{0,1500}call HandleVmResumeFailure)");
   CheckPattern(state, "fatal path triggers the dedicated bugcheck", asm_source,
                R"(vmxHalt:[\s\S]{0,3000}call HvFatalBugCheck)");
-  CheckPattern(state, "fatal bugcheck uses the saved exit snapshot", vmm,
-               R"(HvFatalBugCheck\(GuestContext\* c\)[\s\S]{0,700}LastExitReason[\s\S]{0,220}KeBugCheckEx)");
+  const std::size_t saved_fatal_begin =
+      vmm.find("HvFatalBugCheck(GuestContext* c)");
+  const std::size_t saved_fatal_reason =
+      saved_fatal_begin == std::string::npos
+          ? std::string::npos
+          : vmm.find("LastExitReasonRaw", saved_fatal_begin);
+  const std::size_t saved_fatal_bugcheck =
+      saved_fatal_begin == std::string::npos
+          ? std::string::npos
+          : vmm.find("KeBugCheckEx", saved_fatal_begin);
+  Check(state, "fatal bugcheck uses the saved exit snapshot",
+        saved_fatal_begin != std::string::npos &&
+            saved_fatal_reason > saved_fatal_begin &&
+            saved_fatal_bugcheck > saved_fatal_reason);
   CheckPattern(state, "native teardown reaches the stopped marker after VMXOFF", asm_source,
                R"(HvRestoreStateAndReturn proc[\s\S]{0,7000}vmxoff[\s\S]{0,1200}call MarkCurrentVcpuStopped)");
   const std::size_t teardown_begin =
@@ -716,7 +751,16 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             asm_source.substr(wrapper_begin, wrapper_end - wrapper_begin).find(
                 "call PrepareHvCallback") != std::string::npos &&
             asm_source.substr(wrapper_begin, wrapper_end - wrapper_begin).find(
-                "test al, al") != std::string::npos);
+                 "test al, al") != std::string::npos);
+  Check(state, "launch wrapper has a prepare and commit phase",
+        asm_source.find("g_HvLaunchCommit") != std::string::npos &&
+            asm_source.find("launchCommit:") != std::string::npos &&
+            vmm.find("prepared") != std::string::npos &&
+            vmm.find("g_HvLaunchCommit = 1") != std::string::npos);
+  Check(state, "fault injection stages are compile-time gated",
+        vmm.find("enum HvFaultStage") != std::string::npos &&
+            vmm.find("HV_TEST_FAIL_CPU") != std::string::npos &&
+            vmm.find("HV_TEST_FAIL_STAGE") != std::string::npos);
   const std::size_t abort_begin = vmm.find("extern \"C\" void AbortHvLaunch");
   const std::size_t abort_end = vmm.find("// ==============================================================================\n// Stop Logic", abort_begin);
   Check(state, "non-VMX launch token is handled",

@@ -19,6 +19,11 @@
 extern "C" void StopHypervisor();
 extern "C" PDRIVER_OBJECT g_HvDriverObject;
 
+#ifndef NESTED_HV_BUILD_ID
+#define NESTED_HV_BUILD_ID 0
+#endif
+static constexpr u64 kHvBuildId = static_cast<u64>(NESTED_HV_BUILD_ID);
+
 // ==============================================================================
 // External Assembly Linking
 // ==============================================================================
@@ -38,6 +43,9 @@ extern "C" {
 
     // entry point for vm-exit, used in vmcs setup
     void HvVmExitEntryPoint();
+    void HvTraceCurrentVcpuEvent(u32 Event);
+    bool HvFaultInjectedCurrent(u32 Stage);
+    void HvCaptureFatalSnapshotPreVmxoff(GuestContext* Ctx);
 
     // register helpers
     u16 GetCs(); u16 GetDs(); u16 GetEs(); u16 GetSs(); u16 GetFs(); u16 GetGs();
@@ -74,6 +82,7 @@ static constexpr LONG kHvLifecycleStarting = 1;
 static constexpr LONG kHvLifecycleRunning = 2;
 static constexpr LONG kHvLifecycleStopping = 3;
 static constexpr LONG kHvLifecycleQuarantined = 4;
+extern "C" volatile u8 g_HvLaunchCommit = 0;
 static u64 g_VmxBasic = 0;
 // VMX host CR3 must always reference the kernel/system address space.  A
 // KeIpiGenericCall callback may run while the interrupted thread belongs to a
@@ -150,13 +159,12 @@ static VmxControlGeneration SelectVmxControlGeneration(u32 profile) {
     }
     return VmxGenerationTrue;
 }
-// Detailed per-CPU launch and ordinary VM-exit messages are opt-in. DbgPrint
-// at IPI_LEVEL or with a kernel debugger attached can stop every processor;
-// fatal and contract-failure messages remain unconditional.
+// Detailed messages are emitted only from passive-level code. Root/IPI paths
+// use the binary recorder so enabling diagnostics cannot stall all processors.
 extern "C" volatile LONG g_HvVerboseLogging = 0;
 #define HV_VERBOSE_PRINT(...) \
     do { \
-        if (g_HvVerboseLogging != 0) { \
+        if (g_HvVerboseLogging != 0 && KeGetCurrentIrql() == PASSIVE_LEVEL) { \
             DbgPrint(__VA_ARGS__); \
         } \
     } while (0)
@@ -195,6 +203,70 @@ static __forceinline bool IsCanonical(u64 value);
 static bool ReadMsrSafe(u32 msr, u64* value);
 static u64 GetDebugctlCapabilityMask();
 static bool UpdateNativeTeardownContract(VcpuContext* vcpu);
+
+enum HvFaultStage : u32 {
+    HvFaultBeforeVmxon = 1,
+    HvFaultAfterVmxon = 2,
+    HvFaultAfterVmclear = 3,
+    HvFaultAfterVmptrld = 4,
+    HvFaultAfterVmcsControls = 5,
+    HvFaultAfterHostState = 6,
+    HvFaultAfterGuestState = 7,
+    HvFaultBeforeVmlaunch = 8,
+    HvFaultVmlaunchFailure = 9,
+    HvFaultLateVmEntry = 10,
+    HvFaultFirstVmexit = 11,
+    HvFaultBeforeVmresume = 12,
+    HvFaultVmresumeFailure = 13,
+    HvFaultTeardown = 14,
+};
+
+static __forceinline bool ShouldInjectFault(u32 cpu, u32 stage) {
+#if defined(HV_TEST_FAIL_CPU) && defined(HV_TEST_FAIL_STAGE)
+    return static_cast<u32>(HV_TEST_FAIL_CPU) == cpu &&
+           static_cast<u32>(HV_TEST_FAIL_STAGE) == stage;
+#else
+    UNREFERENCED_PARAMETER(cpu);
+    UNREFERENCED_PARAMETER(stage);
+    return false;
+#endif
+}
+
+static __forceinline void WriteHvTrace(VcpuContext* vcpu, u32 cpu,
+                                       HvTraceEvent event, u64 arg0 = 0,
+                                       u64 arg1 = 0, u64 arg2 = 0,
+                                       u64 arg3 = 0) {
+    if (!vcpu || !vcpu->TraceRing || vcpu->TraceCapacity == 0) return;
+    const u64 sequence = static_cast<u64>(
+        InterlockedIncrement64(reinterpret_cast<volatile LONG64*>(
+                                    &vcpu->TraceWriteIndex)) - 1);
+    const u32 slot = static_cast<u32>(sequence % vcpu->TraceCapacity);
+    HvTraceRecord* record = &vcpu->TraceRing[slot];
+    record->Tsc = __rdtsc();
+    record->Cpu = cpu;
+    record->Lifecycle = static_cast<u16>(g_HvLifecycle);
+    record->Stage = static_cast<u16>(vcpu->LaunchStage);
+    record->Event = static_cast<u32>(event);
+    record->Arg0 = arg0;
+    record->Arg1 = arg1;
+    record->Arg2 = arg2;
+    record->Arg3 = arg3;
+    MemoryBarrier();
+    record->Sequence = sequence;
+}
+
+extern "C" void HvTraceCurrentVcpuEvent(u32 event) {
+    if (!g_VcpuData) return;
+    const u32 cpu = CurrentProcessorIndex();
+    if (cpu < g_ProcessorCount) {
+        WriteHvTrace(&g_VcpuData[cpu], cpu,
+                     static_cast<HvTraceEvent>(event));
+    }
+}
+
+extern "C" bool HvFaultInjectedCurrent(u32 stage) {
+    return ShouldInjectFault(CurrentProcessorIndex(), stage);
+}
 
 // VMX capability MSRs expose mandatory-one bits in the low half and optional
 // allowed-one bits in the high half. Either half can make a requested one
@@ -703,6 +775,75 @@ bool InitializeVmxFeatureContract() {
 // tags for memory allocation (avoid multi-char warnings by using integers)
 constexpr u32 TAG_HV00 = 0x30305648; // 'HV00' little endian
 constexpr u32 TAG_HVST = 0x54535648; // 'HVST' little endian
+constexpr u32 TAG_HVCB = 0x42435648; // 'HVCB' little endian
+constexpr u32 TAG_HVTR = 0x52545648; // 'HVTR' little endian
+static constexpr u64 kHvCrashBlobSignature = 0x48564342524D5541; // HVCBRMA
+static constexpr u32 kHvCrashBlobVersion = 1;
+static const GUID kHvCrashBlobGuid = {
+    0xC6A3D9F0, 0x2F6F, 0x4E4A,
+    {0xA5, 0x9E, 0x61, 0x34, 0x12, 0x88, 0x4B, 0xE6}
+};
+static constexpr const char kHvCrashBlobComponent[] = "Nested_HV_CrashBlob";
+
+struct HvFatalSnapshot {
+    u32 Cpu;
+    u32 Lifecycle;
+    u32 LaunchStage;
+    u32 VmInstructionError;
+
+    u64 ExitReasonRaw;
+    u64 ExitQualification;
+
+    u64 GuestRip;
+    u64 GuestRsp;
+    u64 GuestRflags;
+
+    u64 GuestCr0;
+    u64 GuestCr3;
+    u64 GuestCr4;
+
+    u64 GuestInterruptibility;
+    u64 GuestActivity;
+    u64 ExitIntrInfo;
+    u64 IdtVectoringInfo;
+
+    u64 GuestXcr0;
+    u64 GuestXss;
+    u64 GuestEfer;
+    u64 GuestPat;
+    u64 GuestDebugctl;
+    u64 GuestSCet;
+    u64 GuestSsp;
+    u64 GuestInterruptSspTable;
+    u64 GuestPtCtl;
+
+    u64 VmInstructionRflags;
+};
+
+struct HvCrashBlob {
+    u64 Signature;
+    u32 Version;
+    u32 CpuCount;
+    u32 SnapshotCount;
+    u32 Lifecycle;
+    u64 BuildId;
+    u32 ContractId;
+    u32 Reserved;
+    u64 BugcheckCode;
+    u64 BugcheckArg1;
+    u64 BugcheckArg2;
+    u64 BugcheckArg3;
+    u64 BugcheckArg4;
+    u32 TraceRecordsPerCpu;
+    u32 TraceReserved;
+    HvFatalSnapshot CpuSnapshots[1];
+};
+
+static KBUGCHECK_REASON_CALLBACK_RECORD g_HvBugCheckReasonRecord;
+static bool g_HvBugCheckReasonRegistered = false;
+static HvCrashBlob* g_HvCrashBlob = nullptr;
+static SIZE_T g_HvCrashBlobSize = 0;
+static volatile LONG g_HvCrashBlobCaptured = 0;
 
 static __forceinline bool VmxOk(u64 rflags) {
     return ((rflags & 1ULL) == 0) && ((rflags & (1ULL << 6)) == 0);
@@ -950,6 +1091,8 @@ extern "C" ULONG HandleVmResumeFailure(GuestContext* c, u64 resumeFlags) {
     const bool vmFailValid = (resumeFlags & (1ULL << 6)) != 0;
     if (vcpu) {
         vcpu->LastVmResumeFlags = resumeFlags;
+        vcpu->LastVmInstructionRflags = resumeFlags;
+        WriteHvTrace(vcpu, id, HvTraceEventVmresumeFail, resumeFlags);
         vcpu->LastVmInstructionError = 0;
         // VMfailValid (ZF=1) makes VM_INSTRUCTION_ERROR architecturally
         // available. VMfailInvalid (CF=1) does not, so never issue a VMREAD
@@ -977,6 +1120,321 @@ extern "C" ULONG HandleVmResumeFailure(GuestContext* c, u64 resumeFlags) {
     return 0;
 }
 
+static void ReleaseHvCrashBlob() {
+    if (!g_HvCrashBlob) return;
+    ExFreePoolWithTag(g_HvCrashBlob, TAG_HVCB);
+    g_HvCrashBlob = nullptr;
+    g_HvCrashBlobSize = 0;
+    g_HvCrashBlobCaptured = 0;
+}
+
+static bool InitializeHvCrashBlob(u32 cpuCount) {
+    if (cpuCount == 0) {
+        return false;
+    }
+
+    const SIZE_T snapshotCount = static_cast<SIZE_T>(cpuCount);
+    const SIZE_T size = offsetof(HvCrashBlob, CpuSnapshots) +
+                        snapshotCount * sizeof(HvFatalSnapshot) +
+                        snapshotCount * HV_TRACE_TAIL_RECORDS *
+                            sizeof(HvTraceRecord);
+
+    if (g_HvCrashBlob && g_HvCrashBlobSize == size) {
+        g_HvCrashBlobCaptured = 0;
+        RtlZeroMemory(g_HvCrashBlob, size);
+        g_HvCrashBlob->Signature = kHvCrashBlobSignature;
+        g_HvCrashBlob->Version = kHvCrashBlobVersion;
+        g_HvCrashBlob->CpuCount = static_cast<u32>(snapshotCount);
+        g_HvCrashBlob->TraceRecordsPerCpu = HV_TRACE_TAIL_RECORDS;
+        g_HvCrashBlob->BuildId = kHvBuildId;
+        g_HvCrashBlob->ContractId = g_VmxCapabilityProfile;
+        return true;
+    }
+
+    if (g_HvCrashBlob) {
+        ReleaseHvCrashBlob();
+    }
+
+    void* memory = ExAllocatePoolWithTag(NonPagedPoolNx, size, TAG_HVCB);
+    if (!memory) return false;
+
+    g_HvCrashBlob = static_cast<HvCrashBlob*>(memory);
+    g_HvCrashBlobSize = size;
+    g_HvCrashBlobCaptured = 0;
+    RtlZeroMemory(g_HvCrashBlob, size);
+    g_HvCrashBlob->Signature = kHvCrashBlobSignature;
+    g_HvCrashBlob->Version = kHvCrashBlobVersion;
+    g_HvCrashBlob->CpuCount = static_cast<u32>(snapshotCount);
+    g_HvCrashBlob->TraceRecordsPerCpu = HV_TRACE_TAIL_RECORDS;
+    g_HvCrashBlob->BuildId = kHvBuildId;
+    g_HvCrashBlob->ContractId = g_VmxCapabilityProfile;
+    g_HvCrashBlob->BugcheckCode = 0;
+    g_HvCrashBlob->BugcheckArg1 = 0;
+    g_HvCrashBlob->BugcheckArg2 = 0;
+    g_HvCrashBlob->BugcheckArg3 = 0;
+    g_HvCrashBlob->BugcheckArg4 = 0;
+    g_HvCrashBlob->Reserved = 0;
+    return true;
+}
+
+static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
+                              ULONG_PTR bugcheckParam1,
+                              ULONG_PTR bugcheckParam2,
+                              ULONG_PTR bugcheckParam3,
+                              ULONG_PTR bugcheckParam4) {
+    if (!g_HvCrashBlob) return;
+
+    const u32 maxSnapshots = g_HvCrashBlob->CpuCount;
+    const u32 snapshotCount = g_ProcessorCount < maxSnapshots ? g_ProcessorCount : maxSnapshots;
+    HvCrashBlob* blob = g_HvCrashBlob;
+    HvFatalSnapshot* snapshots = blob->CpuSnapshots;
+
+    RtlZeroMemory(blob, g_HvCrashBlobSize);
+    blob->Signature = kHvCrashBlobSignature;
+    blob->Version = kHvCrashBlobVersion;
+    blob->CpuCount = maxSnapshots;
+    blob->SnapshotCount = snapshotCount;
+    blob->TraceRecordsPerCpu = HV_TRACE_TAIL_RECORDS;
+    blob->Lifecycle = static_cast<u32>(g_HvLifecycle);
+    blob->BuildId = kHvBuildId;
+    blob->ContractId = g_VmxCapabilityProfile;
+    blob->BugcheckCode = bugcheckCode;
+    blob->BugcheckArg1 = bugcheckParam1;
+    blob->BugcheckArg2 = bugcheckParam2;
+    blob->BugcheckArg3 = bugcheckParam3;
+    blob->BugcheckArg4 = bugcheckParam4;
+    blob->Reserved = g_HvImagePinned != 0 ? 1U : 0U;
+
+    for (u32 i = 0; i < snapshotCount; ++i) {
+        HvFatalSnapshot& out = snapshots[i];
+        out.Cpu = i;
+        out.Lifecycle = static_cast<u32>(g_HvLifecycle);
+        out.LaunchStage = 0;
+        out.VmInstructionError = 0;
+        out.ExitReasonRaw = 0;
+        out.ExitQualification = 0;
+        out.GuestRip = 0;
+        out.GuestRsp = 0;
+        out.GuestRflags = 0;
+        out.GuestCr0 = 0;
+        out.GuestCr3 = 0;
+        out.GuestCr4 = 0;
+        out.GuestInterruptibility = 0;
+        out.GuestActivity = 0;
+        out.ExitIntrInfo = 0;
+        out.IdtVectoringInfo = 0;
+        out.GuestXcr0 = 0;
+        out.GuestXss = 0;
+        out.GuestEfer = 0;
+        out.GuestPat = 0;
+        out.GuestDebugctl = 0;
+        out.GuestSCet = 0;
+        out.GuestSsp = 0;
+        out.GuestInterruptSspTable = 0;
+        out.GuestPtCtl = 0;
+        out.VmInstructionRflags = 0;
+
+        if (g_VcpuData && i < g_ProcessorCount) {
+            const VcpuContext& vcpu = g_VcpuData[i];
+            out.Lifecycle = static_cast<u32>(vcpu.State);
+            out.LaunchStage = static_cast<u32>(vcpu.LaunchStage);
+            out.VmInstructionError = static_cast<u32>(vcpu.LastVmInstructionError);
+            out.ExitReasonRaw = vcpu.LastExitReasonRaw;
+            out.ExitQualification = vcpu.LastExitQualification;
+            out.GuestRip = vcpu.LastGuestRip;
+            out.GuestRsp = vcpu.LastGuestRsp;
+            out.GuestRflags = vcpu.LastRflags;
+            out.GuestCr0 = vcpu.LastGuestCr0;
+            out.GuestCr3 = vcpu.LastGuestCr3;
+            out.GuestCr4 = vcpu.LastGuestCr4;
+            out.GuestInterruptibility = vcpu.LastGuestInterruptibility;
+            out.GuestActivity = vcpu.LastGuestActivity;
+            out.ExitIntrInfo = vcpu.LastVmExitIntrInfo;
+            out.IdtVectoringInfo = vcpu.LastIdtVectoringInfo;
+            out.GuestXcr0 = vcpu.LastGuestXcr0;
+            out.GuestXss = vcpu.LastGuestXss;
+            out.GuestEfer = vcpu.LastGuestEfer;
+            out.GuestPat = vcpu.LastGuestPat;
+            out.GuestDebugctl = vcpu.LastGuestDebugctl;
+            out.GuestSCet = vcpu.LastGuestSCet;
+            out.GuestSsp = vcpu.LastGuestSsp;
+            out.GuestInterruptSspTable = vcpu.LastGuestInterruptSspTable;
+            out.GuestPtCtl = vcpu.LastPtCtl;
+            out.VmInstructionRflags = vcpu.LastVmInstructionRflags;
+        }
+    }
+
+    auto* traceTail = reinterpret_cast<HvTraceRecord*>(
+        reinterpret_cast<UCHAR*>(snapshots) +
+        snapshotCount * sizeof(HvFatalSnapshot));
+    RtlZeroMemory(traceTail, snapshotCount * HV_TRACE_TAIL_RECORDS *
+                                sizeof(HvTraceRecord));
+    for (u32 i = 0; i < snapshotCount; ++i) {
+        if (!g_VcpuData || i >= g_ProcessorCount ||
+            !g_VcpuData[i].TraceRing || g_VcpuData[i].TraceCapacity == 0) {
+            continue;
+        }
+        VcpuContext& vcpu = g_VcpuData[i];
+        const u64 writeIndex = static_cast<u64>(
+            InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(
+                                              &vcpu.TraceWriteIndex),
+                                          0, 0));
+        const u64 available = writeIndex < vcpu.TraceCapacity
+                                  ? writeIndex
+                                  : vcpu.TraceCapacity;
+        const u64 count = available < HV_TRACE_TAIL_RECORDS
+                              ? available
+                              : HV_TRACE_TAIL_RECORDS;
+        for (u64 j = 0; j < count; ++j) {
+            const u64 sequence = writeIndex - count + j;
+            const u32 slot = static_cast<u32>(sequence % vcpu.TraceCapacity);
+            const HvTraceRecord record = vcpu.TraceRing[slot];
+            if (record.Sequence == sequence) {
+                traceTail[static_cast<SIZE_T>(i) * HV_TRACE_TAIL_RECORDS + j] =
+                    record;
+            }
+        }
+    }
+
+    MemoryBarrier();
+}
+
+extern "C" VOID HvSecondaryDumpDataCallback(
+    KBUGCHECK_CALLBACK_REASON Reason,
+    PKBUGCHECK_REASON_CALLBACK_RECORD Record,
+    PVOID ReasonSpecificData,
+    ULONG ReasonSpecificDataLength) {
+    UNREFERENCED_PARAMETER(Record);
+    if (Reason != KbCallbackSecondaryMultiPartDumpData) return;
+
+    if (!ReasonSpecificData ||
+        ReasonSpecificDataLength < sizeof(KBUGCHECK_SECONDARY_DUMP_DATA_EX)) {
+        return;
+    }
+
+    PKBUGCHECK_SECONDARY_DUMP_DATA_EX dumpData =
+        static_cast<PKBUGCHECK_SECONDARY_DUMP_DATA_EX>(ReasonSpecificData);
+    dumpData->Guid = kHvCrashBlobGuid;
+    const UCHAR* base = reinterpret_cast<const UCHAR*>(g_HvCrashBlob);
+    const SIZE_T cursor = reinterpret_cast<SIZE_T>(dumpData->Context);
+
+    if (!g_HvCrashBlob || g_HvCrashBlobSize == 0) {
+        dumpData->OutBuffer = nullptr;
+        dumpData->OutBufferLength = 0;
+        dumpData->Flags = KB_SECONDARY_DATA_FLAG_NO_DEVICE_ACCESS;
+        return;
+    }
+
+    if (cursor >= g_HvCrashBlobSize) {
+        dumpData->OutBuffer = const_cast<UCHAR*>(base + g_HvCrashBlobSize);
+        dumpData->OutBufferLength = 0;
+        dumpData->Flags = KB_SECONDARY_DATA_FLAG_NO_DEVICE_ACCESS;
+        dumpData->Context = nullptr;
+        return;
+    }
+
+    const ULONG maxAllowed = dumpData->MaximumAllowed;
+    const ULONG remaining = static_cast<ULONG>(
+        g_HvCrashBlobSize - cursor < static_cast<SIZE_T>(MAXULONG) ?
+        g_HvCrashBlobSize - cursor : MAXULONG);
+    const ULONG copyLength = (maxAllowed >= remaining) ? remaining : maxAllowed;
+    dumpData->OutBuffer = const_cast<UCHAR*>(base + cursor);
+    dumpData->OutBufferLength = copyLength;
+    dumpData->Flags = KB_SECONDARY_DATA_FLAG_NO_DEVICE_ACCESS;
+    if (copyLength < remaining) {
+        dumpData->Flags |= KB_SECONDARY_DATA_FLAG_ADDITIONAL_DATA;
+        dumpData->Context = reinterpret_cast<PVOID>(cursor + copyLength);
+    } else {
+        dumpData->Context = nullptr;
+    }
+}
+
+bool RegisterSecondaryDumpCallback() {
+    if (g_HvBugCheckReasonRegistered) return true;
+
+    const BOOLEAN ok = KeRegisterBugCheckReasonCallback(
+        &g_HvBugCheckReasonRecord,
+        HvSecondaryDumpDataCallback,
+        KbCallbackSecondaryMultiPartDumpData,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(kHvCrashBlobComponent)));
+    if (!ok) return false;
+
+    g_HvBugCheckReasonRegistered = true;
+    return true;
+}
+
+void UnregisterSecondaryDumpCallback() {
+    if (!g_HvBugCheckReasonRegistered) return;
+
+    g_HvBugCheckReasonRegistered = false;
+    (void)KeDeregisterBugCheckReasonCallback(&g_HvBugCheckReasonRecord);
+}
+
+// Capture the VMCS while VMX is still active. The fatal assembly path calls
+// this before VMXOFF; after VMXOFF only the software copy is trustworthy.
+extern "C" void HvCaptureFatalSnapshotPreVmxoff(GuestContext* c) {
+    if (!g_VcpuData) return;
+    const u32 cpu = CurrentProcessorIndex();
+    if (cpu >= g_ProcessorCount) return;
+
+    VcpuContext* vcpu = &g_VcpuData[cpu];
+    u64 value = 0;
+    if (VmReadChecked(VM_EXIT_REASON, &value)) {
+        vcpu->LastExitReasonRaw = static_cast<u32>(value);
+        vcpu->LastExitReasonBasic = static_cast<u32>(value) & 0xFFFFU;
+        vcpu->LastExitEntryFailure =
+            (static_cast<u32>(value) & 0x80000000U) != 0 ? 1U : 0U;
+    }
+    if (VmReadChecked(EXIT_QUALIFICATION, &value)) {
+        vcpu->LastExitQualification = value;
+    }
+    if (VmReadChecked(VM_INSTRUCTION_ERROR, &value)) {
+        vcpu->LastVmInstructionError = value;
+    }
+    if (VmReadChecked(GUEST_RIP, &value)) vcpu->LastGuestRip = value;
+    if (VmReadChecked(GUEST_RSP, &value)) vcpu->LastGuestRsp = value;
+    if (VmReadChecked(GUEST_RFLAGS, &value)) vcpu->LastRflags = value;
+    if (VmReadChecked(GUEST_CR0, &value)) vcpu->LastGuestCr0 = value;
+    if (VmReadChecked(GUEST_CR3, &value)) vcpu->LastGuestCr3 = value;
+    if (VmReadChecked(GUEST_CR4, &value)) vcpu->LastGuestCr4 = value;
+    if (VmReadChecked(GUEST_INTERRUPTIBILITY_INFO, &value)) {
+        vcpu->LastGuestInterruptibility = static_cast<u32>(value);
+    }
+    if (VmReadChecked(GUEST_ACTIVITY_STATE, &value)) {
+        vcpu->LastGuestActivity = static_cast<u32>(value);
+    }
+    if (VmReadChecked(VM_EXIT_INTR_INFO, &value)) {
+        vcpu->LastVmExitIntrInfo = static_cast<u32>(value);
+    }
+    if (VmReadChecked(VM_EXIT_IDT_VECTORING_INFO, &value)) {
+        vcpu->LastIdtVectoringInfo = static_cast<u32>(value);
+    }
+    if (VmReadChecked(GUEST_EFER, &value)) vcpu->LastGuestEfer = value;
+    if (VmReadChecked(GUEST_PAT, &value)) vcpu->LastGuestPat = value;
+    if (VmReadChecked(GUEST_DEBUGCTL, &value)) {
+        vcpu->LastGuestDebugctl = value;
+    }
+    if (g_CetVmcsEnabled) {
+        if (VmReadChecked(GUEST_S_CET, &value)) vcpu->LastGuestSCet = value;
+        if (VmReadChecked(GUEST_SSP, &value)) vcpu->LastGuestSsp = value;
+        if (VmReadChecked(GUEST_INTR_SSP_TABLE, &value)) {
+            vcpu->LastGuestInterruptSspTable = value;
+        }
+    }
+    if (c) {
+        vcpu->LastGuestXcr0 = c->GuestXcr0;
+        vcpu->LastGuestXss = c->GuestXss;
+    }
+    u64 ptControl = 0;
+    if (ReadMsrSafe(MSR_IA32_RTIT_CTL, &ptControl)) {
+        vcpu->LastPtCtl = ptControl;
+    }
+    WriteHvTrace(vcpu, cpu, HvTraceEventFatalSnapshot,
+                 vcpu->LastExitReasonRaw, vcpu->LastVmInstructionError,
+                 vcpu->LastGuestRip, vcpu->LastGuestRsp);
+    MemoryBarrier();
+}
+
 // A frame that cannot pass native teardown validation has no safe instruction
 // pointer or stack. Fail fast with a debugger-visible dump instead of waiting
 // for CLOCK_WATCHDOG_TIMEOUT to obscure the original VMX failure.
@@ -984,14 +1442,20 @@ extern "C" __declspec(noreturn) void HvFatalBugCheck(GuestContext* c) {
     constexpr ULONG kHvFatalBugCheck = 0x200;
     const ULONG_PTR cpu = CurrentProcessorIndex();
     ULONG_PTR reason = 0;
+    const ULONG_PTR rip = c ? static_cast<ULONG_PTR>(c->GuestRip) : 0;
+    const ULONG_PTR rsp = c ? static_cast<ULONG_PTR>(c->GuestRsp) : 0;
     if (c && g_VcpuData && cpu < g_ProcessorCount) {
         // VMXOFF has already ended VMX operation on this path.  Use the
         // per-CPU snapshot instead of issuing an invalid post-VMX VMREAD
         // while collecting bugcheck parameters
         reason = static_cast<ULONG_PTR>(g_VcpuData[cpu].LastExitReasonRaw);
+        WriteHvTrace(&g_VcpuData[cpu], static_cast<u32>(cpu),
+                     HvTraceEventPreBugcheck, reason,
+                     static_cast<u64>(rip), static_cast<u64>(rsp));
     }
-    const ULONG_PTR rip = c ? static_cast<ULONG_PTR>(c->GuestRip) : 0;
-    const ULONG_PTR rsp = c ? static_cast<ULONG_PTR>(c->GuestRsp) : 0;
+    if (InterlockedCompareExchange(&g_HvCrashBlobCaptured, 1, 0) == 0) {
+        CaptureHvCrashBlob(kHvFatalBugCheck, cpu, reason, rip, rsp);
+    }
     KeBugCheckEx(kHvFatalBugCheck, cpu, reason, rip, rsp);
     __assume(0);
 }
@@ -1110,6 +1574,7 @@ extern "C" void MarkCurrentVcpuLaunched() {
                              previous, vcpu->LaunchStage);
             return;
         }
+        WriteHvTrace(vcpu, id, HvTraceEventGuestStart);
     }
 }
 
@@ -1120,8 +1585,10 @@ extern "C" void MarkCurrentVcpuParked() {
     if (!g_VcpuData) return;
     const u32 id = CurrentProcessorIndex();
     if (id < g_ProcessorCount) {
-        InterlockedExchange(&g_VcpuData[id].LaunchStage, 7);
-        InterlockedExchange(&g_VcpuData[id].State, VcpuParked);
+        VcpuContext* vcpu = &g_VcpuData[id];
+        WriteHvTrace(vcpu, id, HvTraceEventPreVmxoff);
+        InterlockedExchange(&vcpu->LaunchStage, 7);
+        InterlockedExchange(&vcpu->State, VcpuParked);
     }
 }
 
@@ -1133,6 +1600,7 @@ extern "C" void MarkCurrentVcpuTearingDown() {
         const long state = vcpu->State;
         if (state == VcpuLaunched || state == VcpuVmxOn ||
             state == VcpuStarting) {
+            WriteHvTrace(vcpu, id, HvTraceEventTeardownRequest);
             InterlockedExchange(&vcpu->LaunchStage, 8);
             InterlockedExchange(&vcpu->State, VcpuTearingDown);
         }
@@ -1153,6 +1621,7 @@ extern "C" void MarkCurrentVcpuStopped() {
             state == VcpuVmxOn) {
             InterlockedExchange(&vcpu->LaunchStage, 9);
             InterlockedExchange(&vcpu->State, VcpuStopped);
+            WriteHvTrace(vcpu, id, HvTraceEventPostVmxoff);
         }
     }
 }
@@ -2044,6 +2513,8 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         return;
     }
     VcpuContext* vcpu = &g_VcpuData[cpuId];
+    WriteHvTrace(vcpu, cpuId, HvTraceEventVmexitEntry, rawExitReason,
+                 static_cast<u64>(entryFailure));
     // Capture the reason before any VMCS write can fail and route directly to
     // the fatal path.  The snapshot remains available after VMXOFF.
     vcpu->LastExitReason = static_cast<long>(basicExitReason);
@@ -2052,6 +2523,8 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     vcpu->LastExitEntryFailure = entryFailure ? 1U : 0U;
     vcpu->LastExitInstructionLength = ExitLen;
     if (entryFailure) {
+        WriteHvTrace(vcpu, cpuId, HvTraceEventVmEntryFailure,
+                     rawExitReason, basicExitReason);
         // A VM-entry failure is not a running guest exit. The VMCS guest
         // fields cannot be used to manufacture an IRET continuation here.
         if (!VmReadChecked(VM_INSTRUCTION_ERROR,
@@ -2210,6 +2683,16 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     }
     vcpu->GuestGsBase = Ctx->GuestGsBase;
     vcpu->GuestKernelGsBase = Ctx->GuestKernelGsBase;
+
+    if (ShouldInjectFault(cpuId, HvFaultLateVmEntry) ||
+        ShouldInjectFault(cpuId, HvFaultFirstVmexit)) {
+        WriteHvTrace(vcpu, cpuId, HvTraceEventVmEntryFailure,
+                     static_cast<u64>(HvFaultLateVmEntry));
+        Ctx->AbortVm = 1;
+        Ctx->HaltVm = 0;
+        vcpu->LastExitAction = kExitActionAbort;
+        return;
+    }
 
     bool AdvanceRip = true;
 
@@ -2604,6 +3087,14 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     } else {
         vcpu->LastExitAction = kExitActionInject;
     }
+    if (ShouldInjectFault(cpuId, HvFaultBeforeVmresume) ||
+        ShouldInjectFault(cpuId, HvFaultVmresumeFailure)) {
+        WriteHvTrace(vcpu, cpuId, HvTraceEventPreVmresume,
+                     static_cast<u64>(HvFaultBeforeVmresume));
+        Ctx->AbortVm = 1;
+        Ctx->HaltVm = 0;
+        vcpu->LastExitAction = kExitActionAbort;
+    }
     if (!Ctx->HaltVm && !Ctx->AbortVm) {
         InterlockedIncrement(&vcpu->VmResumeAttempts);
     }
@@ -2790,6 +3281,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         }
     }
 
+    WriteHvTrace(mutableVcpu, cpuId, HvTraceEventVmcsHostDone);
+    if (ShouldInjectFault(cpuId, HvFaultAfterHostState)) return false;
 
     // ==============================================================================
     // Guest State Configuration
@@ -2906,6 +3399,9 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                      reinterpret_cast<u64>(GuestSp),
                      reinterpret_cast<u64>(GuestIp));
     if (!VmWriteChecked(GUEST_RFLAGS, guestRflags)) return false;
+
+    WriteHvTrace(mutableVcpu, cpuId, HvTraceEventVmcsGuestDone);
+    if (ShouldInjectFault(cpuId, HvFaultAfterGuestState)) return false;
 
     // ==============================================================================
     // VM Execution Controls
@@ -3044,6 +3540,10 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             secCtl)) {
         return false;
     }
+
+    WriteHvTrace(mutableVcpu, cpuId, HvTraceEventVmcsControlsDone,
+                 procCtl, secCtl);
+    if (ShouldInjectFault(cpuId, HvFaultAfterVmcsControls)) return false;
 
     // The tertiary capability MSR is a direct 64-bit allowed-one bitmap. Do
     // not apply AdjustControls, whose low half has a different meaning.
@@ -3248,6 +3748,9 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
                                    VcpuUninitialized) != VcpuUninitialized) {
         return 0;
     }
+    WriteHvTrace(vcpu, id, HvTraceEventDriverEntry);
+    WriteHvTrace(vcpu, id, HvTraceEventCpuIpiEnter);
+    WriteHvTrace(vcpu, id, HvTraceEventContractBegin);
     InterlockedExchange(&vcpu->LaunchStage, 1);
     InterlockedExchange(&vcpu->TeardownQuiesced, 0);
     InterlockedExchange(&vcpu->VmcsWriteFailed, 0);
@@ -3664,7 +4167,17 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         __writecr4(AdjustCr4(vcpu->OriginalCr4 | CR4_VMXE));
         cr4Prepared = true;
 
+        WriteHvTrace(vcpu, id, HvTraceEventPreVmxon);
+        if (ShouldInjectFault(id, HvFaultBeforeVmxon)) {
+            WriteHvTrace(vcpu, id, HvTraceEventContractFail,
+                         HvFaultBeforeVmxon);
+            __writecr0(vcpu->OriginalCr0);
+            __writecr4(vcpu->OriginalCr4);
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
         const u64 vmxonFlags = HvVmxOn(&vcpu->VmxOnPhys);
+        WriteHvTrace(vcpu, id, HvTraceEventPostVmxon, vmxonFlags);
         if (!VmxOk(vmxonFlags)) {
             HV_VERBOSE_PRINT("[HV] CPU %u VMXON failed: flags=0x%llX cr0=0x%llX "
                              "cr4=0x%llX vmxon_pa=0x%llX\n", id, vmxonFlags,
@@ -3678,10 +4191,42 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         InterlockedExchange(&vcpu->LaunchStage, 2);
         InterlockedExchange(&vcpu->State, VcpuVmxOn);
 
+        if (ShouldInjectFault(id, HvFaultAfterVmxon)) {
+            WriteHvTrace(vcpu, id, HvTraceEventContractFail,
+                         HvFaultAfterVmxon);
+            HvVmxOff();
+            __writecr0(vcpu->OriginalCr0);
+            __writecr4(vcpu->OriginalCr4);
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
+
+        WriteHvTrace(vcpu, id, HvTraceEventPreVmclear);
         const u64 vmclearFlags = HvVmClear(&vcpu->VmcsPhys);
+        WriteHvTrace(vcpu, id, HvTraceEventPostVmclear, vmclearFlags);
+        if (ShouldInjectFault(id, HvFaultAfterVmclear)) {
+            WriteHvTrace(vcpu, id, HvTraceEventContractFail,
+                         HvFaultAfterVmclear);
+            HvVmxOff();
+            __writecr0(vcpu->OriginalCr0);
+            __writecr4(vcpu->OriginalCr4);
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
+        WriteHvTrace(vcpu, id, HvTraceEventPreVmptrld);
         const u64 vmptrldFlags = VmxOk(vmclearFlags)
                                      ? HvVmPtrLd(&vcpu->VmcsPhys)
                                      : vmclearFlags;
+        WriteHvTrace(vcpu, id, HvTraceEventPostVmptrld, vmptrldFlags);
+        if (ShouldInjectFault(id, HvFaultAfterVmptrld)) {
+            WriteHvTrace(vcpu, id, HvTraceEventContractFail,
+                         HvFaultAfterVmptrld);
+            HvVmxOff();
+            __writecr0(vcpu->OriginalCr0);
+            __writecr4(vcpu->OriginalCr4);
+            InterlockedExchange(&vcpu->State, VcpuFailed);
+            return 0;
+        }
         vcpu->LastVmclearFlags = vmclearFlags;
         vcpu->LastVmptrldFlags = vmptrldFlags;
         if (!VmxOk(vmclearFlags) || !VmxOk(vmptrldFlags) ||
@@ -3716,6 +4261,7 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         // The wrapper publishes Launched only after GuestStartThunk returns
         // from a successful VMLAUNCH. Until then this CPU is merely VMXON.
         InterlockedExchange(&vcpu->LaunchStage, 4);
+        WriteHvTrace(vcpu, id, HvTraceEventContractOk);
         HV_VERBOSE_PRINT("[HV] CPU %u VMCS ready; entering VMLAUNCH: revision=0x%X "
                          "vmcs_pa=0x%llX host_rsp=0x%llX\n", id, vcpu->RevisionId,
                          vcpu->VmcsPhys, vcpu->HostStackTop);
@@ -3745,6 +4291,8 @@ extern "C" void AbortHvLaunch(u64 Rflags) {
     if (!g_VcpuData || id >= g_ProcessorCount) return;
     VcpuContext* vcpu = &g_VcpuData[id];
     vcpu->LastLaunchFlags = Rflags;
+    vcpu->LastVmInstructionRflags = Rflags;
+    WriteHvTrace(vcpu, id, HvTraceEventVmlaunchFail, Rflags);
 
     // HvLaunchGuest returns this private token when its CR4.VMXE guard finds
     // that VMX operation is already inactive. In that case VMREAD/VMXOFF are
@@ -3758,6 +4306,7 @@ extern "C" void AbortHvLaunch(u64 Rflags) {
         vcpu->VmcsReadFailed = 1;
     }
     vcpu->LastVmInstructionError = errorCode;
+    WriteHvTrace(vcpu, id, HvTraceEventContractFail, errorCode, Rflags);
     InterlockedExchange(&vcpu->LaunchStage, 6);
     HV_VERBOSE_PRINT("[HV] VMLAUNCH failed on processor %u flags 0x%llX error 0x%llX vmx=%u\n",
                      id, Rflags, errorCode,
@@ -3863,9 +4412,11 @@ extern "C" NTSTATUS StartHypervisor() {
         return STATUS_DEVICE_BUSY;
     }
     auto rejectStart = [](NTSTATUS status) -> NTSTATUS {
+        g_HvLaunchCommit = 0;
         InterlockedCompareExchange(&g_HvLifecycle,
-                                    kHvLifecycleIdle,
-                                    kHvLifecycleStarting);
+                                   kHvLifecycleIdle,
+                                   kHvLifecycleStarting);
+        ReleaseHvCrashBlob();
         return status;
     };
     // Keep this exported entry point safe even if a future caller bypasses
@@ -3964,6 +4515,10 @@ extern "C" NTSTATUS StartHypervisor() {
         DbgPrint("[HV] StartHypervisor rejected: no active processors\n");
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
+    if (!InitializeHvCrashBlob(g_ProcessorCount)) {
+        DbgPrint("[HV] StartHypervisor rejected: failed to initialize crash blob\n");
+        return rejectStart(STATUS_INSUFFICIENT_RESOURCES);
+    }
     DbgPrint("[HV] StartHypervisor: processors=%u host_cr3=0x%llX "
              "vmx_basic=0x%llX xsave_frame=%lu\n", g_ProcessorCount,
              g_HostCr3, g_VmxBasic, static_cast<ULONG>(g_XsaveStateSize));
@@ -3987,16 +4542,29 @@ extern "C" NTSTATUS StartHypervisor() {
             g_VcpuData[i].HostStackTop  = reinterpret_cast<u64>(g_VcpuData[i].HostStack) + 0x8000;
             g_VcpuData[i].HostStackTop &= ~0x3FULL;
         }
+        g_VcpuData[i].TraceCapacity = HV_TRACE_RECORDS_PER_CPU;
+        g_VcpuData[i].TraceRing = static_cast<HvTraceRecord*>(
+            ExAllocatePoolWithTag(NonPagedPoolNx,
+                                   sizeof(HvTraceRecord) *
+                                       HV_TRACE_RECORDS_PER_CPU,
+                                   TAG_HVTR));
+        if (g_VcpuData[i].TraceRing) {
+            RtlZeroMemory(g_VcpuData[i].TraceRing,
+                          sizeof(HvTraceRecord) * HV_TRACE_RECORDS_PER_CPU);
+        }
 
         if (!g_VcpuData[i].VmxOnVirt || !g_VcpuData[i].VmcsVirt ||
-            !g_VcpuData[i].MsrBitmapVirt || !g_VcpuData[i].HostStack) {
+            !g_VcpuData[i].MsrBitmapVirt || !g_VcpuData[i].HostStack ||
+            !g_VcpuData[i].TraceRing) {
                 DbgPrint("[HV] CPU %u allocation failed: vmxon=%u vmcs=%u "
-                         "msr_bitmap=%u host_stack=%u\n", i,
-                         g_VcpuData[i].VmxOnVirt ? 1U : 0U,
-                         g_VcpuData[i].VmcsVirt ? 1U : 0U,
-                         g_VcpuData[i].MsrBitmapVirt ? 1U : 0U,
-                         g_VcpuData[i].HostStack ? 1U : 0U);
+                          "msr_bitmap=%u host_stack=%u trace_ring=%u\n", i,
+                          g_VcpuData[i].VmxOnVirt ? 1U : 0U,
+                          g_VcpuData[i].VmcsVirt ? 1U : 0U,
+                          g_VcpuData[i].MsrBitmapVirt ? 1U : 0U,
+                          g_VcpuData[i].HostStack ? 1U : 0U,
+                          g_VcpuData[i].TraceRing ? 1U : 0U);
                 StopHypervisorInternal(true);
+                ReleaseHvCrashBlob();
                 return STATUS_INSUFFICIENT_RESOURCES;
         }
         DbgPrint("[HV] CPU %u allocations: vmxon_pa=0x%llX vmcs_pa=0x%llX "
@@ -4006,22 +4574,43 @@ extern "C" NTSTATUS StartHypervisor() {
                  reinterpret_cast<u64>(g_VcpuData[i].HostStack));
     }
 
-    // Start with the optional instruction set and atomically reduce it from
-    // every processor callback. Keep the guest-visible value at zero until
-    // all processors have finished entering VMX; otherwise an early guest
-    // exit could observe a capability that a later CPU removes.
+    // Phase A prepares every VMCS without entering the guest. Keep the guest
+    // visible optional profile at zero until both the prepare and commit
+    // barriers have completed.
+    g_HvLaunchCommit = 0;
     InterlockedExchange(&g_VmxGuestOptionalProfile,
                         0);
     InterlockedExchange(&g_VmxGuestOptionalProfileCandidate,
                         static_cast<LONG>(kGuestOptionalProfileMask));
     BroadcastToAllProcessorGroups(EnableHvCallback);
+    const u32 expected = ExpectedLaunchProcessorCount();
+    u32 prepared = 0;
+    for (u32 i = 0; i < g_ProcessorCount; ++i) {
+        if (g_VcpuData[i].State == VcpuVmxOn &&
+            g_VcpuData[i].LaunchStage == 4) {
+            ++prepared;
+        }
+    }
+    DbgPrint("[HV] Prepared %u/%u processors\n", prepared, expected);
+    if (prepared != expected) {
+        DbgPrint("[HV] StartHypervisor rejected during prepare phase\n");
+        StopHypervisorInternal(true);
+        ReleaseHvCrashBlob();
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    // Phase B commits the prepared transaction. The assembly wrapper skips
+    // C++ preparation and executes VMLAUNCH only after this publication.
+    MemoryBarrier();
+    g_HvLaunchCommit = 1;
+    BroadcastToAllProcessorGroups(EnableHvCallback);
+    g_HvLaunchCommit = 0;
     const ULONG candidateOptionalProfile =
         static_cast<ULONG>(InterlockedCompareExchange(
             &g_VmxGuestOptionalProfileCandidate, 0, 0));
     DbgPrint("[HV] guest optional VMX profile candidate=0x%X\n",
              candidateOptionalProfile);
 
-    const u32 expected = ExpectedLaunchProcessorCount();
     u32 ok = 0;
 
     for (u32 i = 0; i < g_ProcessorCount; i++) {
@@ -4073,6 +4662,7 @@ extern "C" NTSTATUS StartHypervisor() {
                 ok, expected);
 
         StopHypervisorInternal(true);
+        ReleaseHvCrashBlob();
         return STATUS_NOT_SUPPORTED;
     }
 
@@ -4181,6 +4771,9 @@ static void StopHypervisorInternal(bool startRollback) {
     }
 
     for (u32 i = 0; i < g_ProcessorCount; i++) {
+        if (startRollback) {
+            WriteHvTrace(&g_VcpuData[i], i, HvTraceEventRollbackDone);
+        }
         if (g_VcpuData[i].VmxOnVirt) {
             MmFreeContiguousMemory(g_VcpuData[i].VmxOnVirt);
         }
@@ -4193,6 +4786,9 @@ static void StopHypervisorInternal(bool startRollback) {
         if (g_VcpuData[i].HostStack) {
             ExFreePoolWithTag(g_VcpuData[i].HostStack, TAG_HVST);
         }
+        if (g_VcpuData[i].TraceRing) {
+            ExFreePoolWithTag(g_VcpuData[i].TraceRing, TAG_HVTR);
+        }
     }
     ExFreePoolWithTag(g_VcpuData, TAG_HV00);
     g_VcpuData = nullptr;
@@ -4200,6 +4796,8 @@ static void StopHypervisorInternal(bool startRollback) {
     g_HostCr3 = 0;
     g_VmxBasic = 0;
     g_VmxRequires32BitPhysicalAddress = false;
+    g_HvLaunchCommit = 0;
+    ReleaseHvCrashBlob();
     InterlockedExchange(&g_HvLifecycle, kHvLifecycleIdle);
 }
 

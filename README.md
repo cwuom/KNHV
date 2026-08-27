@@ -201,6 +201,22 @@ a recovery snapshot on a dedicated test machine. After the service reaches
 end-to-end VM-exit smoke test; `--stop` only stops a service that this process
 started.
 
+For isolated rollback testing, enable the deterministic fault hooks at
+configure time. `HV_TEST_FAIL_CPU` selects the logical processor and
+`HV_TEST_FAIL_STAGE` selects a stage from `HvFaultStage` in `src/vmm.cpp`:
+
+```powershell
+cmake --preset vscode-debug `
+  -DNESTED_HV_FAULT_INJECTION=ON `
+  -DHV_TEST_FAIL_CPU=19 `
+  -DHV_TEST_FAIL_STAGE=8
+cmake --build --preset vscode-debug
+```
+
+The hooks request a controlled abort or rollback; they do not emulate a
+hardware VM-entry failure. Run them only on an isolated target with KD and a
+recovery path.
+
 ## Driver signing
 
 The Run and Debug entries **Build and Sign SYS (Debug/Release)** and the tasks

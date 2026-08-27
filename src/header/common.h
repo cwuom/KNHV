@@ -14,6 +14,57 @@ using u8  = unsigned __int8;
 // constants
 constexpr u64 HYPERVISOR_MAGIC = 0x13371337;
 constexpr u64 VMCALL_UNLOAD    = 0xDEADBEEF;
+
+// The recorder is allocated before VMX starts and is written from IPI/root
+// paths without locks, allocation, formatting, or debugger output
+constexpr u32 HV_TRACE_RECORDS_PER_CPU = 512;
+constexpr u32 HV_TRACE_TAIL_RECORDS = 32;
+
+struct HvTraceRecord {
+    u64 Sequence;
+    u64 Tsc;
+    u32 Cpu;
+    u16 Lifecycle;
+    u16 Stage;
+    u32 Event;
+    u64 Arg0;
+    u64 Arg1;
+    u64 Arg2;
+    u64 Arg3;
+};
+
+static_assert(sizeof(HvTraceRecord) == 64,
+              "flight recorder records must remain fixed-size");
+
+enum HvTraceEvent : u32 {
+    HvTraceEventDriverEntry = 1,
+    HvTraceEventContractBegin = 2,
+    HvTraceEventContractOk = 3,
+    HvTraceEventContractFail = 4,
+    HvTraceEventCpuIpiEnter = 5,
+    HvTraceEventPreVmxon = 6,
+    HvTraceEventPostVmxon = 7,
+    HvTraceEventPreVmclear = 8,
+    HvTraceEventPostVmclear = 9,
+    HvTraceEventPreVmptrld = 10,
+    HvTraceEventPostVmptrld = 11,
+    HvTraceEventVmcsControlsDone = 12,
+    HvTraceEventVmcsHostDone = 13,
+    HvTraceEventVmcsGuestDone = 14,
+    HvTraceEventPreVmlaunch = 15,
+    HvTraceEventVmlaunchFail = 16,
+    HvTraceEventGuestStart = 17,
+    HvTraceEventVmexitEntry = 18,
+    HvTraceEventVmEntryFailure = 19,
+    HvTraceEventPreVmresume = 20,
+    HvTraceEventVmresumeFail = 21,
+    HvTraceEventTeardownRequest = 22,
+    HvTraceEventPreVmxoff = 23,
+    HvTraceEventPostVmxoff = 24,
+    HvTraceEventRollbackDone = 25,
+    HvTraceEventFatalSnapshot = 26,
+    HvTraceEventPreBugcheck = 27,
+};
 // these offsets belong to this software frame, not to CPU-specific VMCS fields
 // HvVmExitEntryPoint reserves the first 0x1000 bytes for XSAVE and starts the
 // GPR/GuestContext fields at offset 0x1000. Keep the limit in a shared header
@@ -169,6 +220,13 @@ struct VcpuContext {
     void* HostStack;
     u64   HostStackTop;
 
+    // Fixed-size nonpaged storage owned by this logical processor. The write
+    // index is monotonically increasing so readers can recover the newest
+    // records without taking a lock at bugcheck time
+    HvTraceRecord* TraceRing;
+    u32   TraceCapacity;
+    volatile __int64 TraceWriteIndex;
+
     // Per-CPU host state and VMX revision.  These values must be obtained on
     // the logical processor that executes VMXON; VMX capability MSRs are not
     // required to be identical across heterogeneous Intel packages.
@@ -255,6 +313,7 @@ struct VcpuContext {
     volatile u32 LastExitEntryFailure;
     volatile u64 LastLaunchFlags;
     volatile u64 LastVmResumeFlags;
+    volatile u64 LastVmInstructionRflags;
     volatile long LastExitAction;
     volatile long VmResumeAttempts;
     u64 LastExitInstructionLength;
@@ -279,6 +338,7 @@ struct VcpuContext {
     u32 LastIdtVectoringError;
     u64 LastGuestDr7;
     u64 LastGuestDebugctl;
+    u64 LastPtCtl;
     u64 LastGuestEfer;
     u64 LastGuestPat;
     u64 LastGuestXcr0;

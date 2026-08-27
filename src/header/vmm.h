@@ -20,6 +20,8 @@ extern "C" void StopHypervisor();
 extern "C" bool IsHypervisorStopComplete();
 extern "C" bool IsHypervisorQuarantined();
 extern "C" void QuarantineHypervisorImage();
+extern "C" bool RegisterSecondaryDumpCallback();
+extern "C" void UnregisterSecondaryDumpCallback();
 
 // Hardware/firmware gate implemented in main.cpp.  The gate is deliberately
 // read-only: it never changes IA32_FEATURE_CONTROL or otherwise claims VMX

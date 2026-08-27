@@ -351,6 +351,7 @@ bool IsVmxSupported() {
 void DriverUnload(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);
     DbgPrint("[HV] Unloading...\n");
+    UnregisterSecondaryDumpCallback();
     StopHypervisor();
     if (IsHypervisorStopComplete()) {
         DbgPrint("[HV] Stopped.\n");
@@ -379,9 +380,16 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     DriverObject->DriverUnload = DriverUnload;
 #endif
 
+    // Register before the VMX transaction starts so a failure during prepare
+    // or launch can still be exported through secondary dump data.
+    if (!RegisterSecondaryDumpCallback()) {
+        DbgPrint("[HV] Secondary dump callback registration failed; continuing without it\n");
+    }
+
     NTSTATUS status = StartHypervisor();
     if (!NT_SUCCESS(status)) {
         DbgPrint("[HV] Failed to start: 0x%X\n", status);
+        UnregisterSecondaryDumpCallback();
         StopHypervisor();
         return status;
     }

@@ -5,6 +5,9 @@
 extern VmExitHandler:proc
 extern PrepareHvCallback:proc
 extern AbortHvLaunch:proc
+extern HvTraceCurrentVcpuEvent:proc
+extern HvFaultInjectedCurrent:proc
+extern HvCaptureFatalSnapshotPreVmxoff:proc
 extern MarkCurrentVcpuLaunched:proc
 extern MarkCurrentVcpuParked:proc
 extern MarkCurrentVcpuTearingDown:proc
@@ -16,6 +19,7 @@ extern g_CetVmcsEnabled:byte
 extern g_XsavesEnabled:byte
 extern g_XstateMode:byte
 extern g_XsavesMask:qword
+extern g_HvLaunchCommit:byte
 
 MSR_FS_BASE     equ 0C0000100h
 MSR_GS_BASE     equ 0C0000101h
@@ -142,6 +146,14 @@ VMX_LAUNCH_SUCCESS_MAGIC equ 04C41554E43484544h
 VMX_LAUNCH_NOT_VMX_MAGIC equ 0BAD0000000000001h
 HYPERVISOR_MAGIC         equ 013371337h
 VMCALL_UNLOAD             equ 0DEADBEEFh
+
+HV_TRACE_PRE_VMLAUNCH    equ 15
+HV_TRACE_PRE_VMRESUME    equ 20
+HV_TRACE_PRE_VMXOFF      equ 23
+HV_TRACE_POST_VMXOFF     equ 24
+HV_TRACE_VMRESUME_FAIL   equ 21
+HV_FAULT_BEFORE_VMLAUNCH equ 8
+HV_FAULT_VMLAUNCH_FAIL  equ 9
 
 ; ------------------------------------------------------------------------------
 ; HvVmExitEntryPoint
@@ -417,6 +429,10 @@ vmxStateRestored:
     ; Keep rsp at the GuestContext until VMRESUME has definitively succeeded.
     ; A failed VMRESUME returns in VMX root with the same stack pointer; adding
     ; 1100h first would make the caller pass the host return stack as context.
+    mov ecx, HV_TRACE_PRE_VMRESUME
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     vmresume
     jc vmxResumeFailure
     jz vmxResumeFailure
@@ -462,6 +478,14 @@ vmxHaltHostMasksReady:
     shr rdx, 20h
     mov ecx, MSR_KERNEL_GS_BASE
     wrmsr
+    mov ecx, HV_TRACE_PRE_VMXOFF
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+    mov rcx, rsp
+    sub rsp, 20h
+    call HvCaptureFatalSnapshotPreVmxoff
+    add rsp, 20h
     sub rsp, 20h
     call MarkCurrentVcpuParked
     add rsp, 20h
@@ -469,6 +493,10 @@ vmxHaltHostMasksReady:
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
+    mov ecx, HV_TRACE_POST_VMXOFF
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     mov rcx, rsp
     sub rsp, 20h
     call HvFatalBugCheck
@@ -510,6 +538,10 @@ vmxResumeFailureHostMasksReady:
     mov rdx, rbx
     sub rsp, 20h
     call HandleVmResumeFailure
+    add rsp, 20h
+    mov ecx, HV_TRACE_VMRESUME_FAIL
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
     add rsp, 20h
     cmp qword ptr [rsp + CTX_HALT_VM], 0
     jne vmxHalt
@@ -726,8 +758,16 @@ restoreSpillCanonicalCompare:
     mov rbp, r9
 
     ; Leave VMX while all host MSRs and the host page table are still active.
+    mov ecx, HV_TRACE_PRE_VMXOFF
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     vmxoff
     mov r10, rbx
+    mov ecx, HV_TRACE_POST_VMXOFF
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     sub rsp, 20h
     call MarkCurrentVcpuStopped
     add rsp, 20h
@@ -923,6 +963,15 @@ restoreInvalidHostMasksReady:
     shr rdx, 20h
     mov ecx, MSR_KERNEL_GS_BASE
     wrmsr
+    mov ecx, HV_TRACE_PRE_VMXOFF
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+    mov rcx, r10
+    sub rsp, 20h
+    call HvCaptureFatalSnapshotPreVmxoff
+    add rsp, 20h
+    mov r10, rbx
     sub rsp, 20h
     call MarkCurrentVcpuParked
     add rsp, 20h
@@ -933,6 +982,10 @@ restoreInvalidHostMasksReady:
     mov rax, cr4
     btr rax, 0Dh
     mov cr4, rax
+    mov ecx, HV_TRACE_POST_VMXOFF
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
     mov rcx, r10
     sub rsp, 20h
     call HvFatalBugCheck
@@ -1154,8 +1207,9 @@ GuestStartThunk endp
 ; ------------------------------------------------------------------------------
 ; IPI launch wrapper
 ; ------------------------------------------------------------------------------
-; The C++ preparation routine performs all VMX setup and returns before entry.
-; This wrapper owns the call frame used as the initial guest stack.  A
+; Phase A calls the C++ preparation routine and returns with VMXON active.
+; Phase B reuses this wrapper to execute VMLAUNCH on already prepared CPUs.
+; The wrapper owns the call frame used as the initial guest stack. A
 ; successful GuestStartThunk RET therefore resumes at enableHvDone while VMX
 ; remains active, while a failed VMLAUNCH returns flags and is cleaned up by
 ; AbortHvLaunch.
@@ -1206,9 +1260,11 @@ EnableHvCallback proc frame
     .savexmm128 xmm15, 110h
     .endprolog
 
-    ; PrepareHvCallback(Context, GuestSp, GuestIp).  The future call to
-    ; HvLaunchGuest writes its return slot at [RSP-8]; pass that slot to the
+    ; Phase A: PrepareHvCallback(Context, GuestSp, GuestIp). The future call
+    ; to HvLaunchGuest writes its return slot at [RSP-8]; pass that slot to
     ; VMCS setup so the diagnostic guest RSP matches the VMX launch path.
+    cmp byte ptr [g_HvLaunchCommit], 0
+    jne launchCommit
     lea rdx, [rsp - 8]
     lea r8, GuestStartThunk
     call PrepareHvCallback
@@ -1217,6 +1273,28 @@ EnableHvCallback proc frame
     test al, al
     jz enableHvDone
 
+    ; Preparation is a transaction boundary. Do not enter the guest until
+    ; StartHypervisor has observed every participating CPU in VcpuVmxOn.
+    cmp byte ptr [g_HvLaunchCommit], 0
+    je enableHvDone
+
+launchCommit:
+    mov ecx, HV_TRACE_PRE_VMLAUNCH
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+    mov ecx, HV_FAULT_BEFORE_VMLAUNCH
+    sub rsp, 20h
+    call HvFaultInjectedCurrent
+    add rsp, 20h
+    test al, al
+    jnz injectedLaunchFailure
+    mov ecx, HV_FAULT_VMLAUNCH_FAIL
+    sub rsp, 20h
+    call HvFaultInjectedCurrent
+    add rsp, 20h
+    test al, al
+    jnz injectedLaunchFailure
     call HvLaunchGuest
     ; CMP r64, imm64 has no x86-64 encoding; materialize the 64-bit magic in
     ; a volatile register before comparing it.
@@ -1228,6 +1306,11 @@ EnableHvCallback proc frame
 
 launchFailed:
     mov rcx, rax
+    call AbortHvLaunch
+    jmp enableHvDone
+
+injectedLaunchFailure:
+    xor ecx, ecx
     call AbortHvLaunch
 
 enableHvDone:
