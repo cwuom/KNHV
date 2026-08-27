@@ -625,8 +625,15 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(VmWriteChecked\(GUEST_FS_BASE[\s\S]{0,180}Ctx->GuestFsBase\s*=\s*value\.QuadPart)");
   CheckPattern(state, "PAT writes update the PAT snapshot", vmm,
                R"(VmWriteChecked\(GUEST_PAT[\s\S]{0,180}Ctx->GuestPat\s*=\s*value\.QuadPart)");
-  CheckPattern(state, "guest XSS is installed before launch", vmm,
-               R"(WriteMsrSafe\(MSR_IA32_XSS\s*,\s*vcpu->GuestXss\)[\s\S]{0,1000}VMCS ready; entering VMLAUNCH)");
+  const std::size_t guest_xss_install =
+      vmm.find("!WriteMsrSafe(MSR_IA32_XSS, vcpu->GuestXss)");
+  const std::size_t launch_ready_log =
+      guest_xss_install == std::string::npos
+          ? std::string::npos
+          : vmm.find("VMCS ready; entering VMLAUNCH", guest_xss_install);
+  Check(state, "guest XSS is installed before launch",
+        guest_xss_install != std::string::npos &&
+            launch_ready_log > guest_xss_install);
   Check(state, "each CPU validates local XCR0 contract",
         vmm.find("localSupportedXcr0") != std::string::npos &&
             vmm.find("localXcr0 = _xgetbv(0)") != std::string::npos &&
@@ -752,11 +759,33 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                 "call PrepareHvCallback") != std::string::npos &&
             asm_source.substr(wrapper_begin, wrapper_end - wrapper_begin).find(
                  "test al, al") != std::string::npos);
-  Check(state, "launch wrapper has a prepare and commit phase",
-        asm_source.find("g_HvLaunchCommit") != std::string::npos &&
-            asm_source.find("launchCommit:") != std::string::npos &&
-            vmm.find("prepared") != std::string::npos &&
-            vmm.find("g_HvLaunchCommit = 1") != std::string::npos);
+  Check(state, "launch snapshot and VMLAUNCH share one IPI callback",
+        wrapper_begin != std::string::npos && wrapper_end > wrapper_begin &&
+            asm_source.substr(wrapper_begin, wrapper_end - wrapper_begin).find(
+                "call PrepareHvCallback") != std::string::npos &&
+            asm_source.substr(wrapper_begin, wrapper_end - wrapper_begin).find(
+                "call HvLaunchGuest") != std::string::npos &&
+            asm_source.find("g_HvLaunchCommit") == std::string::npos);
+  const std::size_t start_begin =
+      vmm.find("extern \"C\" NTSTATUS StartHypervisor()");
+  const std::size_t start_end =
+      vmm.find("static bool HasParkedVcpu()", start_begin);
+  const std::string launch_start_source =
+      start_begin != std::string::npos && start_end > start_begin
+          ? vmm.substr(start_begin, start_end - start_begin)
+          : std::string{};
+  const std::size_t launch_broadcast =
+      launch_start_source.find("BroadcastToAllProcessorGroups(EnableHvCallback)");
+  Check(state, "startup uses one stateful launch rendezvous",
+        launch_broadcast != std::string::npos &&
+            launch_start_source.find(
+                "BroadcastToAllProcessorGroups(EnableHvCallback)",
+                launch_broadcast + 1) == std::string::npos);
+  Check(state, "incomplete live XSS fails before VMXON",
+        launch_start_source.find("g_HostXssMask != g_XsavesMask") !=
+                std::string::npos &&
+            launch_start_source.find("g_HostXssMask != g_GuestXssWriteMask") !=
+                std::string::npos);
   Check(state, "fault injection stages are compile-time gated",
         vmm.find("enum HvFaultStage") != std::string::npos &&
             vmm.find("HV_TEST_FAIL_CPU") != std::string::npos &&

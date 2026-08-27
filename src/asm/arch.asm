@@ -19,7 +19,6 @@ extern g_CetVmcsEnabled:byte
 extern g_XsavesEnabled:byte
 extern g_XstateMode:byte
 extern g_XsavesMask:qword
-extern g_HvLaunchCommit:byte
 
 MSR_FS_BASE     equ 0C0000100h
 MSR_GS_BASE     equ 0C0000101h
@@ -1207,9 +1206,8 @@ GuestStartThunk endp
 ; ------------------------------------------------------------------------------
 ; IPI launch wrapper
 ; ------------------------------------------------------------------------------
-; Phase A calls the C++ preparation routine and returns with VMXON active.
-; Phase B reuses this wrapper to execute VMLAUNCH on already prepared CPUs.
-; The wrapper owns the call frame used as the initial guest stack. A
+; The wrapper performs VMXON, dynamic state capture, and VMLAUNCH in one IPI
+; callback. The wrapper owns the call frame used as the initial guest stack. A
 ; successful GuestStartThunk RET therefore resumes at enableHvDone while VMX
 ; remains active, while a failed VMLAUNCH returns flags and is cleaned up by
 ; AbortHvLaunch.
@@ -1260,11 +1258,9 @@ EnableHvCallback proc frame
     .savexmm128 xmm15, 110h
     .endprolog
 
-    ; Phase A: PrepareHvCallback(Context, GuestSp, GuestIp). The future call
-    ; to HvLaunchGuest writes its return slot at [RSP-8]; pass that slot to
-    ; VMCS setup so the diagnostic guest RSP matches the VMX launch path.
-    cmp byte ptr [g_HvLaunchCommit], 0
-    jne launchCommit
+    ; PrepareHvCallback(Context, GuestSp, GuestIp). The future call to
+    ; HvLaunchGuest writes its return slot at [RSP-8]; pass that slot to VMCS
+    ; setup so the dynamic guest RSP matches the VMX launch path.
     lea rdx, [rsp - 8]
     lea r8, GuestStartThunk
     call PrepareHvCallback
@@ -1273,12 +1269,8 @@ EnableHvCallback proc frame
     test al, al
     jz enableHvDone
 
-    ; Preparation is a transaction boundary. Do not enter the guest until
-    ; StartHypervisor has observed every participating CPU in VcpuVmxOn.
-    cmp byte ptr [g_HvLaunchCommit], 0
-    je enableHvDone
-
-launchCommit:
+    ; Do not return to Windows after PrepareHvCallback. It captured the live
+    ; callback state and installed guest IA32_XSS for this immediate entry.
     mov ecx, HV_TRACE_PRE_VMLAUNCH
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent

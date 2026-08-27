@@ -82,7 +82,6 @@ static constexpr LONG kHvLifecycleStarting = 1;
 static constexpr LONG kHvLifecycleRunning = 2;
 static constexpr LONG kHvLifecycleStopping = 3;
 static constexpr LONG kHvLifecycleQuarantined = 4;
-extern "C" volatile u8 g_HvLaunchCommit = 0;
 static u64 g_VmxBasic = 0;
 // VMX host CR3 must always reference the kernel/system address space.  A
 // KeIpiGenericCall callback may run while the interrupted thread belongs to a
@@ -2893,7 +2892,7 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                             // Do not advertise XSAVES/XRSTORS when the
                             // compacted supervisor-state path is unavailable.
                             regs[0] &= ~(1 << 3);  // XSAVES
-                            regs[0] &= ~(1 << 4);  // XRSTORS
+                        regs[0] &= ~(1 << 4);  // XFD
                             regs[2] &= static_cast<int>(0xFFFFFFFFULL &
                                                         static_cast<u32>(guestXssMask));
                             regs[3] &= static_cast<int>(guestXssMask >> 32);
@@ -4244,18 +4243,27 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             return 0;
         }
 
-        // VMX does not virtualize IA32_XSS. Enter the guest with the
-        // restricted mask; the VM-exit stub switches back to HostXss before
-        // calling C++ and restores this guest mask before VMRESUME.
-        if (g_XsavesEnabled && !WriteMsrSafe(MSR_IA32_XSS, vcpu->GuestXss)) {
-            HV_VERBOSE_PRINT("[HV] CPU %u failed to install guest IA32_XSS=0x%llX\n",
-                             id, vcpu->GuestXss);
-            HvVmxOff();
-            (void)WriteMsrSafe(MSR_IA32_XSS, vcpu->HostXss);
-            __writecr0(vcpu->OriginalCr0);
-            __writecr4(vcpu->OriginalCr4);
-            InterlockedExchange(&vcpu->State, VcpuFailed);
-            return 0;
+        // VMX does not virtualize IA32_XSS. This callback proceeds directly
+        // to VMLAUNCH, so guest XSS is installed only after the live state is
+        // captured and never survives a return to Windows in VMX root mode.
+        if (g_XsavesEnabled) {
+            u64 currentXss = 0;
+            if (!ReadMsrSafe(MSR_IA32_XSS, &currentXss) ||
+                currentXss != vcpu->HostXss ||
+                !WriteMsrSafe(MSR_IA32_XSS, vcpu->GuestXss)) {
+                WriteHvTrace(vcpu, id, HvTraceEventContractFail,
+                             currentXss, vcpu->HostXss, vcpu->GuestXss);
+                HV_VERBOSE_PRINT("[HV] CPU %u IA32_XSS transition rejected: "
+                                 "current=0x%llX host=0x%llX guest=0x%llX\n",
+                                 id, currentXss, vcpu->HostXss,
+                                 vcpu->GuestXss);
+                HvVmxOff();
+                (void)WriteMsrSafe(MSR_IA32_XSS, vcpu->HostXss);
+                __writecr0(vcpu->OriginalCr0);
+                __writecr4(vcpu->OriginalCr4);
+                InterlockedExchange(&vcpu->State, VcpuFailed);
+                return 0;
+            }
         }
 
         // The wrapper publishes Launched only after GuestStartThunk returns
@@ -4412,7 +4420,6 @@ extern "C" NTSTATUS StartHypervisor() {
         return STATUS_DEVICE_BUSY;
     }
     auto rejectStart = [](NTSTATUS status) -> NTSTATUS {
-        g_HvLaunchCommit = 0;
         InterlockedCompareExchange(&g_HvLifecycle,
                                    kHvLifecycleIdle,
                                    kHvLifecycleStarting);
@@ -4424,6 +4431,18 @@ extern "C" NTSTATUS StartHypervisor() {
     // VMX capability, and IA32_FEATURE_CONTROL checks.
     if (!IsVmxSupported()) {
         DbgPrint("[HV] StartHypervisor rejected by the VMX capability gate\n");
+        return rejectStart(STATUS_NOT_SUPPORTED);
+    }
+    // A guest begins with the interrupted Windows XSTATE. Do not enter VMX
+    // while any live IA32_XSS component is absent from either the fixed save
+    // frame or the guest-visible selector. Supporting that case requires a
+    // complete component virtualization contract, not a masked launch value.
+    if (g_XsavesEnabled &&
+        (g_HostXssMask != g_XsavesMask ||
+         g_HostXssMask != g_GuestXssWriteMask)) {
+        DbgPrint("[HV] StartHypervisor rejected: IA32_XSS requires full "
+                 "preservation host=0x%llX frame=0x%llX guest=0x%llX\n",
+                 g_HostXssMask, g_XsavesMask, g_GuestXssWriteMask);
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
     DbgPrint("[HV] StartHypervisor: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
@@ -4574,37 +4593,15 @@ extern "C" NTSTATUS StartHypervisor() {
                  reinterpret_cast<u64>(g_VcpuData[i].HostStack));
     }
 
-    // Phase A prepares every VMCS without entering the guest. Keep the guest
-    // visible optional profile at zero until both the prepare and commit
-    // barriers have completed.
-    g_HvLaunchCommit = 0;
+    // VMXON, the live Windows snapshot, guest XSS installation, and VMLAUNCH
+    // must remain in one IPI callback. A second stateful rendezvous would
+    // resume Windows between capture and VM entry, leaving stale VMCS state.
     InterlockedExchange(&g_VmxGuestOptionalProfile,
                         0);
     InterlockedExchange(&g_VmxGuestOptionalProfileCandidate,
                         static_cast<LONG>(kGuestOptionalProfileMask));
     BroadcastToAllProcessorGroups(EnableHvCallback);
     const u32 expected = ExpectedLaunchProcessorCount();
-    u32 prepared = 0;
-    for (u32 i = 0; i < g_ProcessorCount; ++i) {
-        if (g_VcpuData[i].State == VcpuVmxOn &&
-            g_VcpuData[i].LaunchStage == 4) {
-            ++prepared;
-        }
-    }
-    DbgPrint("[HV] Prepared %u/%u processors\n", prepared, expected);
-    if (prepared != expected) {
-        DbgPrint("[HV] StartHypervisor rejected during prepare phase\n");
-        StopHypervisorInternal(true);
-        ReleaseHvCrashBlob();
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    // Phase B commits the prepared transaction. The assembly wrapper skips
-    // C++ preparation and executes VMLAUNCH only after this publication.
-    MemoryBarrier();
-    g_HvLaunchCommit = 1;
-    BroadcastToAllProcessorGroups(EnableHvCallback);
-    g_HvLaunchCommit = 0;
     const ULONG candidateOptionalProfile =
         static_cast<ULONG>(InterlockedCompareExchange(
             &g_VmxGuestOptionalProfileCandidate, 0, 0));
@@ -4796,7 +4793,6 @@ static void StopHypervisorInternal(bool startRollback) {
     g_HostCr3 = 0;
     g_VmxBasic = 0;
     g_VmxRequires32BitPhysicalAddress = false;
-    g_HvLaunchCommit = 0;
     ReleaseHvCrashBlob();
     InterlockedExchange(&g_HvLifecycle, kHvLifecycleIdle);
 }
