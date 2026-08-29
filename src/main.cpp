@@ -14,7 +14,7 @@ extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
 #define HV_PASSIVE_PRINT(...) \
     do { \
         if (KeGetCurrentIrql() == PASSIVE_LEVEL) { \
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, __VA_ARGS__); \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, __VA_ARGS__); \
         } \
     } while (0)
 

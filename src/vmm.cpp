@@ -219,13 +219,15 @@ static VmxControlGeneration SelectVmxControlGeneration(u32 profile) {
 }
 // Detailed messages are emitted only from passive-level code. Root/IPI paths
 // use the binary recorder so enabling diagnostics cannot stall all processors.
-extern "C" volatile LONG g_HvVerboseLogging = 0;
+extern "C" volatile LONG g_HvVerboseLogging = 1;
+
 #define HV_PASSIVE_PRINT(...) \
     do { \
         if (KeGetCurrentIrql() == PASSIVE_LEVEL) { \
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, __VA_ARGS__); \
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, __VA_ARGS__); \
         } \
     } while (0)
+
 #define HV_VERBOSE_PRINT(...) \
     do { \
         if (g_HvVerboseLogging != 0) { \
