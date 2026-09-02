@@ -316,11 +316,10 @@ static constexpr u64 kVmxHostStackAlignment = 0x40;
 // so one processor cannot hide the other results
 static constexpr bool kUseHyperDbgGenericLaunch = false;
 
-// HyperDbg's launch callback returns after the VMX handoff and does not issue
-// a synthetic CPUID from the newly launched guest. Keep the probe available
-// for an explicit bring-up build, but leave the production path free of this
-// extra VM-exit and VMRESUME cycle.
-static constexpr bool kEnableLaunchFirstExitProbe = false;
+// validate one CPUID exit and VMRESUME before the coordinator launches the
+// next processor. This keeps a broken first-exit path from being propagated
+// to every logical processor during late-launch bring-up.
+static constexpr bool kEnableLaunchFirstExitProbe = true;
 
 static __forceinline bool ShouldLaunchOnThisProcessor(u32 id) {
     if (!kDebugSingleCpu && kReserveCoordinatorCpu &&
@@ -5075,12 +5074,11 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // Host State Configuration
     // ==============================================================================
     SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseHostState);
-    VmWriteChecked(HOST_CR0, hostCr0);
-
-    // set host CR3 to system directory table base
-    VmWriteChecked(HOST_CR3, hostCr3);
-
-    VmWriteChecked(HOST_CR4, hostCr4);
+    if (!VmWriteChecked(HOST_CR0, hostCr0) ||
+        !VmWriteChecked(HOST_CR3, hostCr3) ||
+        !VmWriteChecked(HOST_CR4, hostCr4)) {
+        return false;
+    }
 
     // host selectors
     VmWriteChecked(HOST_CS_SELECTOR, csSelector & 0xFFF8);
@@ -5107,6 +5105,9 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // host RIP/RSP (exit handler)
     VmWriteChecked(HOST_RSP, Vcpu->HostStackTop);
     VmWriteChecked(HOST_RIP, reinterpret_cast<u64>(HvVmExitEntryPoint));
+    if (InterlockedCompareExchange(&mutableVcpu->VmcsWriteFailed, 0, 0) != 0) {
+        return false;
+    }
 
     // CET supervisor state is loaded by VM-exit/VM-entry controls rather than
     // by XSAVES.  Keep the host and initial guest copies identical; later

@@ -1239,9 +1239,9 @@ HvVmPtrLd proc
 HvVmPtrLd endp
 
 HvVmWrite proc
-    ; vmwrite takes the value first and the VMCS field second
+    ; ml64 uses Intel operand order: VMCS field first, value second
     ; Win64 passes Field in RCX and Value in RDX
-    vmwrite rdx, rcx
+    vmwrite rcx, rdx
     pushfq
     pop rax
     ret
