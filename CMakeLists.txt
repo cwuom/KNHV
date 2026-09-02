@@ -60,6 +60,57 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(WDK REQUIRED)
 
+# CMake launched outside a Visual Studio developer shell does not always
+# populate MSVC's implicit standard-header search path. Derive the compiler
+# include directory instead of relying on process-global INCLUDE variables.
+set(_nested_hv_toolchain_includes "")
+set(_nested_hv_user_toolchain_libdirs "")
+if(MSVC AND CMAKE_CXX_COMPILER)
+    get_filename_component(_nested_hv_msvc_bin
+                           "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_nested_hv_msvc_host_bin
+                           "${_nested_hv_msvc_bin}" DIRECTORY)
+    get_filename_component(_nested_hv_msvc_bin_root
+                           "${_nested_hv_msvc_host_bin}" DIRECTORY)
+    get_filename_component(_nested_hv_msvc_root
+                           "${_nested_hv_msvc_bin_root}" DIRECTORY)
+    set(_nested_hv_msvc_include "${_nested_hv_msvc_root}/include")
+    if(EXISTS "${_nested_hv_msvc_include}")
+        list(APPEND _nested_hv_toolchain_includes
+             "${_nested_hv_msvc_include}")
+    endif()
+    set(_nested_hv_msvc_lib "${_nested_hv_msvc_root}/lib/x64")
+    if(EXISTS "${_nested_hv_msvc_lib}")
+        list(APPEND _nested_hv_user_toolchain_libdirs
+             "${_nested_hv_msvc_lib}")
+    endif()
+endif()
+if(WDK_INC_VERSION AND
+   EXISTS "${WDK_ROOT}/Include/${WDK_INC_VERSION}/ucrt")
+    list(APPEND _nested_hv_toolchain_includes
+         "${WDK_ROOT}/Include/${WDK_INC_VERSION}/ucrt")
+endif()
+if(WDK_INC_VERSION)
+    foreach(_nested_hv_wdk_user_subdir IN ITEMS shared um)
+        set(_nested_hv_wdk_user_include
+            "${WDK_ROOT}/Include/${WDK_INC_VERSION}/${_nested_hv_wdk_user_subdir}")
+        if(EXISTS "${_nested_hv_wdk_user_include}")
+            list(APPEND _nested_hv_toolchain_includes
+                 "${_nested_hv_wdk_user_include}")
+        endif()
+    endforeach()
+endif()
+if(WDK_LIB_VERSION)
+    foreach(_nested_hv_wdk_user_lib_subdir IN ITEMS um ucrt)
+        set(_nested_hv_wdk_user_lib
+            "${WDK_ROOT}/Lib/${WDK_LIB_VERSION}/${_nested_hv_wdk_user_lib_subdir}/x64")
+        if(EXISTS "${_nested_hv_wdk_user_lib}")
+            list(APPEND _nested_hv_user_toolchain_libdirs
+                 "${_nested_hv_wdk_user_lib}")
+        endif()
+    endforeach()
+endif()
+
 option(NESTED_HV_SIGN "Sign the driver as a post-build step" OFF)
 option(NESTED_HV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
 option(NESTED_HV_FAULT_INJECTION
@@ -84,7 +135,18 @@ set(SOURCES
         src/header/vmx.h
 )
 
+# The MSVC toolchain may populate these variables with user-mode CRT libraries.
+# Capture them for the contract test, but keep them empty while the WDK driver
+# target is created so NODEFAULTLIB remains effective at link time.
+set(_nested_hv_saved_c_standard_libraries "${CMAKE_C_STANDARD_LIBRARIES}")
+set(_nested_hv_saved_cxx_standard_libraries "${CMAKE_CXX_STANDARD_LIBRARIES}")
+set(CMAKE_C_STANDARD_LIBRARIES "")
+set(CMAKE_CXX_STANDARD_LIBRARIES "")
 wdk_add_driver(Nested_HV ${SOURCES})
+if(_nested_hv_toolchain_includes)
+    target_include_directories(Nested_HV SYSTEM BEFORE PRIVATE
+                               ${_nested_hv_toolchain_includes})
+endif()
 
 # A kernel image has no user-mode CRT.  An empty runtime property prevents
 # CMake from adding /MDd or /MD to the WDK target
@@ -165,11 +227,27 @@ endif()
 if(NESTED_HV_BUILD_TESTS)
     enable_testing()
     add_executable(Nested_HV_ContractTests tests/vmx_contract_test.cpp)
+    if(_nested_hv_toolchain_includes)
+        target_include_directories(Nested_HV_ContractTests SYSTEM BEFORE PRIVATE
+                                   ${_nested_hv_toolchain_includes})
+    endif()
+    if(_nested_hv_user_toolchain_libdirs)
+        target_link_directories(Nested_HV_ContractTests PRIVATE
+                                ${_nested_hv_user_toolchain_libdirs})
+    endif()
     target_compile_definitions(Nested_HV_ContractTests PRIVATE
             NESTED_HV_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_options(Nested_HV_ContractTests PRIVATE
             /W4 /EHsc /GR /GS /permissive- /std:c++17)
     target_link_libraries(Nested_HV_ContractTests PRIVATE advapi32 wintrust)
+    if(_nested_hv_saved_cxx_standard_libraries)
+        set(_nested_hv_test_standard_libraries
+            "${_nested_hv_saved_cxx_standard_libraries}")
+        separate_arguments(_nested_hv_test_standard_libraries WINDOWS_COMMAND
+                           "${_nested_hv_test_standard_libraries}")
+        target_link_libraries(Nested_HV_ContractTests PRIVATE
+                              ${_nested_hv_test_standard_libraries})
+    endif()
     add_test(NAME Nested_HV_ContractTests
             COMMAND Nested_HV_ContractTests --root "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

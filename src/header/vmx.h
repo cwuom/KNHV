@@ -221,16 +221,27 @@
 #define VM_ENTRY_INTR_INFO_VALID                 (1UL << 31)
 #define VM_ENTRY_INTR_INFO_DELIVER_ERROR_CODE   (1UL << 11)
 #define VM_ENTRY_INTR_TYPE_HARDWARE_EXCEPTION   (3UL << 8)
+#define VMX_EXCEPTION_VECTOR_DOUBLE_FAULT        8U
+#define VMX_EXCEPTION_BITMAP_DOUBLE_FAULT        \
+    (1UL << VMX_EXCEPTION_VECTOR_DOUBLE_FAULT)
 #define VM_EXIT_REASON_EXTERNAL_INTERRUPT       1
 #define VM_EXIT_REASON_TRIPLE_FAULT              2
 #define VM_EXIT_REASON_CPUID                    10
+#define VM_EXIT_REASON_GETSEC                   11
 #define VM_EXIT_REASON_HLT                      12
+#define VM_EXIT_REASON_INVD                     13
 #define VM_EXIT_REASON_INVLPG                   14
+#define VM_EXIT_REASON_RDPMC                   15
+#define VM_EXIT_REASON_RDTSC                   16
 #define VM_EXIT_REASON_VMCALL                   18
 #define VM_EXIT_REASON_CR_ACCESS                28
 #define VM_EXIT_REASON_RDMSR                    31
 #define VM_EXIT_REASON_WRMSR                    32
 #define VM_EXIT_REASON_INVALID_GUEST_STATE      33
+#define VM_EXIT_REASON_MSR_LOADING              34
+#define VM_EXIT_REASON_MACHINE_CHECK            41
+#define VM_EXIT_REASON_INVEPT                   50
+#define VM_EXIT_REASON_INVVPID                  53
 // VMX instructions are intentionally not virtualized (nested virtualization
 // is outside this driver's scope).  If a non-root instruction reaches the
 // exit handler, inject the architectural #UD rather than treating it as an

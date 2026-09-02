@@ -16,8 +16,9 @@ Designed for research and educational purposes, it transitions the running opera
   state-preservation capabilities are unavailable; nested virtualization is
   intentionally disabled.
 * **All-core production mode**: Launches the validated contract on every
-  active logical processor by default; the single-CPU switch is reserved for
-  explicit bring-up builds.
+  participating logical processor by default while keeping one coordinator
+  processor native for the late-load debugger rendezvous; the single-CPU
+  switch is reserved for explicit bring-up builds.
 * **Generation-aware VMX contract**: Selects legacy/true controls and the
   available secondary, tertiary, XSAVES, CET, RDTSCP, and INVPCID capabilities
   per processor. The save-frame and CET transition contracts remain global,
@@ -59,12 +60,12 @@ hidden when a single P/E core cannot safely pass them through. FRED and LKGS
 remain hidden, and guest writes that attempt to enable `CR4.FRED` are rejected
 because this build retains the legacy VM-exit event-delivery contract.
 
-The MASM `VMWRITE` wrapper follows the Intel encoding contract: `ModRM.reg`
-contains the VMCS field and `ModRM.r/m` contains the value. With
+The MASM `VMWRITE` wrapper follows the Intel operand contract: the source value
+is in `ModRM.reg` and the VMCS field is in `ModRM.r/m`. With
 `HvVmWrite(Field, Value)` on the Windows x64 ABI, `RCX=Field`, `RDX=Value`, and
-the instruction is `vmwrite rcx, rdx` (`0F 79 CA`). `VMREAD` remains
+the instruction is `vmwrite rdx, rcx` (`0F 79 D1`). `VMREAD` remains
 `vmread destination, field`; the contract test checks both forms and the
-object-level encoding can be verified with `tools/Verify-VmwriteEncoding.ps1`.
+object-level encoding.
 
 The debugger log is staged by contract and processor. `[HV] XSTATE contract`
 and `[HV] VMX control contract` describe the feature gate and selected
@@ -72,6 +73,13 @@ generation profile, `CPU <n> VMCS` records per-processor VMX setup and launch
 values, and the first 16 VM-exits per processor include reason, RIP, RSP,
 qualification, and flags. Fatal or unsupported exits print the guest CR3/CR4;
 only a context that passes the native teardown checks is resumed, while an
+initial VM-entry masks `RFLAGS.IF` until the HyperDbg-style launch thunk has
+left its private frame; the original flag is then restored with an `STI`
+interrupt shadow. This prevents a late-load interrupt from overwriting the
+saved return frame. If `VM_EXIT_IDT_VECTORING_INFO` reports an in-flight event,
+the monitor keeps the event snapshot and enters the same fail-stop diagnostic
+path instead of silently clearing it and issuing `VMRESUME`; event reinjection
+and interrupt-window queues are intentionally not claimed by this build.
 unsafe context takes the documented bugcheck path.
 
 ## Scope

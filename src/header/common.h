@@ -68,6 +68,8 @@ enum HvTraceEvent : u32 {
     HvTraceEventFatalSnapshotComplete = 29,
     HvTraceEventFatalParked = 30,
     HvTraceEventFatalVmexit = 31,
+    HvTraceEventFirstExitProbe = 32,
+    HvTraceEventCr3LaunchContract = 33,
 };
 // these offsets belong to this software frame, not to CPU-specific VMCS fields
 // HvVmExitEntryPoint reserves the first 0x1000 bytes for XSAVE and starts the
@@ -105,6 +107,10 @@ constexpr u64 VMX_LAUNCH_SUCCESS_MAGIC = 0x4C41554E43484544ULL; // "LAUNCHED"
 // Returned by the defensive launch guard when CR4.VMXE is already clear. The
 // caller must not interpret this value as VMX instruction flags.
 constexpr u64 VMX_LAUNCH_NOT_VMX_MAGIC = 0xBAD0000000000001ULL;
+// Returned when the pre-entry lifecycle marker cannot publish VcpuLaunched.
+// The launch wrapper must roll back VMX without interpreting this value as
+// VMfailValid or VMfailInvalid flags.
+constexpr u64 VMX_LAUNCH_MARKER_FAILURE_MAGIC = 0xBAD0000000000002ULL;
 
 enum VcpuState : long {
     VcpuUninitialized = 0,
@@ -120,10 +126,46 @@ enum VcpuState : long {
     VcpuTearingDown   = 7,
 };
 
+// VMCS ownership is tracked separately from the lifecycle state because a
+// launch failure can leave VMX root active between two lifecycle updates
+enum VmcsCurrentState : long {
+    VmcsCurrentStateNone = 0,
+    VmcsCurrentStateActive = 1,
+    VmcsCurrentStateClearing = 2,
+    VmcsCurrentStateFailed = 3,
+};
+
+// Intel exposes a hybrid core type through CPUID leaf 1A. Keep the branch
+// explicit so a VMX profile selected on a P-core is never silently reused as
+// an assumption about an E-core or an older legacy processor.
+enum IntelCpuBranch : u32 {
+    IntelCpuBranchUnknown = 0,
+    IntelCpuBranchLegacy = 1,
+    IntelCpuBranchModern = 2,
+    IntelCpuBranchHybridPerformance = 3,
+    IntelCpuBranchHybridEfficient = 4,
+    IntelCpuBranchHybridUnknown = 5,
+};
+
 enum HvFatalSnapshotCommitState : long {
     HvFatalSnapshotEmpty = 0,
     HvFatalSnapshotWriting = 1,
     HvFatalSnapshotCommitted = 2,
+};
+
+// these bits describe which VMCS values are meaningful in the software
+// snapshot. Intel leaves most VM-exit fields unchanged on a VM-entry failure,
+// so a zero value alone cannot distinguish a real zero from an unknown value
+enum HvVmcsDiagnosticValidity : u64 {
+    HvVmcsValidityNone = 0,
+    HvVmcsValidityExitReason = 1ULL << 0,
+    HvVmcsValidityExitQualification = 1ULL << 1,
+    HvVmcsValidityExitInstructionLength = 1ULL << 2,
+    HvVmcsValidityEventState = 1ULL << 3,
+    HvVmcsValidityGuestState = 1ULL << 4,
+    HvVmcsValidityVmInstructionError = 1ULL << 5,
+    HvVmcsValidityVmcsReadFailure = 1ULL << 6,
+    HvVmcsValidityVmcsReadback = 1ULL << 7,
 };
 
 // 记录原生拆除被拒绝的具体契约原因，供崩溃后的离线分析使用
@@ -262,6 +304,14 @@ struct VcpuContext {
     // the logical processor that executes VMXON; VMX capability MSRs are not
     // required to be identical across heterogeneous Intel packages.
     u64   HostCr3;
+    // capture raw and normalized CR3 values at the VMCS boundary so a
+    // late-launch failure can distinguish KPTI or PCID state from a bad VMCS
+    // write without relying on debugger output from a DPC
+    u64   LaunchRawGuestCr3;
+    u64   LaunchGuestCr3;
+    u64   LaunchRawHostCr3;
+    u64   LaunchHostCr3;
+    u64   LaunchCr3Metadata;
     u64   OriginalCr0;
     u64   OriginalCr4;
     u64   VmxBasic;
@@ -270,7 +320,17 @@ struct VcpuContext {
     // save contract is global, while optional VMX controls are local so
     // heterogeneous P/E cores can choose their own safe control set.
     u32   VmxProfile;
+    // CPUID identity captured on the processor that owns VMXON. These fields
+    // are diagnostic and also select the generation-specific control branch.
+    u32   CpuFamily;
+    u32   CpuModel;
+    u32   CpuStepping;
+    u32   CpuCoreType;
+    u32   CpuBranch;
     volatile long VmcsWriteFailed;
+    // 0 means no writer, 1 means diagnostics are being published, and 2
+    // means the first failing VMWRITE record is complete
+    volatile long VmcsWriteState;
     volatile long VmcsReadFailed;
     volatile long VmcsSetupPhase;
     u64   FirstVmcsWriteField;
@@ -280,6 +340,7 @@ struct VcpuContext {
     u64   FirstVmcsReadFlags;
     u64   LastVmclearFlags;
     u64   LastVmptrldFlags;
+    volatile long VmcsCurrent;
     u64   PrimaryControlsCapability;
     u64   TertiaryControlsAllowed;
 
@@ -322,6 +383,10 @@ struct VcpuContext {
     // from the non-returning VMXOFF and IRET transition
     volatile long TeardownQuiesced;
 
+    // only the authenticated stop rendezvous may authorize the native
+    // teardown marker in the assembly return path
+    volatile long TeardownRequest;
+
     // State is published with InterlockedExchange so lifecycle callbacks can
     // inspect it without taking a lock at IPI_LEVEL.
     volatile long State;
@@ -335,13 +400,33 @@ struct VcpuContext {
     // can report the first failures without flooding the kernel debugger.
     volatile long VmExitCount;
 
+    // The staged launch DPC arms this token immediately before a private
+    // CPUID.  The VM-exit handler publishes one immutable result, and the
+    // DPC only reports success after the CPUID instruction has returned.
+    volatile long FirstExitProbeState;
+    volatile long FirstExitProbeBaselineVmExits;
+    volatile long FirstExitProbeBaselineVmResumes;
+    volatile long FirstExitProbeObservedVmExits;
+    volatile long FirstExitProbeObservedVmResumes;
+    volatile long FirstExitProbeReason;
+    volatile long FirstExitProbeAction;
+    volatile u64 FirstExitProbeResumeFlags;
+
     // These fields are a passive-level diagnostic snapshot.  They are written
     // by the owning processor and read only after an IPI rendezvous completes.
     volatile long LaunchStage;
+    // This checkpoint identifies the last local contract block reached before
+    // a launch failure. It is separate from the lifecycle stage used by stop.
+    volatile long LaunchCheckStage;
     volatile long LastExitReason;
     volatile u32 LastExitReasonRaw;
     volatile u32 LastExitReasonBasic;
     volatile u32 LastExitEntryFailure;
+    // For RDMSR and WRMSR exits this is the guest ECX value. Keep it beside
+    // the raw reason so a transport loss still identifies the intercepted MSR.
+    volatile u32 LastExitMsrIndex;
+    u32 LastExitMsrReserved;
+    u64 LastExitMsrValue;
     volatile u64 LastLaunchFlags;
     volatile u64 LastVmResumeFlags;
     volatile u64 LastVmInstructionRflags;
@@ -363,10 +448,17 @@ struct VcpuContext {
     u32 LastGuestTrAr;
     u32 LastGuestInterruptibility;
     u32 LastGuestActivity;
+    // VM-entry and VM-exit interruption fields are captured before the exit
+    // handler clears the one-shot VM-entry request
+    u32 LastVmEntryIntrInfo;
+    u32 LastVmEntryIntrError;
+    u32 LastVmEntryInstructionLength;
     u32 LastVmExitIntrInfo;
     u32 LastVmExitIntrError;
     u32 LastIdtVectoringInfo;
     u32 LastIdtVectoringError;
+    u32 LastGuestPendingDbgExceptions;
+    volatile long LastEventSnapshotValid;
     u64 LastGuestDr7;
     u64 LastGuestDebugctl;
     u64 LastPtCtl;
@@ -378,15 +470,41 @@ struct VcpuContext {
     u64 LastGuestSsp;
     u64 LastGuestInterruptSspTable;
     u64 LastVmInstructionError;
+    // a validity mask accompanies the diagnostic values because VM-entry
+    // failure leaves most VM-exit information fields unmodified
+    volatile u64 VmcsDiagnosticValidity;
 
     // The first fatal VMCS image is immutable after Committed is published.
     // Interlocked operations provide the release/acquire boundary; root paths
     // must not depend on allocation, locks, formatting, or debugger output.
     volatile long FatalSnapshotCommitState;
     volatile long NativeTeardownRejectMask;
+
+    // vmcs readback mismatches are distinct from failed VMREAD instructions
+    // keep a first-wins record so a bad field encoding or width conversion is
+    // rejected before VMLAUNCH and remains diagnosable after the callback
+    // returns to passive level
+    volatile long VmcsReadState;
+    u64   FirstVmcsReadError;
+    volatile long VmcsValueMismatch;
+    volatile long VmcsMismatchState;
+    u64   FirstVmcsMismatchField;
+    u64   FirstVmcsMismatchExpected;
+    u64   FirstVmcsMismatchActual;
+    u64   FirstVmcsMismatchMask;
 };
 
 static_assert((offsetof(VcpuContext, FatalSnapshotCommitState) % alignof(long)) == 0,
               "fatal snapshot commit state must be naturally aligned");
 static_assert((offsetof(VcpuContext, NativeTeardownRejectMask) % alignof(long)) == 0,
               "native teardown reject mask must be naturally aligned");
+static_assert((offsetof(VcpuContext, FirstExitProbeState) % alignof(long)) == 0,
+              "first exit probe state must be naturally aligned");
+static_assert((offsetof(VcpuContext, FirstExitProbeResumeFlags) % alignof(u64)) == 0,
+              "first exit probe flags must be naturally aligned");
+static_assert((offsetof(VcpuContext, VmcsReadState) % alignof(long)) == 0,
+              "vmcs read state must be naturally aligned");
+static_assert((offsetof(VcpuContext, VmcsMismatchState) % alignof(long)) == 0,
+              "vmcs mismatch state must be naturally aligned");
+static_assert((offsetof(VcpuContext, VmcsDiagnosticValidity) % alignof(u64)) == 0,
+              "vmcs diagnostic validity must be naturally aligned");

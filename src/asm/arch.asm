@@ -13,12 +13,14 @@ extern g_HvLaunchAssemblyEntered:dword
 extern g_HvLaunchGuestEntered:dword
 extern g_HvLaunchVmlaunchIssued:dword
 extern g_HvLaunchVmlaunchReturned:dword
-extern g_HvLaunchGuestStarted:dword
 extern g_HvLaunchVmExitAsmReached:dword
+extern g_HvVmExitDebugHold:dword
 extern AbortHvLaunch:proc
 extern HvTraceCurrentVcpuEvent:proc
 extern HvFaultInjectedCurrent:proc
 extern HvCaptureFatalSnapshotPreVmxoff:proc
+extern HvClearCurrentVmcsAndRecord:proc
+extern HvFailVmcsClear:proc
 extern MarkCurrentVcpuLaunched:proc
 extern MarkCurrentVcpuParked:proc
 extern MarkCurrentVcpuTearingDown:proc
@@ -54,10 +56,8 @@ XSTATE_SAVE_FXSAVE equ 0
 XSTATE_SAVE_XSAVE  equ 1
 XSTATE_SAVE_XSAVES equ 2
 
-; VMCS fields used by the launch thunk.  The values are the architectural
+; VMCS fields read by the VM-exit path.  The values are the architectural
 ; encodings from Intel SDM Vol. 3C, Table B-1.
-VMCS_GUEST_RSP  equ 0681Ch
-VMCS_GUEST_RIP  equ 0681Eh
 VMCS_GUEST_DR7  equ 0681Ah
 VMCS_GUEST_DEBUGCTL equ 02802h
 
@@ -120,7 +120,7 @@ HOST_DR7_FRAME_SLOT   equ 01158h
 HOST_DEBUGCTL_FRAME_SLOT equ 01160h
 
 ; HvRestoreStateAndReturn stages state in a 100h-byte spill below the
-; five-qword IRETQ frame so it cannot overlap the active guest stack
+; three-qword ring-0 IRETQ frame so it cannot overlap the active guest stack
 ; The stack pointer itself remains the only address used after loading guest
 ; CR3, so the host VM-exit stack is never dereferenced there
 RST_RAX         equ 000h
@@ -154,6 +154,7 @@ RST_RING        equ 0C0h
 ; on by this stub; the caller should compare the complete value first.
 VMX_LAUNCH_SUCCESS_MAGIC equ 04C41554E43484544h
 VMX_LAUNCH_NOT_VMX_MAGIC equ 0BAD0000000000001h
+VMX_LAUNCH_MARKER_FAILURE_MAGIC equ 0BAD0000000000002h
 HYPERVISOR_MAGIC         equ 013371337h
 VMCALL_UNLOAD             equ 0DEADBEEFh
 
@@ -176,9 +177,11 @@ HvVmExitEntryPoint proc
     ; before allocating the private frame so an IRQ cannot enter the kernel
     ; while RSP still points at the VMX host stack.
     cli
+
     cmp dword ptr [g_HvLaunchVmExitAsmReached], 0
     jne vmExitAsmRecorded
     lock bts dword ptr [g_HvLaunchVmExitAsmReached], 0
+
 vmExitAsmRecorded:
     ; 1180h is this driver's fixed frame size and is independent of VMCS
     ; encodings; the capability gate keeps the XSAVE area below 1000h.
@@ -296,7 +299,10 @@ vmxDebugStateReady:
     or rax, r15
     mov rdx, rax
     shr rdx, 20h
-    xsaves [rsp]
+    ; use the 64-bit operand-size form explicitly.  The unsuffixed MASM
+    ; mnemonic emits the 32-bit XSAVE format in long mode, which does not
+    ; preserve the 64-bit x87 environment used by the Windows kernel
+    xsaves64 [rsp]
     jmp short vmxStateSaved
 
 vmxSaveXsave:
@@ -304,7 +310,7 @@ vmxSaveXsave:
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
-    xsave [rsp]
+    xsave64 [rsp]
 
     jmp short vmxStateSaved
 
@@ -365,6 +371,14 @@ vmxGuestStateCommit:
     ; The handler ran with the host XCR0/XSS contract. Restore the complete
     ; host-saved state first, then switch to the guest mask. This keeps state
     ; for components the guest temporarily disabled from leaking across exits.
+    ; A fatal handler cannot provide a valid guest XSTATE image. Do not load
+    ; guest-selected XCR0/XSS values on the park or native-teardown branches:
+    ; an invalid mask would raise #GP in VMX root before the diagnostic path
+    ; can leave VMX.
+    cmp qword ptr [rsp + CTX_HALT_VM], 0
+    jne vmxStateRestored
+    cmp qword ptr [rsp + CTX_ABORT_VM], 0
+    jne vmxStateRestored
     cmp byte ptr [g_XstateMode], XSTATE_SAVE_FXSAVE
     je vmxRestoreFxsave
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
@@ -388,7 +402,7 @@ vmxGuestStateCommit:
     or rax, r15
     mov rdx, rax
     shr rdx, 20h
-    xrstors [rsp]
+    xrstors64 [rsp]
     mov rax, [rsp + CTX_GUEST_XSS]
     mov rdx, rax
     shr rdx, 20h
@@ -405,7 +419,7 @@ vmxRestoreXsave:
     mov rax, [rsp + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
-    xrstor [rsp]
+    xrstor64 [rsp]
 
     mov rax, [rsp + CTX_GUEST_XCR0]
     mov rdx, rax
@@ -419,6 +433,15 @@ vmxRestoreFxsave:
     fxrstor64 [rsp]
 
 vmxStateRestored:
+
+vmExitDebugHoldLoop:
+    cmp dword ptr [g_HvVmExitDebugHold], 0
+    je vmExitDebugHoldDone
+    pause
+    jmp vmExitDebugHoldLoop
+
+vmExitDebugHoldDone:
+
     ; Windows x64 C/C++ code requires DF=0.  RFLAGS (including the guest's
     ; original DF) is restored by VMRESUME or the IRET teardown path, so this
     ; only normalizes the temporary VMX-root execution context.
@@ -524,6 +547,11 @@ vmxHaltHostMasksReady:
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
     add rsp, 20h
+    sub rsp, 20h
+    call HvClearCurrentVmcsAndRecord
+    add rsp, 20h
+    test al, al
+    jz vmxHaltVmclearFailed
     vmxoff
     jc vmxHaltVmxoffFailed
     jz vmxHaltVmxoffFailed
@@ -544,6 +572,11 @@ vmxHaltVmxoffFailed:
     bts rdx, 3Fh
     xor eax, eax
     lock cmpxchg qword ptr [g_HvVmxOffFailureFlagsAsm], rdx
+    jmp vmxHaltBugCheck
+vmxHaltVmclearFailed:
+    sub rsp, 20h
+    call HvFailVmcsClear
+    add rsp, 20h
 vmxHaltBugCheck:
     mov rcx, rsp
     sub rsp, 20h
@@ -643,6 +676,16 @@ teardownHostMasksReady:
     sub rsp, 20h
     call MarkCurrentVcpuTearingDown
     add rsp, 20h
+    test al, al
+    jnz teardownMarkerAuthorized
+    ; An authenticated VMCALL is not enough by itself.  If the stop
+    ; rendezvous did not publish the one-shot owner token, leave through the
+    ; diagnostic park path instead of manufacturing a native IRET frame.
+    mov r10, rbx
+    mov qword ptr [r10 + CTX_ABORT_VM], 0
+    mov qword ptr [r10 + CTX_HALT_VM], 1
+    jmp restoreInvalid
+teardownMarkerAuthorized:
     mov r10, rbx
 
     mov r11, [r10 + CTX_GUEST_RSP]
@@ -708,10 +751,12 @@ restoreRipCanonicalCompare:
     ; than manufacturing an IRET frame that could fault under KPTI.
     jmp restoreInvalid
 
-    ; In 64-bit mode IRETQ consumes the complete interrupt frame, including
-    ; RSP and SS even for a same-CPL target. Keep all five slots contiguous.
+    ; In 64-bit mode a same-CPL IRETQ consumes only RIP, CS, and RFLAGS. The
+    ; RSP and SS slots are consumed only when the return changes privilege.
+    ; This path is restricted to ring 0, so keep exactly three slots; adding
+    ; the outer-privilege slots would leave the caller stack 10h bytes low.
 restoreRing0:
-    lea r8, [r11 - 28h]                   ; complete IRETQ frame
+    lea r8, [r11 - 18h]                   ; ring-0 IRETQ frame
     lea r9, [r8 - 100h]                   ; guest stack spill area
 
     ; Subtracting from a canonical RSP can cross the sign boundary or wrap.
@@ -755,8 +800,6 @@ restoreFrameReady:
     mov [r8 + 00h], r14
     mov [r8 + 08h], r12
     mov [r8 + 10h], r15
-    mov [r8 + 18h], r11
-    mov [r8 + 20h], r13
 
     mov rax, [r10 + CTX_RAX]
     mov [r9 + RST_RAX], rax
@@ -809,6 +852,11 @@ restoreFrameReady:
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
     add rsp, 20h
+    sub rsp, 20h
+    call HvClearCurrentVmcsAndRecord
+    add rsp, 20h
+    test al, al
+    jz teardownVmclearFailed
     vmxoff
     jc teardownVmxoffFailed
     jz teardownVmxoffFailed
@@ -816,9 +864,6 @@ restoreFrameReady:
     mov ecx, HV_TRACE_POST_VMXOFF
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
-    add rsp, 20h
-    sub rsp, 20h
-    call MarkCurrentVcpuStopped
     add rsp, 20h
     mov r10, rbx
     mov r9, rbp
@@ -883,8 +928,9 @@ restoreFrameReady:
     xsetbv
     cmp byte ptr [g_XsavesEnabled], 0
     je restoreGuestXsave
-    ; Use the fixed compacted layout for teardown as well, then expose the
-    ; guest selector after XRSTORS has restored CET_U state.
+    ; Use the fixed compacted layout for teardown as well.  This path returns
+    ; to the interrupted Windows context, so restore its current guest XSS
+    ; selector after XRSTORS rather than discarding a legal selector change.
     mov r15, qword ptr [g_XsavesMask]
     mov r14, r15
     shr r14, 20h
@@ -896,7 +942,7 @@ restoreFrameReady:
     or rax, r15
     mov rdx, rax
     shr rdx, 20h
-    xrstors [r10]
+    xrstors64 [r10]
     mov rax, [r10 + CTX_GUEST_XSS]
     mov rdx, rax
     shr rdx, 20h
@@ -913,7 +959,7 @@ restoreGuestXsave:
     mov rax, [r10 + HOST_XCR0_FRAME_SLOT]
     mov rdx, rax
     shr rdx, 20h
-    xrstor [r10]
+    xrstor64 [r10]
 
     mov rax, [r10 + CTX_GUEST_XCR0]
     mov rdx, rax
@@ -1018,6 +1064,12 @@ teardownVmxoffFailedLoop:
     hlt
     jmp teardownVmxoffFailedLoop
 
+teardownVmclearFailed:
+    sub rsp, 20h
+    call HvFailVmcsClear
+    add rsp, 20h
+    jmp teardownVmxoffFailedLoop
+
 restoreInvalid:
     ; There is no safe architectural return for malformed state.  Park this
     ; processor with interrupts disabled instead of executing a guessed RET or
@@ -1076,6 +1128,11 @@ restoreInvalidHostMasksReady:
     ; the park callback may clobber volatile R10
     ; restore the frame pointer before VMXOFF and the fatal diagnostic call
     mov r10, rbx
+    sub rsp, 20h
+    call HvClearCurrentVmcsAndRecord
+    add rsp, 20h
+    test al, al
+    jz restoreInvalidVmclearFailed
     vmxoff
     jc restoreInvalidVmxoffFailed
     jz restoreInvalidVmxoffFailed
@@ -1095,6 +1152,11 @@ restoreInvalidVmxoffFailed:
     bts rdx, 3Fh
     xor eax, eax
     lock cmpxchg qword ptr [g_HvVmxOffFailureFlagsAsm], rdx
+    jmp restoreInvalidBugCheck
+restoreInvalidVmclearFailed:
+    sub rsp, 20h
+    call HvFailVmcsClear
+    add rsp, 20h
 restoreInvalidBugCheck:
     mov r10, rbx
     mov rcx, r10
@@ -1162,6 +1224,13 @@ HvVmClear proc
     ret
 HvVmClear endp
 
+HvVmPtrSt proc
+    vmptrst qword ptr [rcx]
+    pushfq
+    pop rax
+    ret
+HvVmPtrSt endp
+
 HvVmPtrLd proc
     vmptrld qword ptr [rcx]
     pushfq
@@ -1170,9 +1239,9 @@ HvVmPtrLd proc
 HvVmPtrLd endp
 
 HvVmWrite proc
-    ; Intel VMWRITE uses ModRM.reg for the VMCS field and ModRM.r/m for value
+    ; Intel VMWRITE takes the value first and the VMCS field second
     ; Win64 passes Field in RCX and Value in RDX
-    vmwrite rcx, rdx
+    vmwrite rdx, rcx
     pushfq
     pop rax
     ret
@@ -1191,10 +1260,9 @@ vmreadFailed:
 HvVmReadChecked endp
 
 HvLaunchGuest proc frame
-    ; Keep the caller return slot at the top of a private area.  The VMXOFF
-    ; restore path builds an IRET frame and a register spill below guest RSP.
-    ; Without this reservation those writes would corrupt the IPI dispatcher
-    ; stack before the guest RET reaches the wrapper continuation.
+    ; Keep a private failure stack so a VMfailValid/VMfailInvalid return cannot
+    ; overwrite the caller's shadow space. Guest RIP/RSP are prepared once by
+    ; SetupVmcs and are intentionally not rewritten in this final transition.
     sub rsp, 200h
     .allocstack 200h
     .endprolog
@@ -1206,36 +1274,11 @@ HvLaunchGuest proc frame
     test rax, CR4_VMXE
     jz launchNotVmx
 
-    ; GuestStartThunk executes a RET.  The call to HvLaunchGuest has already
-    ; pushed the wrapper continuation at [RSP+200h]; point guest RSP at that
-    ; return slot so the successful VM-entry returns to enableHvDone exactly
-    ; as the original call would.  The call return slot is exactly [RSP+200h]
-    ; after this thunk's private stack reservation.
-    mov rax, rsp
-    add rax, 200h
-    mov ecx, VMCS_GUEST_RSP
-    mov rdx, rax
-    vmwrite rcx, rdx
-    jc launchVmwriteFailure
-    jz launchVmwriteFailure
-
-    lea rdx, GuestStartThunk
-    mov ecx, VMCS_GUEST_RIP
-    vmwrite rcx, rdx
-    jc launchVmwriteFailure
-    jz launchVmwriteFailure
-
     lock inc dword ptr [g_HvLaunchVmlaunchIssued]
     vmlaunch
     pushfq
     pop rax
     lock inc dword ptr [g_HvLaunchVmlaunchReturned]
-    add rsp, 200h
-    ret
-
-launchVmwriteFailure:
-    pushfq
-    pop rax
     add rsp, 200h
     ret
 
@@ -1341,89 +1384,114 @@ Success:
 HvGetSegmentAr endp
 
 ; ------------------------------------------------------------------------------
-; Guest Start Thunk
+; guest start and restore thunk
 ; ------------------------------------------------------------------------------
+; HyperDbg keeps the initial guest stack as a complete register frame.  The
+; VMCS guest RIP points here, so a successful VM-entry restores the interrupted
+; DPC context and returns to the original caller without executing C++ code in
+; VMX non-root mode.
 GuestStartThunk proc
-    ; VMLAUNCH does not return through the HvLaunchGuest call frame. Returning
-    ; directly to that frame's continuation leaves the monitor active and lets
-    ; the IPI wrapper return to Windows in VMX non-root mode. StopHypervisor()
-    ; later uses the reserved VMCALL path to leave VMX on each processor.
-    pushfq
-    lock inc dword ptr [g_HvLaunchGuestStarted]
+    ; Keep this thunk side-effect free under the guest CR3. HyperDbg's restore
+    ; path only touches the launch frame before returning to Windows; the first
+    ; real VM-exit records guest entry after host state is available.
+    movdqu xmm6, xmmword ptr [rsp + 020h]
+    movdqu xmm7, xmmword ptr [rsp + 030h]
+    movdqu xmm8, xmmword ptr [rsp + 040h]
+    movdqu xmm9, xmmword ptr [rsp + 050h]
+    movdqu xmm10, xmmword ptr [rsp + 060h]
+    movdqu xmm11, xmmword ptr [rsp + 070h]
+    movdqu xmm12, xmmword ptr [rsp + 080h]
+    movdqu xmm13, xmmword ptr [rsp + 090h]
+    movdqu xmm14, xmmword ptr [rsp + 0A0h]
+    movdqu xmm15, xmmword ptr [rsp + 0B0h]
+    ldmxcsr [rsp + 0C0h]
+    add rsp, 100h
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    ; keep the launch frame protected until RSP points at the caller frame
+    ; restore all saved flags except IF, then use STI's one-instruction shadow
+    ; so the stack transition completes before a maskable interrupt is taken
+    bt qword ptr [rsp], 9
+    jnc guestStartWithoutInterrupts
+    btr qword ptr [rsp], 9
     popfq
-    mov rax, VMX_LAUNCH_SUCCESS_MAGIC
+    sti
+    add rsp, 08h
+    ret
+guestStartWithoutInterrupts:
+    popfq
+    add rsp, 08h
     ret
 GuestStartThunk endp
 
 ; ------------------------------------------------------------------------------
 ; IPI launch wrapper
 ; ------------------------------------------------------------------------------
-; The wrapper performs VMXON, dynamic state capture, and VMLAUNCH in one IPI
-; callback. The wrapper owns the call frame used as the initial guest stack. A
-; successful GuestStartThunk RET therefore resumes at enableHvDone while VMX
-; remains active, while a failed VMLAUNCH returns flags and is cleaned up by
-; AbortHvLaunch.
-EnableHvCallback proc frame
-    ; Entry RSP points at the IPI dispatcher's return address.  148h keeps the
-    ; stack aligned for calls and reserves 0A0h bytes for XMM6-XMM15, which are
-    ; nonvolatile in the Windows x64 ABI (entry is +8, subtracting 148h yields
-    ; 0 mod 16).
-    ; [RSP..1Fh] is the mandatory Windows x64 shadow space; nonvolatile saves
-    ; start at 40h so a C++ callee cannot overwrite them.
-    sub rsp, 148h
-    .allocstack 148h
-    mov [rsp + 40h], rbx
-    .savereg rbx, 40h
-    mov [rsp + 48h], rbp
-    .savereg rbp, 48h
-    mov [rsp + 50h], rsi
-    .savereg rsi, 50h
-    mov [rsp + 58h], rdi
-    .savereg rdi, 58h
-    mov [rsp + 60h], r12
-    .savereg r12, 60h
-    mov [rsp + 68h], r13
-    .savereg r13, 68h
-    mov [rsp + 70h], r14
-    .savereg r14, 70h
-    mov [rsp + 78h], r15
-    .savereg r15, 78h
-    movdqu xmmword ptr [rsp + 080h], xmm6
-    .savexmm128 xmm6, 080h
-    movdqu xmmword ptr [rsp + 090h], xmm7
-    .savexmm128 xmm7, 090h
-    movdqu xmmword ptr [rsp + 0A0h], xmm8
-    .savexmm128 xmm8, 0A0h
-    movdqu xmmword ptr [rsp + 0B0h], xmm9
-    .savexmm128 xmm9, 0B0h
-    movdqu xmmword ptr [rsp + 0C0h], xmm10
-    .savexmm128 xmm10, 0C0h
-    movdqu xmmword ptr [rsp + 0D0h], xmm11
-    .savexmm128 xmm11, 0D0h
-    movdqu xmmword ptr [rsp + 0E0h], xmm12
-    .savexmm128 xmm12, 0E0h
-    movdqu xmmword ptr [rsp + 0F0h], xmm13
-    .savexmm128 xmm13, 0F0h
-    movdqu xmmword ptr [rsp + 100h], xmm14
-    .savexmm128 xmm14, 100h
-    movdqu xmmword ptr [rsp + 110h], xmm15
-    .savexmm128 xmm15, 110h
-    .endprolog
+; Keep the save/restore frame identical to HyperDbg's AsmVmxSaveState model:
+; an alignment slot, RFLAGS, every GPR, and a private XMM area.  VMLAUNCH
+; failure returns through this frame; success enters GuestStartThunk and never
+; executes the wrapper's C++ tail in VMX non-root mode.
+EnableHvCallback proc
+    push 0
+    pushfq
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 100h
 
-    ; PrepareHvCallback(Context, GuestSp, GuestIp). The future call to
-    ; HvLaunchGuest writes its return slot at [RSP-8]; pass that slot to VMCS
-    ; setup so the dynamic guest RSP matches the VMX launch path.
-    lea rdx, [rsp - 8]
+    ; Keep the first 20h bytes as the Windows x64 shadow space for PrepareHvCallback.
+    movdqu xmmword ptr [rsp + 020h], xmm6
+    movdqu xmmword ptr [rsp + 030h], xmm7
+    movdqu xmmword ptr [rsp + 040h], xmm8
+    movdqu xmmword ptr [rsp + 050h], xmm9
+    movdqu xmmword ptr [rsp + 060h], xmm10
+    movdqu xmmword ptr [rsp + 070h], xmm11
+    movdqu xmmword ptr [rsp + 080h], xmm12
+    movdqu xmmword ptr [rsp + 090h], xmm13
+    movdqu xmmword ptr [rsp + 0A0h], xmm14
+    movdqu xmmword ptr [rsp + 0B0h], xmm15
+    stmxcsr [rsp + 0C0h]
+
+    ; The original Context is the saved RCX at +168h.  GuestSp is the frame
+    ; base, exactly as in HyperDbg's AsmVmxSaveState implementation.
+    mov rcx, [rsp + 168h]
+    lea rdx, [rsp]
     lea r8, GuestStartThunk
     lock inc dword ptr [g_HvLaunchAssemblyEntered]
+    ; the launch frame doubles as the guest stack, so its first 20h bytes are
+    ; not the caller-owned shadow space required by the Win64 ABI
+    ; move the call area below the frame to keep C++ home slots out of saved XMM state
+    sub rsp, 20h
     call PrepareHvCallback
-    ; PrepareHvCallback is an explicit ULONG contract. Test the low byte as
-    ; well so older binaries that still return a C++ bool fail closed.
+    add rsp, 20h
     test al, al
-    jz enableHvDone
+    jz enableHvRestore
 
-    ; Do not return to Windows after PrepareHvCallback. It captured the live
-    ; callback state and installed guest IA32_XSS for this immediate entry.
     mov ecx, HV_TRACE_PRE_VMLAUNCH
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
@@ -1440,45 +1508,66 @@ EnableHvCallback proc frame
     add rsp, 20h
     test al, al
     jnz injectedLaunchFailure
-    call HvLaunchGuest
-    ; CMP r64, imm64 has no x86-64 encoding; materialize the 64-bit magic in
-    ; a volatile register before comparing it.
-    mov rdx, VMX_LAUNCH_SUCCESS_MAGIC
-    cmp rax, rdx
-    jne launchFailed
+    ; HyperDbg publishes the per-CPU launched state immediately before
+    ; VMLAUNCH because a successful instruction never returns to this frame.
+    ; A VMfail path returns here and is then rolled back by AbortHvLaunch.
+    sub rsp, 20h
     call MarkCurrentVcpuLaunched
-    jmp enableHvDone
-
-launchFailed:
+    add rsp, 20h
+    test al, al
+    jz launchMarkerFailure
+    sub rsp, 20h
+    call HvLaunchGuest
+    add rsp, 20h
     mov rcx, rax
+    sub rsp, 20h
     call AbortHvLaunch
-    jmp enableHvDone
+    add rsp, 20h
+    jmp enableHvRestore
 
 injectedLaunchFailure:
     xor ecx, ecx
+    sub rsp, 20h
     call AbortHvLaunch
+    add rsp, 20h
+    jmp enableHvRestore
 
-enableHvDone:
-    mov rbx, [rsp + 40h]
-    mov rbp, [rsp + 48h]
-    mov rsi, [rsp + 50h]
-    mov rdi, [rsp + 58h]
-    mov r12, [rsp + 60h]
-    mov r13, [rsp + 68h]
-    mov r14, [rsp + 70h]
-    mov r15, [rsp + 78h]
-    movdqu xmm6, xmmword ptr [rsp + 080h]
-    movdqu xmm7, xmmword ptr [rsp + 090h]
-    movdqu xmm8, xmmword ptr [rsp + 0A0h]
-    movdqu xmm9, xmmword ptr [rsp + 0B0h]
-    movdqu xmm10, xmmword ptr [rsp + 0C0h]
-    movdqu xmm11, xmmword ptr [rsp + 0D0h]
-    movdqu xmm12, xmmword ptr [rsp + 0E0h]
-    movdqu xmm13, xmmword ptr [rsp + 0F0h]
-    movdqu xmm14, xmmword ptr [rsp + 100h]
-    movdqu xmm15, xmmword ptr [rsp + 110h]
-    xor eax, eax
-    add rsp, 148h
+launchMarkerFailure:
+    mov rcx, VMX_LAUNCH_MARKER_FAILURE_MAGIC
+    sub rsp, 20h
+    call AbortHvLaunch
+    add rsp, 20h
+
+enableHvRestore:
+    movdqu xmm6, xmmword ptr [rsp + 020h]
+    movdqu xmm7, xmmword ptr [rsp + 030h]
+    movdqu xmm8, xmmword ptr [rsp + 040h]
+    movdqu xmm9, xmmword ptr [rsp + 050h]
+    movdqu xmm10, xmmword ptr [rsp + 060h]
+    movdqu xmm11, xmmword ptr [rsp + 070h]
+    movdqu xmm12, xmmword ptr [rsp + 080h]
+    movdqu xmm13, xmmword ptr [rsp + 090h]
+    movdqu xmm14, xmmword ptr [rsp + 0A0h]
+    movdqu xmm15, xmmword ptr [rsp + 0B0h]
+    ldmxcsr [rsp + 0C0h]
+    add rsp, 100h
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    popfq
+    add rsp, 08h
     ret
 EnableHvCallback endp
 

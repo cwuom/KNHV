@@ -19,7 +19,7 @@ extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
     } while (0)
 
 static constexpr const char* kDriverContractTag =
-    "PT-HIDDEN-XSTATE-V12-TRIPLEFAULT-FAILSTOP-VMEXIT-NO-DBGPRINT-TARGETED-DEADLINE-CRASH-FIRST-CETU-PASSTHRU-DUMP-LAUNCH-FLIGHTREC-XSS-PRESERVE-FRED-SUBLEAF1-CET-HIDDEN";
+    "PT-HIDDEN-XSTATE-V38-TRIPLEFAULT-FAILSTOP-VMEXIT-NO-DBGPRINT-TARGETED-DEADLINE-CRASH-FIRST-CETU-PASSTHRU-DUMP-LAUNCH-FLIGHTREC-XSS-PRESERVE-FRED-SUBLEAF1-CET-HIDDEN-HYPERDBG-FULL-FRAME-STAGED-COORDINATOR-NATIVE-HOSTSTACK-LASTBYTE-KD-COMPACT-VMWRITE-FIELD-VALUE-RAW-VALUE-FIELD-CR4-SHADOW-IF-HANDOFF-PT-VMXMISC-DPC-RETURN-CR3-GUESTCR4-CET-WP-FIRSTEXIT-CPUID-PROBE-IDT-VECTORING-FAILSTOP-CR3-FLIGHTREC";
 static constexpr ULONG kHvFatalBugCheck = 0x48564D58UL;
 static constexpr ULONG_PTR kHvFatalUnloadIncomplete = 0x554E4C44ULL;
 static constexpr ULONG_PTR kHvFatalUnloadCallbackState = 0x43425354ULL;
@@ -85,6 +85,15 @@ bool IsVmxSupported() {
              maxBasicLeaf, static_cast<ULONG>(cpuInfo[1]),
              static_cast<ULONG>(cpuInfo[3]), static_cast<ULONG>(cpuInfo[2]));
     if (maxBasicLeaf < 1) return RejectVmx("CPUID basic leaf 1 is unavailable");
+
+    // VMX is an Intel architectural contract.  Do this check before any
+    // capability MSR access so a spoofed or non-Intel CPUID cannot reach
+    // VMX_BASIC and turn an unsupported instruction into a fatal fault.
+    const bool genuineIntel =
+        static_cast<u32>(cpuInfo[1]) == 0x756E6547U &&
+        static_cast<u32>(cpuInfo[3]) == 0x49656E69U &&
+        static_cast<u32>(cpuInfo[2]) == 0x6C65746EU;
+    if (!genuineIntel) return RejectVmx("CPUID vendor is not GenuineIntel");
 
     __cpuidex(cpuInfo, 1, 0);
     const bool fxsrEnumerated = (static_cast<u32>(cpuInfo[3]) &
@@ -443,6 +452,5 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
         return STATUS_SUCCESS;
     }
 
-    HV_PASSIVE_PRINT("[HV] VMX monitor started on all active processors.\n");
     return STATUS_SUCCESS;
 }
