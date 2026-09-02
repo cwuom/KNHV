@@ -127,6 +127,46 @@ static_assert(offsetof(GuestContextLayout, GuestDr7) == 0x1130);
 static_assert(offsetof(GuestContextLayout, GuestDebugctl) == 0x1138);
 static_assert(sizeof(GuestContextLayout) <= 0x1178);
 
+// Keep the MSR bitmap calculation independent from the driver so a policy
+// change cannot silently move a bit to the wrong VMX region
+struct MsrBitmapModel {
+  static constexpr std::size_t kBitmapBytes = 0x1000;
+  std::array<std::uint8_t, kBitmapBytes> bytes{};
+
+  static bool Resolve(std::uint32_t msr, bool write,
+                      std::size_t& byte_offset, std::uint8_t& bit_mask) {
+    std::uint32_t normalized = msr;
+    std::uint32_t region = 0;
+    if (msr <= 0x1FFFU) {
+      region = write ? 0x800U : 0x000U;
+    } else if (msr >= 0xC0000000U && msr <= 0xC0001FFFU) {
+      region = write ? 0xC00U : 0x400U;
+      normalized -= 0xC0000000U;
+    } else {
+      return false;
+    }
+    byte_offset = static_cast<std::size_t>(
+        region + ((normalized & 0x1FFFU) >> 3));
+    bit_mask = static_cast<std::uint8_t>(1U << (normalized & 7U));
+    return byte_offset < kBitmapBytes;
+  }
+
+  bool Set(std::uint32_t msr, bool write) {
+    std::size_t byte_offset = 0;
+    std::uint8_t bit_mask = 0;
+    if (!Resolve(msr, write, byte_offset, bit_mask)) return false;
+    bytes[byte_offset] |= bit_mask;
+    return true;
+  }
+
+  bool IsSet(std::uint32_t msr, bool write) const {
+    std::size_t byte_offset = 0;
+    std::uint8_t bit_mask = 0;
+    return Resolve(msr, write, byte_offset, bit_mask) &&
+           (bytes[byte_offset] & bit_mask) != 0;
+  }
+};
+
 struct TestState {
   int passed = 0;
   int failed = 0;
@@ -225,6 +265,27 @@ bool ContainsUtf16Le(const std::string& bytes, std::string_view needle) {
         match = false;
         break;
       }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+bool ContainsBytes(const std::string& bytes,
+                   std::initializer_list<std::uint8_t> needle) {
+  if (needle.empty() || bytes.size() < needle.size()) return false;
+  for (std::size_t offset = 0;
+       offset + needle.size() <= bytes.size(); ++offset) {
+    std::size_t index = 0;
+    bool match = true;
+    for (const std::uint8_t expected : needle) {
+      const auto actual = static_cast<std::uint8_t>(
+          static_cast<unsigned char>(bytes[offset + index]));
+      if (actual != expected) {
+        match = false;
+        break;
+      }
+      ++index;
     }
     if (match) return true;
   }
@@ -409,10 +470,38 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                         {"LastVmEntryInstructionLength", "EntryInstructionLength",
                          "VmEntryInstructionLength"}));
   Check(state, "crash blob carries VMXOFF failure flags",
-        vmm.find("kHvCrashBlobVersion = 10") != std::string::npos &&
+        vmm.find("kHvCrashBlobVersion = 11") != std::string::npos &&
             vmm.find("VmxOffFailureFlags") != std::string::npos &&
             vmm.find("g_HvVmxOffFailureFlagsAsm") != std::string::npos &&
             vmm.find("InterlockedCompareExchange64") != std::string::npos);
+  Check(state, "crash blob preserves the VMCS first-failure tuple",
+        !fatal_snapshot_layout.empty() &&
+            fatal_snapshot_layout.find("VmcsFailureCommitState") !=
+                std::string::npos &&
+            fatal_snapshot_layout.find("VmcsFailureReason") !=
+                std::string::npos &&
+            fatal_snapshot_layout.find("VmcsFailureArg0") !=
+                std::string::npos &&
+            fatal_snapshot_layout.find("VmcsFailureArg1") !=
+                std::string::npos &&
+            !crash_blob_copy.empty() &&
+            crash_blob_copy.find("ReadVmcsFailureRecord") !=
+                std::string::npos &&
+            crash_blob_copy.find("out.VmcsFailureCommitState") !=
+                std::string::npos &&
+            crash_blob_copy.find("out.VmcsFailureReason") !=
+                std::string::npos &&
+            crash_blob_copy.find("out.VmcsFailureArg0") !=
+                std::string::npos &&
+            crash_blob_copy.find("out.VmcsFailureArg1") !=
+                std::string::npos);
+  Check(state, "VMCS failure tuple rejects an in-flight publication",
+        vmm.find("ReadVmcsFailureRecord(const VcpuContext*") !=
+                std::string::npos &&
+            vmm.find("const long finalCommit") != std::string::npos &&
+            vmm.find("firstCommit == finalCommit") != std::string::npos &&
+            vmm.find("*reason = static_cast<u32>(HvVmcsFailureNone)") !=
+                std::string::npos);
   Check(state, "crash blob exports VMCS clear diagnostics",
         !fatal_snapshot_layout.empty() &&
             fatal_snapshot_layout.find("VmcsCurrentState") !=
@@ -523,11 +612,13 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             asm_source.find("vmxSaveFxsave:") != std::string::npos &&
             asm_source.find("fxsave64 [rsp]") != std::string::npos &&
             asm_source.find("fxrstor64 [rsp]") != std::string::npos);
-  CheckPattern(state, "VMWRITE uses value then field operands", asm_source,
-               R"(HvVmWrite proc[\s\S]{0,260}vmwrite rdx, rcx)");
-  Check(state, "VMWRITE does not use the reversed raw operand order",
-        asm_source.find("HvVmWrite proc") == std::string::npos ||
-            asm_source.find("vmwrite rcx, rdx") == std::string::npos);
+  const std::string vmwrite_asm =
+      SliceSource(asm_source, "HvVmWrite proc", "HvVmWrite endp");
+  CheckPattern(state, "VMWRITE encodes value then field", vmwrite_asm,
+               R"(vmwrite rdx, rcx)");
+  Check(state, "VMWRITE wrapper does not use the swapped operand order",
+        !vmwrite_asm.empty() && vmwrite_asm.find("vmwrite rcx, rdx") ==
+                                  std::string::npos);
   const std::string vmwrite_checked_source = SliceSource(
       vmm, "static __forceinline bool VmWriteChecked(",
       "static __forceinline bool VmReadChecked(");
@@ -612,14 +703,49 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             vmm.find("0xFFFFFFFFULL", setup_readback_compare) !=
                 std::string::npos &&
             vmm.find("~0ULL", setup_readback_compare) != std::string::npos);
+  const std::string vmcs_setup_source = SliceSource(
+      vmm, "bool SetupVmcs(",
+      "// ==============================================================================\n// Launch Logic");
+  const std::size_t vmcs_readback_begin = vmcs_setup_source.find(
+      "if (success) {\n        // a successful VMREAD");
+  const std::string vmcs_readback_source =
+      vmcs_readback_begin == std::string::npos
+          ? std::string{}
+          : vmcs_setup_source.substr(vmcs_readback_begin);
+  Check(state, "VMCS readback reads host SYSENTER fields",
+        !vmcs_setup_source.empty() &&
+            TokensInOrder(vmcs_setup_source,
+                          {"VmReadChecked(HOST_IA32_SYSENTER_CS, &vmcsHostSysenterCs)",
+                           "VmReadChecked(HOST_IA32_SYSENTER_ESP, &vmcsHostSysenterEsp)",
+                           "VmReadChecked(HOST_IA32_SYSENTER_EIP, &vmcsHostSysenterEip)"}));
+  Check(state, "VMCS readback reads guest SYSENTER and DEBUGCTL",
+        !vmcs_setup_source.empty() &&
+            TokensInOrder(vmcs_setup_source,
+                          {"VmReadChecked(GUEST_SYSENTER_CS, &vmcsGuestSysenterCs)",
+                           "VmReadChecked(GUEST_SYSENTER_ESP, &vmcsGuestSysenterEsp)",
+                           "VmReadChecked(GUEST_SYSENTER_EIP, &vmcsGuestSysenterEip)",
+                           "VmReadChecked(GUEST_DEBUGCTL, &vmcsGuestDebugctl)"}));
+  CheckPattern(
+      state, "VMCS readback compares host SYSENTER values with widths",
+      vmcs_readback_source,
+      R"(VmcsValueMatches\([\s\S]{0,180}HOST_IA32_SYSENTER_CS[\s\S]{0,120}vmcsHostSysenterCs[\s\S]{0,120}sysenterCs[\s\S]{0,80}0xFFFFFFFFULL[\s\S]{0,260}VmcsValueMatches\([\s\S]{0,180}HOST_IA32_SYSENTER_ESP[\s\S]{0,120}vmcsHostSysenterEsp[\s\S]{0,120}sysenterEsp[\s\S]{0,80}~0ULL[\s\S]{0,260}VmcsValueMatches\([\s\S]{0,180}HOST_IA32_SYSENTER_EIP[\s\S]{0,120}vmcsHostSysenterEip[\s\S]{0,120}sysenterEip[\s\S]{0,80}~0ULL)");
+  CheckPattern(
+      state, "VMCS readback compares guest SYSENTER and DEBUGCTL",
+      vmcs_readback_source,
+      R"(VmcsValueMatches\([\s\S]{0,180}GUEST_SYSENTER_CS[\s\S]{0,120}vmcsGuestSysenterCs[\s\S]{0,120}sysenterCs[\s\S]{0,80}0xFFFFFFFFULL[\s\S]{0,260}VmcsValueMatches\([\s\S]{0,180}GUEST_SYSENTER_ESP[\s\S]{0,120}vmcsGuestSysenterEsp[\s\S]{0,120}sysenterEsp[\s\S]{0,80}~0ULL[\s\S]{0,260}VmcsValueMatches\([\s\S]{0,180}GUEST_SYSENTER_EIP[\s\S]{0,120}vmcsGuestSysenterEip[\s\S]{0,120}sysenterEip[\s\S]{0,80}~0ULL[\s\S]{0,260}VmcsValueMatches\([\s\S]{0,180}GUEST_DEBUGCTL[\s\S]{0,120}vmcsGuestDebugctl[\s\S]{0,120}Vcpu->GuestDebugctl[\s\S]{0,80}~0ULL)");
   Check(state, "VMCS setup writes the guest RSP",
         vmm.find("VmWriteChecked(GUEST_RSP, reinterpret_cast<u64>(GuestSp))") !=
             std::string::npos);
   Check(state, "VMCS setup writes the guest RIP",
         vmm.find("VmWriteChecked(GUEST_RIP, reinterpret_cast<u64>(GuestIp))") !=
             std::string::npos);
-  CheckPattern(state, "guest entry stack is canonical and aligned", vmm,
-               R"(IsCanonical\(reinterpret_cast<u64>\(GuestSp\)\)[\s\S]{0,160}reinterpret_cast<u64>\(GuestSp\)\s*&\s*0xFULL)");
+  Check(state, "guest entry stack follows the VMX canonical rule",
+        vmm.find("VMX requires canonical guest pointers") !=
+                std::string::npos &&
+            vmm.find("IsCanonical(reinterpret_cast<u64>(GuestSp))") !=
+                std::string::npos &&
+            vmm.find("(reinterpret_cast<u64>(GuestSp) & 0xFULL)") ==
+                std::string::npos);
   Check(state, "C++ has no unchecked VMREAD path",
         vmm.find("HvVmRead(") == std::string::npos);
   CheckPattern(state, "FXSAVE mode hides XSAVE from the guest", vmm,
@@ -1364,12 +1490,31 @@ void TestSourceContract(const fs::path& root, TestState& state) {
       native_teardown_safe);
   const std::size_t authenticated_abort =
       unload_source.find("c->AbortVm = 1", authenticated_gate);
+  const std::size_t authenticated_calculation =
+      unload_source.find("const bool authenticatedUnload");
+  const std::size_t teardown_refresh =
+      unload_source.find("UpdateNativeTeardownContract(vcpu)");
+  const std::size_t teardown_mask_read =
+      unload_source.find("ReadNativeTeardownRejectMask(vcpu)");
   Check(state, "authenticated unload validates descriptor state",
         !unload_source.empty() && descriptor_contract != std::string::npos &&
             native_teardown_safe > descriptor_contract);
   Check(state, "safe exit requires descriptor contract",
         authenticated_gate != std::string::npos &&
             authenticated_abort > authenticated_gate);
+  Check(state, "descriptor refresh is limited to authenticated unload",
+        authenticated_calculation != std::string::npos &&
+            teardown_refresh > authenticated_calculation &&
+            teardown_refresh < teardown_mask_read &&
+            exit_source.find("UpdateNativeTeardownContract(vcpu)") ==
+                std::string::npos);
+  const std::string resume_failure_source = SliceSource(
+      vmm, "extern \"C\" ULONG HandleVmResumeFailure",
+      "static void ReleaseHvCrashBlob");
+  Check(state, "VMRESUME failure path does not refresh teardown descriptors",
+        !resume_failure_source.empty() &&
+            resume_failure_source.find("UpdateNativeTeardownContract(vcpu)") ==
+                std::string::npos);
   const std::size_t fatal_exit_begin =
       exit_source.find("case VM_EXIT_REASON_TRIPLE_FAULT");
   const std::size_t fatal_exit_end =
@@ -1471,12 +1616,26 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             vmm.find("observedKgs") == std::string::npos &&
             vmm.find("Untracked KERNEL_GS_BASE") == std::string::npos);
   CheckPattern(state, "debug controls are paired in VMCS", vmm,
-               R"(requestedExit\s*=\s*VM_EXIT_HOST_ADDRESS_SPACE_SIZE[\s\S]{0,180}VM_EXIT_SAVE_DEBUG_CONTROLS[\s\S]{0,900}requestedEntry\s*=\s*VM_ENTRY_IA32E_MODE_GUEST[\s\S]{0,180}VM_ENTRY_LOAD_DEBUG_CONTROLS)");
+               R"(requestedExit\s*=\s*VM_EXIT_HOST_ADDRESS_SPACE_SIZE[\s\S]{0,180}VM_EXIT_SAVE_DEBUG_CONTROLS[\s\S]{0,1500}requestedEntry\s*=\s*VM_ENTRY_IA32E_MODE_GUEST[\s\S]{0,180}VM_ENTRY_LOAD_DEBUG_CONTROLS)");
   Check(state, "CET does not depend on VMX BASIC bit 56",
         vmm.find("VMX_BASIC_NO_HW_ERROR_CODE") == std::string::npos);
   const std::size_t setup_begin = vmm.find("bool SetupVmcs(");
   const std::size_t setup_end = vmm.find(
       "// ==============================================================================\n// Launch Logic", setup_begin);
+  const std::string setup_source =
+      setup_begin != std::string::npos && setup_end > setup_begin
+          ? vmm.substr(setup_begin, setup_end - setup_begin)
+          : std::string{};
+  Check(state, "VMCS optional controls start from an explicit baseline",
+        !setup_source.empty() &&
+            TokensInOrder(setup_source,
+                          {"VmWriteChecked(CONTROL_TSC_OFFSET, 0ULL)",
+                           "VmWriteChecked(CONTROL_PAGE_FAULT_ERROR_CODE_MASK, 0ULL)",
+                           "VmWriteChecked(CONTROL_PAGE_FAULT_ERROR_CODE_MATCH, 0ULL)",
+                           "VmWriteChecked(CONTROL_CR3_TARGET_COUNT, 0ULL)",
+                           "VmWriteChecked(CONTROL_VM_EXIT_MSR_STORE_COUNT, 0ULL)",
+                           "VmWriteChecked(CONTROL_VM_EXIT_MSR_LOAD_COUNT, 0ULL)",
+                           "VmWriteChecked(CONTROL_VM_ENTRY_MSR_LOAD_COUNT, 0ULL)"}));
   Check(state, "targeted launch masks IF during frame handoff",
         setup_begin != std::string::npos && setup_end > setup_begin &&
             vmm.substr(setup_begin, setup_end - setup_begin).find(
@@ -1647,11 +1806,18 @@ void TestSourceContract(const fs::path& root, TestState& state) {
             vmm.find("LaunchRawGuestCr3 = 0") != std::string::npos &&
             vmm.find("LaunchRawHostCr3 = 0") != std::string::npos);
   Check(state, "staged launch keeps raw CR3 in a short diagnostic record",
-        vmm.find("[HV] CPU %u staged CR3: raw_guest=0x%llX") !=
-                std::string::npos &&
+         vmm.find("[HV] CPU %u staged CR3: raw_guest=0x%llX") !=
+                 std::string::npos &&
             vmm.find("raw_host=0x%llX host=0x%llX meta=0x%llX") !=
                 std::string::npos &&
-            vmm.find("ReadLaunchCr3Field(&g_VcpuData[i].LaunchRawGuestCr3)") !=
+             vmm.find("ReadLaunchCr3Field(&g_VcpuData[i].LaunchRawGuestCr3)") !=
+                 std::string::npos);
+  Check(state, "failure diagnostics stay below the debugger burst limit",
+        vmm.find("launch failure: state=%ld") != std::string::npos &&
+            vmm.find("launch transition: msr=0x%08X") != std::string::npos &&
+            vmm.find("VMCS access: setup_phase=%ld") != std::string::npos &&
+            vmm.find("VMCS image: mismatch=%ld") != std::string::npos &&
+            vmm.find("VMCS capabilities: primary=0x%llX") !=
                 std::string::npos);
   Check(state, "host stack top stays inside the allocation",
         vmm.find("const u64 stackLastByte") != std::string::npos &&
@@ -1661,9 +1827,32 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   CheckPattern(
       state, "successful launch output is compact", vmm,
       R"(LaunchResultNeedsDetail[\s\S]{0,1200}keep the normal path below the debugger transport's burst size[\s\S]{0,500}reason=0x%08X)");
-  CheckPattern(
-      state, "failed launch output keeps the full diagnostic block", vmm,
-      R"(LaunchResultNeedsDetail[\s\S]{0,2200}retain the complete failure block[\s\S]{0,900}raw_reason=0x%08X)");
+  Check(state, "launch diagnostics are scoped to participating processors",
+        vmm.find("static __forceinline bool ShouldReportLaunchResult") !=
+                std::string::npos &&
+            vmm.find("ShouldLaunchOnThisProcessor(processorIndex)") !=
+                std::string::npos &&
+            vmm.find("if (!ShouldReportLaunchResult(processorIndex)) return;") !=
+                std::string::npos);
+  Check(state, "launch diagnostics use the participation predicate only",
+        vmm.find("return ShouldLaunchOnThisProcessor(processorIndex);") !=
+            std::string::npos &&
+            vmm.find("return kUseHyperDbgGenericLaunch ||") ==
+                std::string::npos);
+  Check(state, "staged success output is conditional",
+        vmm.find("LaunchResultNeedsDetail(i, g_VcpuData[i])") !=
+                std::string::npos &&
+            vmm.find("[HV] staged launch completed: %u/%u participating processors") !=
+                std::string::npos);
+  Check(state, "failed launch output keeps split diagnostic records",
+        vmm.find("keep each failure record below DbgPrintEx's 512-byte call limit") !=
+                std::string::npos &&
+            vmm.find("launch failure: state=%ld") != std::string::npos &&
+            vmm.find("launch transition: msr=0x%08X") != std::string::npos &&
+            vmm.find("VMCS access: setup_phase=%ld") != std::string::npos &&
+            vmm.find("VMCS image: mismatch=%ld") != std::string::npos &&
+            vmm.find("VMCS capabilities: primary=0x%llX") !=
+                std::string::npos);
   CheckPattern(state, "target workers retain the driver object", vmm,
                R"(IoCreateSystemThread\(g_HvDriverObject[\s\S]{0,600}TargetCpuWorker)");
   CheckPattern(state, "target workers bind and verify processor identity", vmm,
@@ -1733,11 +1922,18 @@ void TestSourceContract(const fs::path& root, TestState& state) {
         staged_return_boundary != std::string::npos &&
             staged_return_boundary > staged_active_stage &&
             staged_return_boundary < launch_dpc_complete);
+  const std::size_t launch_probe_gate = launch_dpc_source.find(
+      "if constexpr (kEnableLaunchFirstExitProbe)", staged_active_stage);
   const std::size_t first_exit_probe_call =
-      launch_dpc_source.find("RunFirstExitProbe", staged_active_stage);
-  Check(state, "staged DPC verifies the first VM-exit before completion",
-        first_exit_probe_call != std::string::npos &&
-            first_exit_probe_call > staged_active_stage &&
+      launch_dpc_source.find("RunFirstExitProbe", launch_probe_gate);
+  const std::size_t default_probe_init = launch_dpc_source.find(
+      "bool firstExitProbePassed = guestActive", staged_active_stage);
+  Check(state, "staged DPC keeps the first-exit probe opt-in",
+        vmm.find("kEnableLaunchFirstExitProbe = false") !=
+            std::string::npos &&
+            default_probe_init != std::string::npos &&
+            launch_probe_gate > default_probe_init &&
+            first_exit_probe_call > launch_probe_gate &&
             first_exit_probe_call < staged_return_boundary &&
             first_exit_probe_call < launch_dpc_complete);
   const std::string vmexit_handler_source = SliceSource(
@@ -2215,11 +2411,141 @@ void TestSourceContract(const fs::path& root, TestState& state) {
     if (msr_bitmap_source.empty()) return false;
     return TokensInOrder(msr_bitmap_source,
                          {"MSR_FS_BASE", "MSR_GS_BASE",
-                          "MSR_IA32_KERNEL_GS_BASE", "MSR_IA32_EFER",
-                          "MSR_IA32_PAT", "MSR_IA32_DEBUGCTL",
+                          "MSR_IA32_EFER", "MSR_IA32_PAT",
+                          "MSR_IA32_DEBUGCTL",
                           "MSR_IA32_SYSENTER_CS", "MSR_IA32_SYSENTER_ESP",
                           "MSR_IA32_SYSENTER_EIP"});
   }());
+  Check(state, "KERNEL_GS_BASE follows HyperDbg pass-through", [&]() {
+    if (msr_bitmap_source.empty()) return false;
+    const std::size_t managed_begin = msr_bitmap_source.find(
+        "constexpr u32 vmxManagedWriteMsrs[]");
+    const std::size_t managed_end =
+        managed_begin == std::string::npos
+            ? std::string::npos
+            : msr_bitmap_source.find("};", managed_begin);
+    if (managed_begin == std::string::npos || managed_end == std::string::npos) {
+      return false;
+    }
+    const std::string managed = msr_bitmap_source.substr(
+        managed_begin, managed_end - managed_begin);
+    return managed.find("MSR_IA32_KERNEL_GS_BASE") == std::string::npos &&
+           asm_source.find("CTX_GUEST_KGS") != std::string::npos &&
+           asm_source.find("MSR_KERNEL_GS_BASE") != std::string::npos;
+  }());
+  constexpr std::array<std::uint32_t, 8> managedMsrs = {
+      0xC0000100U,  // fs base
+      0xC0000101U,  // gs base
+      0xC0000080U,  // efer
+      0x00000277U,  // pat
+      0x000001D9U,  // debugctl
+      0x00000174U,  // sysenter cs
+      0x00000175U,  // sysenter esp
+      0x00000176U,  // sysenter eip
+  };
+  MsrBitmapModel managedBitmap;
+  bool managedConfigured = true;
+  for (const std::uint32_t msr : managedMsrs) {
+    managedConfigured = managedBitmap.Set(msr, true) && managedConfigured;
+  }
+  const bool managedReadsRemainNative = std::all_of(
+      managedMsrs.begin(), managedMsrs.end(), [&](const std::uint32_t msr) {
+        return !managedBitmap.IsSet(msr, false);
+      });
+  const bool managedWritesTrap = std::all_of(
+      managedMsrs.begin(), managedMsrs.end(), [&](const std::uint32_t msr) {
+        return managedBitmap.IsSet(msr, true);
+      });
+  Check(state, "MSR bitmap model leaves managed RDMSR native",
+        managedConfigured && managedReadsRemainNative);
+  Check(state, "MSR bitmap model retains managed WRMSR exits",
+        managedConfigured && managedWritesTrap);
+  struct MsrBitmapExpectation {
+    std::uint32_t msr;
+    std::size_t readOffset;
+    std::uint8_t readMask;
+    std::size_t writeOffset;
+    std::uint8_t writeMask;
+  };
+  constexpr std::array<MsrBitmapExpectation, 8> bitmapExpectations = {{
+      {0xC0000100U, 0x420, 0x01, 0xC20, 0x01},
+      {0xC0000101U, 0x420, 0x02, 0xC20, 0x02},
+      {0xC0000080U, 0x410, 0x01, 0xC10, 0x01},
+      {0x00000277U, 0x04E, 0x80, 0x84E, 0x80},
+      {0x000001D9U, 0x03B, 0x02, 0x83B, 0x02},
+      {0x00000174U, 0x02E, 0x10, 0x82E, 0x10},
+      {0x00000175U, 0x02E, 0x20, 0x82E, 0x20},
+      {0x00000176U, 0x02E, 0x40, 0x82E, 0x40},
+  }};
+  const bool bitmapLayoutMatches = std::all_of(
+      bitmapExpectations.begin(), bitmapExpectations.end(),
+      [&](const MsrBitmapExpectation& expected) {
+        return (managedBitmap.bytes[expected.readOffset] &
+                expected.readMask) == 0 &&
+               (managedBitmap.bytes[expected.writeOffset] &
+                expected.writeMask) != 0;
+      });
+  Check(state, "MSR bitmap model uses the four Intel regions",
+        bitmapLayoutMatches);
+  constexpr std::array<std::uint32_t, 11> hiddenMsrs = {
+      0x000001C4U,  // xfd
+      0x000001C5U,  // xfd err
+      0x00000560U,  // rtit output base
+      0x00000570U,  // rtit ctl
+      0x0000058FU,  // rtit window end
+      0x00000DA0U,  // xss
+      0x000006A0U,  // u cet
+      0x000006A7U,  // pl3 ssp
+      0x000006A2U,  // s cet
+      0x000006A4U,  // pl0 ssp
+      0x000006A8U,  // interrupt ssp table
+  };
+  MsrBitmapModel hiddenBitmap;
+  bool hiddenConfigured = true;
+  for (const std::uint32_t msr : hiddenMsrs) {
+    hiddenConfigured = hiddenBitmap.Set(msr, false) && hiddenConfigured;
+    hiddenConfigured = hiddenBitmap.Set(msr, true) && hiddenConfigured;
+  }
+  const bool hiddenReadsTrap = std::all_of(
+      hiddenMsrs.begin(), hiddenMsrs.end(), [&](const std::uint32_t msr) {
+        return hiddenBitmap.IsSet(msr, false);
+      });
+  const bool hiddenWritesTrap = std::all_of(
+      hiddenMsrs.begin(), hiddenMsrs.end(), [&](const std::uint32_t msr) {
+        return hiddenBitmap.IsSet(msr, true);
+      });
+  Check(state, "MSR bitmap model keeps hidden MSRs bidirectionally trapped",
+        hiddenConfigured && hiddenReadsTrap && hiddenWritesTrap);
+  Check(state, "MSR bitmap model rejects out-of-range indices",
+        !managedBitmap.Set(0x00002000U, false) &&
+            !managedBitmap.Set(0xC0002000U, true));
+  const std::size_t managed_array_begin = msr_bitmap_source.find(
+      "constexpr u32 vmxManagedWriteMsrs[]");
+  const std::size_t managed_array_end =
+      managed_array_begin == std::string::npos
+          ? std::string::npos
+          : msr_bitmap_source.find("// XFD is not part", managed_array_begin);
+  const std::string managed_policy_source =
+      managed_array_begin != std::string::npos &&
+              managed_array_end > managed_array_begin
+          ? msr_bitmap_source.substr(managed_array_begin,
+                                     managed_array_end - managed_array_begin)
+          : std::string{};
+  Check(state, "source keeps managed MSR reads pass-through",
+        !managed_policy_source.empty() &&
+            managed_policy_source.find("setBit(msr, true)") !=
+                std::string::npos &&
+            managed_policy_source.find("setBit(msr, false)") ==
+                std::string::npos &&
+            managed_policy_source.find("MSR_IA32_KERNEL_GS_BASE") ==
+                std::string::npos);
+  Check(state, "source encodes all four MSR bitmap regions",
+        msr_bitmap_source.find("base = write ? 0x800U : 0x000U") !=
+                std::string::npos &&
+            msr_bitmap_source.find("base = write ? 0xC00U : 0x400U") !=
+                std::string::npos &&
+            msr_bitmap_source.find("msr -= 0xC0000000U") !=
+                std::string::npos);
   CheckPattern(state, "guest CPUID hides unvirtualized XCR1", vmm,
                R"(leaf\s*==\s*0xD\s*&&\s*subleaf\s*==\s*1[\s\S]{0,320}CPUID_D1_XGETBV1[\s\S]{0,180}CPUID_D1_XFD)");
   CheckPattern(state, "FRED uses CPUID subleaf one", vmm,
@@ -2556,6 +2882,30 @@ void TestSourceContract(const fs::path& root, TestState& state) {
       start_begin != std::string::npos && start_end > start_begin
           ? vmm.substr(start_begin, start_end - start_begin)
           : std::string{};
+  const std::size_t staged_target_failure = launch_start_source.find(
+      "if (!NT_SUCCESS(targetStatus))",
+      launch_start_source.find(
+          "launching processors through staged target DPCs"));
+  const std::size_t staged_failure_diagnostics =
+      launch_start_source.find("PrintLaunchResult(i, g_VcpuData[i])",
+                               staged_target_failure);
+  const std::size_t staged_failure_stop = launch_start_source.find(
+      "StopHypervisorInternal(true)", staged_target_failure);
+  Check(state, "staged failure prints diagnostics before VMX rollback",
+        staged_target_failure != std::string::npos &&
+            staged_failure_diagnostics > staged_target_failure &&
+            staged_failure_stop > staged_failure_diagnostics);
+  const std::size_t staged_launch_loop = launch_start_source.find(
+      "for (u32 i = 0; i < g_ProcessorCount; ++i)",
+      launch_start_source.find("launching processors through staged target DPCs"));
+  const std::size_t staged_detail_gate = launch_start_source.find(
+      "LaunchResultNeedsDetail(i, g_VcpuData[i])", staged_launch_loop);
+  const std::size_t staged_aggregate = launch_start_source.find(
+      "[HV] staged launch completed:", staged_launch_loop);
+  Check(state, "staged launch filters successful per CPU output",
+        staged_launch_loop != std::string::npos &&
+            staged_detail_gate > staged_launch_loop &&
+            staged_aggregate > staged_detail_gate);
   const std::size_t probe_broadcast = launch_start_source.find(
       "QueueTargetOperation(i, TargetOperationProbe)");
   const std::size_t launch_orchestration = launch_start_source.find(
@@ -3160,6 +3510,8 @@ void TestArtifact(const fs::path& root, const fs::path& driver,
 
   bool image_read = false;
   bool image_has_contract_tag = false;
+  bool image_has_hyperdbg_vmwrite = false;
+  bool image_has_reversed_vmwrite = false;
   if (file_size <= static_cast<std::uintmax_t>(
                        (std::numeric_limits<std::size_t>::max)())) {
     std::string image_bytes(static_cast<std::size_t>(file_size), '\0');
@@ -3180,10 +3532,17 @@ void TestArtifact(const fs::path& root, const fs::path& driver,
           !expected_contract_tag.empty() &&
           (image_bytes.find(expected_contract_tag) != std::string::npos ||
            ContainsUtf16Le(image_bytes, expected_contract_tag));
+       image_has_hyperdbg_vmwrite =
+           ContainsBytes(image_bytes, {0x0F, 0x79, 0xD1, 0x9C, 0x58, 0xC3});
+       image_has_reversed_vmwrite =
+           ContainsBytes(image_bytes, {0x0F, 0x79, 0xCA, 0x9C, 0x58, 0xC3});
     }
   }
   Check(state, "SYS embeds the current VMX contract tag",
         image_read && image_has_contract_tag, driver.string());
+  Check(state, "SYS embeds the HyperDbg VMWRITE wrapper",
+        image_read && image_has_hyperdbg_vmwrite &&
+            !image_has_reversed_vmwrite, driver.string());
 }
 
 bool IsUntrustedPrivateRoot(LONG status) {

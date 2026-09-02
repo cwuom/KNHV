@@ -60,19 +60,21 @@ hidden when a single P/E core cannot safely pass them through. FRED and LKGS
 remain hidden, and guest writes that attempt to enable `CR4.FRED` are rejected
 because this build retains the legacy VM-exit event-delivery contract.
 
-The MASM `VMWRITE` wrapper follows the Intel operand contract: the source value
-is in `ModRM.reg` and the VMCS field is in `ModRM.r/m`. With
-`HvVmWrite(Field, Value)` on the Windows x64 ABI, `RCX=Field`, `RDX=Value`, and
-the instruction is `vmwrite rdx, rcx` (`0F 79 D1`). `VMREAD` remains
-`vmread destination, field`; the contract test checks both forms and the
-object-level encoding.
+The MASM `VMWRITE` wrapper follows the Intel and HyperDbg operand encoding:
+`HvVmWrite(Field, Value)` receives `RCX=Field` and `RDX=Value`; VMWRITE's first
+operand is the value and its second register operand is the field. The wrapper
+therefore uses `vmwrite rdx, rcx` (encoding `0F 79 D1`). `VMREAD` remains
+`vmread destination, field`; the contract test checks both source forms and
+the operand encoding so a swapped wrapper cannot silently reach VMX hardware.
 
 The debugger log is staged by contract and processor. `[HV] XSTATE contract`
 and `[HV] VMX control contract` describe the feature gate and selected
 generation profile, `CPU <n> VMCS` records per-processor VMX setup and launch
 values, and the first 16 VM-exits per processor include reason, RIP, RSP,
 qualification, and flags. Fatal or unsupported exits print the guest CR3/CR4;
-only a context that passes the native teardown checks is resumed, while an
+only a context that passes the native teardown checks is resumed. The
+descriptor contract is refreshed at the authenticated unload boundary rather
+than on every ordinary exit, matching the low-overhead HyperDbg hot path, while an
 initial VM-entry masks `RFLAGS.IF` until the HyperDbg-style launch thunk has
 left its private frame; the original flag is then restored with an `STI`
 interrupt shadow. This prevents a late-load interrupt from overwriting the

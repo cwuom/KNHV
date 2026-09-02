@@ -135,6 +135,36 @@ enum VmcsCurrentState : long {
     VmcsCurrentStateFailed = 3,
 };
 
+// this first-wins record identifies why VMCS preparation stopped. The detailed
+// field, flag, and mismatch tuples remain in the neighboring diagnostic fields
+enum HvVmcsFailureReason : u32 {
+    HvVmcsFailureNone = 0,
+    HvVmcsFailureArgument = 1,
+    HvVmcsFailureVmclear = 2,
+    HvVmcsFailureVmptrld = 3,
+    HvVmcsFailureCetWriteProtect = 4,
+    HvVmcsFailureMsrSnapshot = 5,
+    HvVmcsFailureGuestTr = 6,
+    HvVmcsFailureDescriptorCr3 = 7,
+    HvVmcsFailureLdtr = 8,
+    HvVmcsFailureSampledTr = 9,
+    HvVmcsFailureVmwrite = 10,
+    HvVmcsFailureVmread = 11,
+    HvVmcsFailureMismatch = 12,
+    HvVmcsFailureGuestEntry = 13,
+    HvVmcsFailureControlPolicy = 14,
+    HvVmcsFailureXstatePolicy = 15,
+    HvVmcsFailureInjected = 16,
+    HvVmcsFailureReadback = 17,
+    HvVmcsFailureException = 18,
+};
+
+enum HvVmcsFailureCommitState : long {
+    HvVmcsFailureEmpty = 0,
+    HvVmcsFailureWriting = 1,
+    HvVmcsFailureCommitted = 2,
+};
+
 // Intel exposes a hybrid core type through CPUID leaf 1A. Keep the branch
 // explicit so a VMX profile selected on a P-core is never silently reused as
 // an assumption about an E-core or an older legacy processor.
@@ -333,6 +363,11 @@ struct VcpuContext {
     volatile long VmcsWriteState;
     volatile long VmcsReadFailed;
     volatile long VmcsSetupPhase;
+    // publish the failure reason only after both argument slots are complete
+    volatile long VmcsFailureCommitState;
+    volatile long VmcsFailureReason;
+    u64   VmcsFailureArg0;
+    u64   VmcsFailureArg1;
     u64   FirstVmcsWriteField;
     u64   FirstVmcsWriteFlags;
     u64   FirstVmcsWriteError;
@@ -506,5 +541,11 @@ static_assert((offsetof(VcpuContext, VmcsReadState) % alignof(long)) == 0,
               "vmcs read state must be naturally aligned");
 static_assert((offsetof(VcpuContext, VmcsMismatchState) % alignof(long)) == 0,
               "vmcs mismatch state must be naturally aligned");
+static_assert((offsetof(VcpuContext, VmcsFailureCommitState) % alignof(long)) == 0,
+              "vmcs failure state must be naturally aligned");
+static_assert((offsetof(VcpuContext, VmcsFailureArg0) % alignof(u64)) == 0,
+              "vmcs failure argument zero must be naturally aligned");
+static_assert((offsetof(VcpuContext, VmcsFailureArg1) % alignof(u64)) == 0,
+              "vmcs failure argument one must be naturally aligned");
 static_assert((offsetof(VcpuContext, VmcsDiagnosticValidity) % alignof(u64)) == 0,
               "vmcs diagnostic validity must be naturally aligned");

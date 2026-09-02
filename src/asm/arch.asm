@@ -1239,7 +1239,7 @@ HvVmPtrLd proc
 HvVmPtrLd endp
 
 HvVmWrite proc
-    ; Intel VMWRITE takes the value first and the VMCS field second
+    ; vmwrite takes the value first and the VMCS field second
     ; Win64 passes Field in RCX and Value in RDX
     vmwrite rdx, rcx
     pushfq

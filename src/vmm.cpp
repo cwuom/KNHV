@@ -316,12 +316,22 @@ static constexpr u64 kVmxHostStackAlignment = 0x40;
 // so one processor cannot hide the other results
 static constexpr bool kUseHyperDbgGenericLaunch = false;
 
+// HyperDbg's launch callback returns after the VMX handoff and does not issue
+// a synthetic CPUID from the newly launched guest. Keep the probe available
+// for an explicit bring-up build, but leave the production path free of this
+// extra VM-exit and VMRESUME cycle.
+static constexpr bool kEnableLaunchFirstExitProbe = false;
+
 static __forceinline bool ShouldLaunchOnThisProcessor(u32 id) {
     if (!kDebugSingleCpu && kReserveCoordinatorCpu &&
         id == kCoordinatorCpuIndex) {
         return false;
     }
     return !kDebugSingleCpu || id == kDebugCpuIndex;
+}
+
+static __forceinline bool ShouldReportLaunchResult(u32 processorIndex) {
+    return ShouldLaunchOnThisProcessor(processorIndex);
 }
 
 static __forceinline u32 ExpectedLaunchProcessorCount() {
@@ -1053,7 +1063,7 @@ constexpr u32 TAG_HVST = 0x54535648; // 'HVST' little endian
 constexpr u32 TAG_HVCB = 0x42435648; // 'HVCB' little endian
 constexpr u32 TAG_HVTR = 0x52545648; // 'HVTR' little endian
 static constexpr u64 kHvCrashBlobSignature = 0x48564342524D5541; // HVCBRMA
-static constexpr u32 kHvCrashBlobVersion = 10;
+static constexpr u32 kHvCrashBlobVersion = 11;
 static const GUID kHvCrashBlobGuid = {
     0xC6A3D9F0, 0x2F6F, 0x4E4A,
     {0xA5, 0x9E, 0x61, 0x34, 0x12, 0x88, 0x4B, 0xE6}
@@ -1121,6 +1131,10 @@ struct HvFatalSnapshot {
     u32 NativeTeardownRejectMask;
     u32 VmcsReadFailed;
     u32 VmcsValueMismatch;
+    u32 VmcsFailureCommitState;
+    u32 VmcsFailureReason;
+    u64 VmcsFailureArg0;
+    u64 VmcsFailureArg1;
     u64 DiagnosticValidity;
     u64 FirstVmcsReadField;
     u64 FirstVmcsReadFlags;
@@ -1257,6 +1271,79 @@ static __forceinline void SetVmcsSetupPhase(VcpuContext* vcpu,
     }
 }
 
+static __forceinline long ReadVmcsFailureCommitState(
+    const VcpuContext* vcpu) {
+    if (!vcpu) return HvVmcsFailureEmpty;
+    return InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu->VmcsFailureCommitState), 0, 0);
+}
+
+static __forceinline u64 ReadVmcsFailureArg(const u64* value) {
+    if (!value) return 0;
+    return static_cast<u64>(InterlockedCompareExchange64(
+        reinterpret_cast<volatile LONG64*>(const_cast<u64*>(value)), 0, 0));
+}
+
+// copy the first-wins record only when its commit word stays stable. A crash
+// callback may run while a VMX-root callback is publishing the two arguments
+// and must never expose a half-written tuple
+static void ReadVmcsFailureRecord(const VcpuContext* vcpu,
+                                  u32* commitState,
+                                  u32* reason,
+                                  u64* arg0,
+                                  u64* arg1) {
+    if (!commitState || !reason || !arg0 || !arg1) return;
+    *commitState = static_cast<u32>(HvVmcsFailureEmpty);
+    *reason = static_cast<u32>(HvVmcsFailureNone);
+    *arg0 = 0;
+    *arg1 = 0;
+    if (!vcpu) return;
+
+    const long firstCommit = ReadVmcsFailureCommitState(vcpu);
+    *commitState = static_cast<u32>(firstCommit);
+    if (firstCommit != HvVmcsFailureCommitted) return;
+
+    MemoryBarrier();
+    *reason = static_cast<u32>(InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu->VmcsFailureReason), 0, 0));
+    *arg0 = ReadVmcsFailureArg(&vcpu->VmcsFailureArg0);
+    *arg1 = ReadVmcsFailureArg(&vcpu->VmcsFailureArg1);
+    MemoryBarrier();
+
+    const long finalCommit = ReadVmcsFailureCommitState(vcpu);
+    if (firstCommit == finalCommit &&
+        finalCommit == HvVmcsFailureCommitted) {
+        return;
+    }
+
+    *commitState = static_cast<u32>(finalCommit);
+    *reason = static_cast<u32>(HvVmcsFailureNone);
+    *arg0 = 0;
+    *arg1 = 0;
+}
+
+static void PublishVmcsFailure(VcpuContext* vcpu,
+                               HvVmcsFailureReason reason,
+                               u64 arg0 = 0,
+                               u64 arg1 = 0) {
+    if (!vcpu || reason == HvVmcsFailureNone) return;
+    if (InterlockedCompareExchange(&vcpu->VmcsFailureCommitState,
+                                   HvVmcsFailureWriting,
+                                   HvVmcsFailureEmpty) !=
+        HvVmcsFailureEmpty) {
+        return;
+    }
+    vcpu->VmcsFailureArg0 = arg0;
+    vcpu->VmcsFailureArg1 = arg1;
+    InterlockedExchange(&vcpu->VmcsFailureReason,
+                        static_cast<LONG>(reason));
+    MemoryBarrier();
+    InterlockedExchange(&vcpu->VmcsFailureCommitState,
+                        HvVmcsFailureCommitted);
+    WriteHvTrace(vcpu, CurrentProcessorIndex(), HvTraceEventContractFail,
+                 static_cast<u64>(reason), arg0, arg1);
+}
+
 static __forceinline bool VmWriteChecked(u64 field, u64 value) {
     VcpuContext* vcpu = nullptr;
     if (g_VcpuData) {
@@ -1286,6 +1373,7 @@ static __forceinline bool VmWriteChecked(u64 field, u64 value) {
             vcpu->FirstVmcsWriteError = instructionError;
             MemoryBarrier();
             InterlockedExchange(&vcpu->VmcsWriteState, 2);
+            PublishVmcsFailure(vcpu, HvVmcsFailureVmwrite, field, flags);
             InterlockedExchange(&vcpu->VmcsWriteFailed, 1);
         }
     }
@@ -1318,6 +1406,7 @@ static __forceinline bool VmReadChecked(u64 field, u64* value) {
                 vcpu->FirstVmcsReadError = instructionError;
                 MemoryBarrier();
                 InterlockedExchange(&vcpu->VmcsReadState, 2);
+                PublishVmcsFailure(vcpu, HvVmcsFailureVmread, field, flags);
                 InterlockedExchange(&vcpu->VmcsReadFailed, 1);
             } else {
                 InterlockedExchange(&vcpu->VmcsReadFailed, 1);
@@ -1371,6 +1460,7 @@ static __forceinline bool VmcsValueMatches(VcpuContext* vcpu, u64 field,
         vcpu->FirstVmcsMismatchMask = mask;
         MemoryBarrier();
         InterlockedExchange(&vcpu->VmcsMismatchState, 2);
+        PublishVmcsFailure(vcpu, HvVmcsFailureMismatch, field, actual);
         InterlockedExchange(&vcpu->VmcsValueMismatch, 1);
         WriteHvTrace(vcpu, CurrentProcessorIndex(), HvTraceEventContractFail,
                      field, expected, actual, mask);
@@ -1909,6 +1999,16 @@ static __forceinline void RequestAuthenticatedUnload(GuestContext* c,
     const u32 id = CurrentProcessorIndex();
     VcpuContext* vcpu =
         g_VcpuData && id < g_ProcessorCount ? &g_VcpuData[id] : nullptr;
+    const bool authenticatedUnload =
+        c && exitReason == VM_EXIT_REASON_VMCALL &&
+        (c->GuestCs & 3U) == 0 &&
+        c->Rcx == HYPERVISOR_MAGIC && c->Rdx == VMCALL_UNLOAD;
+    // Descriptor validation is needed only at the authenticated native
+    // teardown boundary. Keeping it out of ordinary exits avoids a long run
+    // of VMREADs on every CR3 or MSR transition.
+    if (authenticatedUnload) {
+        UpdateNativeTeardownContract(vcpu);
+    }
     u32 rejectMask = ReadNativeTeardownRejectMask(vcpu);
     u64 entryIntrInfo = 0;
     u64 exitIntrInfo = 0;
@@ -1966,10 +2066,6 @@ static __forceinline void RequestAuthenticatedUnload(GuestContext* c,
         (idtVectoringInfo & VM_ENTRY_INTR_INFO_VALID) == 0 &&
         guestInterruptibility == 0 && guestActivity == 0 &&
         pendingDebug == 0;
-    const bool authenticatedUnload =
-        c && exitReason == VM_EXIT_REASON_VMCALL &&
-        (c->GuestCs & 3U) == 0 &&
-        c->Rcx == HYPERVISOR_MAGIC && c->Rdx == VMCALL_UNLOAD;
     if (!c || exitReason != VM_EXIT_REASON_VMCALL) {
         rejectMask |= HvNativeTeardownRejectParameters;
     }
@@ -2271,6 +2367,10 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
         out.NativeTeardownRejectMask = 0;
         out.VmcsReadFailed = 0;
         out.VmcsValueMismatch = 0;
+        out.VmcsFailureCommitState = 0;
+        out.VmcsFailureReason = 0;
+        out.VmcsFailureArg0 = 0;
+        out.VmcsFailureArg1 = 0;
         out.DiagnosticValidity = 0;
         out.FirstVmcsReadField = 0;
         out.FirstVmcsReadFlags = 0;
@@ -2380,6 +2480,10 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
                 const_cast<volatile LONG*>(&vcpu.VmcsReadFailed), 0, 0));
             out.VmcsValueMismatch = static_cast<u32>(InterlockedCompareExchange(
                 const_cast<volatile LONG*>(&vcpu.VmcsValueMismatch), 0, 0));
+            ReadVmcsFailureRecord(&vcpu, &out.VmcsFailureCommitState,
+                                  &out.VmcsFailureReason,
+                                  &out.VmcsFailureArg0,
+                                  &out.VmcsFailureArg1);
             out.DiagnosticValidity = ReadVmcsDiagnosticValidity(&vcpu);
             out.FirstVmcsReadField = vcpu.FirstVmcsReadField;
             out.FirstVmcsReadFlags = vcpu.FirstVmcsReadFlags;
@@ -3529,13 +3633,11 @@ bool HandleMsrWrite(GuestContext* Ctx) {
 static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
     if (!vcpu || !vcpu->MsrBitmapVirt) return false;
 
-    // A one bit means "cause a VM-exit".  VMX loads these values from the
-    // guest VMCS on every entry and restores the host copies on every exit.
-    // A native guest WRMSR would update only the hardware MSR, leaving the
-    // VMCS stale; the next transition would then restore the old value. This
-    // is especially dangerous for Windows FS/GS and SYSENTER context state.
-    // Keep the software shadow and VMCS synchronized through the same handler
-    // path used by HyperDbg.
+    // A one bit means "cause a VM-exit".  VMX loads the VMCS-managed values
+    // on entry and restores the host copies on exit.  Reads can therefore run
+    // natively, while writes still need the handler to update the VMCS before
+    // the next transition.  This is the low-overhead baseline used by
+    // HyperDbg and avoids trapping ordinary kernel RDMSR instructions.
     RtlZeroMemory(vcpu->MsrBitmapVirt, PAGE_SIZE);
 
     auto setBit = [&](u32 msr, bool write) -> bool {
@@ -3554,15 +3656,27 @@ static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
         return true;
     };
 
-    constexpr u32 baseManagedMsrs[] = {
-        MSR_FS_BASE, MSR_GS_BASE, MSR_IA32_KERNEL_GS_BASE,
+    // KERNEL_GS_BASE stays pass-through like HyperDbg because it is not a
+    // VMCS field; the assembly boundary snapshots it before host code runs
+    // and restores that snapshot before VMRESUME
+    constexpr u32 vmxManagedWriteMsrs[] = {
+        MSR_FS_BASE, MSR_GS_BASE,
         MSR_IA32_EFER, MSR_IA32_PAT,
         MSR_IA32_DEBUGCTL,
         MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP,
         MSR_IA32_SYSENTER_EIP,
+    };
+    for (u32 msr : vmxManagedWriteMsrs) {
+        if (!setBit(msr, true)) return false;
+    }
+
+    // XFD is not part of the VMCS state used by this monitor. Keep both
+    // directions trapped so the hidden guest contract can return #GP without
+    // exposing or changing the host selector.
+    constexpr u32 hiddenXfdMsrs[] = {
         MSR_IA32_XFD, MSR_IA32_XFD_ERR,
     };
-    for (u32 msr : baseManagedMsrs) {
+    for (u32 msr : hiddenXfdMsrs) {
         if (!setBit(msr, false) || !setBit(msr, true)) return false;
     }
 
@@ -4192,11 +4306,6 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
     vcpu->LastGuestSCet = Ctx->GuestSCet;
     vcpu->LastGuestSsp = Ctx->GuestSsp;
     vcpu->LastGuestInterruptSspTable = Ctx->GuestInterruptSspTable;
-    // Native teardown returns through the host descriptor tables restored by
-    // VMX. Track whether the current guest descriptor environment is still
-    // identical to the launch snapshot before any exit handler can request
-    // VMXOFF/IRET.
-    UpdateNativeTeardownContract(vcpu);
     // IA32_KERNEL_GS_BASE is not represented in the VMCS.  The VM-exit
     // assembly stub snapshots the guest value before restoring the host
     // per-CPU value; copy that snapshot into the teardown context so the
@@ -4818,6 +4927,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             "host_cr0=0x%llX host_cr4=0x%llX guest_cr0=0x%llX "
             "guest_cr4=0x%llX\n",
             cpuId, hostCr0, hostCr4, guestCr0, guestCr4);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureCetWriteProtect,
+                           hostCr0, hostCr4);
         return false;
     }
     // Capture all VMX-managed MSRs once on the owning logical processor. A
@@ -4853,6 +4964,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             "sysenter_cs=0x%llX sysenter_esp=0x%llX sysenter_eip=0x%llX\n",
             cpuId, msrSnapshotUsable ? 1U : 0U, hostEfer, pat, fsBase, gsBase,
             sysenterCs, sysenterEsp, sysenterEip);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureMsrSnapshot,
+                           hostEfer, pat);
         return false;
     }
     const u64 guestEfer = hostEfer;
@@ -4865,6 +4978,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             "[HV] CPU %u VMCS setup rejected guest TR 0x%04X: "
             "IA-32e guest requires a present busy 64-bit TSS (type=0xB)\n",
             cpuId, trSelector);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureGuestTr,
+                           trSelector, tssBase);
         return false;
     }
 
@@ -4892,6 +5007,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                          "ss=0x%04X tr=0x%04X cr3=0x%llX host_cr3=0x%llX\n",
                          cpuId, gdtBase, gdtLimit, idtBase, idtLimit, csSelector,
                          ssSelector, trSelector, guestCr3, hostCr3);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureDescriptorCr3,
+                           guestCr3, hostCr3);
         return false;
     }
 
@@ -4901,6 +5018,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if (ldtrSelector != 0) {
         HV_VERBOSE_PRINT("[HV] VMCS setup rejected a non-empty LDTR 0x%04X\n",
                          ldtrSelector);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureLdtr,
+                           ldtrSelector, 0);
         return false;
     }
 
@@ -4930,6 +5049,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             "[HV] CPU %u VMCS setup rejected sampled guest TR: "
             "selector=0x%04X limit=0x%X ar=0x%X base=0x%llX\n",
             cpuId, trSelector, trLimit, trAr, tssBase);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureSampledTr,
+                           trLimit, trAr);
         return false;
     }
 
@@ -5005,7 +5126,11 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     }
 
     WriteHvTrace(mutableVcpu, cpuId, HvTraceEventVmcsHostDone);
-    if (ShouldInjectFault(cpuId, HvFaultAfterHostState)) return false;
+    if (ShouldInjectFault(cpuId, HvFaultAfterHostState)) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureInjected,
+                           HvFaultAfterHostState, 0);
+        return false;
+    }
 
     // ==============================================================================
     // Guest State Configuration
@@ -5097,14 +5222,19 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(GUEST_SM_BASE, 0);
 
     // guest RIP/RSP
+    // VMX requires canonical guest pointers, not a 16-byte ABI-aligned stack.
+    // The launch thunk uses MOVDQU for its XMM frame and restores qwords
+    // directly, so a DPC frame that arrives 8-byte aligned remains valid.
     if (!GuestIp || !GuestSp ||
         !IsCanonical(reinterpret_cast<u64>(GuestIp)) ||
-        !IsCanonical(reinterpret_cast<u64>(GuestSp)) ||
-        (reinterpret_cast<u64>(GuestSp) & 0xFULL) != 0) {
+        !IsCanonical(reinterpret_cast<u64>(GuestSp))) {
         HV_VERBOSE_PRINT("[HV] CPU %u VMCS setup rejected guest entry pointers: "
                          "rip=0x%llX rsp=0x%llX\n",
                          cpuId, reinterpret_cast<u64>(GuestIp),
                          reinterpret_cast<u64>(GuestSp));
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureGuestEntry,
+                           reinterpret_cast<u64>(GuestIp),
+                           reinterpret_cast<u64>(GuestSp));
         return false;
     }
     VmWriteChecked(GUEST_RIP, reinterpret_cast<u64>(GuestIp));
@@ -5131,12 +5261,29 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if (!VmWriteChecked(GUEST_RFLAGS, guestRflags)) return false;
 
     WriteHvTrace(mutableVcpu, cpuId, HvTraceEventVmcsGuestDone);
-    if (ShouldInjectFault(cpuId, HvFaultAfterGuestState)) return false;
+    if (ShouldInjectFault(cpuId, HvFaultAfterGuestState)) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureInjected,
+                           HvFaultAfterGuestState, 0);
+        return false;
+    }
 
     // ==============================================================================
     // VM Execution Controls
     // ==============================================================================
     SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseExecutionControls);
+
+    // match HyperDbg's baseline VMCS image. These fields are inactive in the
+    // selected control profile, but explicit zeroes prevent stale values from
+    // a reused VMCS from changing the launch contract.
+    if (!VmWriteChecked(CONTROL_TSC_OFFSET, 0ULL) ||
+        !VmWriteChecked(CONTROL_PAGE_FAULT_ERROR_CODE_MASK, 0ULL) ||
+        !VmWriteChecked(CONTROL_PAGE_FAULT_ERROR_CODE_MATCH, 0ULL) ||
+        !VmWriteChecked(CONTROL_CR3_TARGET_COUNT, 0ULL) ||
+        !VmWriteChecked(CONTROL_VM_EXIT_MSR_STORE_COUNT, 0ULL) ||
+        !VmWriteChecked(CONTROL_VM_EXIT_MSR_LOAD_COUNT, 0ULL) ||
+        !VmWriteChecked(CONTROL_VM_ENTRY_MSR_LOAD_COUNT, 0ULL)) {
+        return false;
+    }
 
     const VmxControlGeneration generation =
         SelectVmxControlGeneration(Vcpu->VmxProfile);
@@ -5160,11 +5307,17 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             entryCtlMsr = MSR_IA32_VMX_TRUE_ENTRY_CTLS;
             break;
         default:
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               static_cast<u64>(generation), 0);
             return false;
     }
 
     u64 primaryControlsCapability = 0;
-    if (!ReadMsrSafe(procCtlMsr, &primaryControlsCapability)) return false;
+    if (!ReadMsrSafe(procCtlMsr, &primaryControlsCapability)) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           procCtlMsr, 0);
+        return false;
+    }
     mutableVcpu->PrimaryControlsCapability = primaryControlsCapability;
 
     u32 pinCtl = AdjustControls(0, pinCtlMsr);
@@ -5180,6 +5333,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if ((pinMandatoryOn & ~VMX_PINBASED_MANDATORY_ON) != 0 ||
         (pinCtl & pinExitControls) != 0 ||
         (pinCtl & ~VMX_PINBASED_MANDATORY_ON) != 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           pinCtl, pinMandatoryOn);
         return false;
     }
     VmWriteChecked(CONTROL_PIN_BASED_VM_EXECUTION_CONTROLS, pinCtl);
@@ -5209,6 +5364,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     if (g_XsavesEnabled) {
         if (!hasSecondaryControls ||
             (profile & VmxProfileXsaves) == 0) {
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureXstatePolicy,
+                               profile, secondaryRequested);
             return false;
         }
         secondaryRequested |= SECONDARY_ENABLE_XSAVES;
@@ -5220,9 +5377,17 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     u32 requestedPrimary = CPU_BASED_USE_MSR_BITMAPS;
     if (secondaryRequested) requestedPrimary |= CPU_BASED_ACTIVATE_SECONDARY_CONTROLS;
     u32 procCtl = AdjustControls(requestedPrimary, procCtlMsr);
-    if ((procCtl & CPU_BASED_USE_MSR_BITMAPS) == 0) return false;
+    if ((procCtl & CPU_BASED_USE_MSR_BITMAPS) == 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           procCtl, CPU_BASED_USE_MSR_BITMAPS);
+        return false;
+    }
     if (secondaryRequested &&
-        (procCtl & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) == 0) return false;
+        (procCtl & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) == 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           procCtl, secondaryRequested);
+        return false;
+    }
     // Keep the primary control policy explicit. CR3 load/store exiting is
     // controlled by bits 15 and 16, but both exits are reported as the
     // control-register access reason (28). This monitor handles MOV CR3 in
@@ -5246,6 +5411,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         CPU_BASED_CR3_STORE_EXITING;
     if ((primaryMandatoryOn & ~knownPrimaryMandatoryOn) != 0 ||
         (procCtl & ~(supportedPrimary | VMX_PROCBASED_MANDATORY_ON)) != 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           procCtl, primaryMandatoryOn);
         return false;
     }
     constexpr u32 unsupportedPrimary =
@@ -5262,6 +5429,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         HV_VERBOSE_PRINT("[HV] CPU %u VMX primary controls require an "
                          "unsupported exit path: proc=0x%08X mask=0x%08X\n",
                          cpuId, procCtl, procCtl & unsupportedPrimary);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           procCtl, procCtl & unsupportedPrimary);
         return false;
     }
     if (!VmWriteChecked(CONTROL_PRIMARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, procCtl)) return false;
@@ -5269,11 +5438,19 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     u32 secCtl = 0;
     if (procCtl & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) {
         secCtl = AdjustControls(secondaryRequested, MSR_IA32_VMX_PROCBASED_CTLS2);
-        if ((secCtl & secondaryRequested) != secondaryRequested) return false;
+        if ((secCtl & secondaryRequested) != secondaryRequested) {
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               secCtl, secondaryRequested);
+            return false;
+        }
         // No EPT/VPID/APIC virtualization/nested controls are implemented.
         // Refuse any mandatory secondary bit outside the exact instruction
         // pass-through set selected from CPUID above.
-        if (secCtl & ~secondaryRequested) return false;
+        if (secCtl & ~secondaryRequested) {
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               secCtl, secondaryRequested);
+            return false;
+        }
     }
     if ((procCtl & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) != 0 &&
         !VmWriteChecked(
@@ -5284,22 +5461,34 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
 
     WriteHvTrace(mutableVcpu, cpuId, HvTraceEventVmcsControlsDone,
                  procCtl, secCtl);
-    if (ShouldInjectFault(cpuId, HvFaultAfterVmcsControls)) return false;
+    if (ShouldInjectFault(cpuId, HvFaultAfterVmcsControls)) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureInjected,
+                           HvFaultAfterVmcsControls, 0);
+        return false;
+    }
 
     // The tertiary capability MSR is a direct 64-bit allowed-one bitmap. Do
     // not apply AdjustControls, whose low half has a different meaning.
     SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseTertiaryControls);
     u64 tertiaryCtl = 0;
     if (procCtl & CPU_BASED_ACTIVATE_TERTIARY_CONTROLS) {
-        if ((profile & VmxProfileTertiaryControls) == 0) return false;
+        if ((profile & VmxProfileTertiaryControls) == 0) {
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               profile, VmxProfileTertiaryControls);
+            return false;
+        }
         u64 tertiaryAllowedOne = 0;
         if (!ReadMsrSafe(MSR_IA32_VMX_PROCBASED_CTLS3, &tertiaryAllowedOne)) {
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               MSR_IA32_VMX_PROCBASED_CTLS3, 0);
             return false;
         }
         mutableVcpu->TertiaryControlsAllowed = tertiaryAllowedOne;
         constexpr u64 tertiaryRequested = 0;
         if (!HvTertiaryControlsAllowed(tertiaryRequested,
                                        tertiaryAllowedOne)) {
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               tertiaryRequested, tertiaryAllowedOne);
             return false;
         }
         tertiaryCtl = HvNormalizeTertiaryControls(tertiaryRequested,
@@ -5317,9 +5506,6 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
 
     SetVmcsSetupPhase(mutableVcpu, VmcsSetupPhaseExitEntryControls);
 
-    // optional fields stay untouched while their activating controls remain
-    // zero, avoiding VMfailValid on implementations without those components
-
     if (!VmWriteChecked(CONTROL_MSR_BITMAP_ADDRESS, Vcpu->MsrBitmapPhys)) return false;
     if (g_XsavesEnabled &&
         !VmWriteChecked(CONTROL_XSS_EXITING_BITMAP, 0)) {
@@ -5333,11 +5519,17 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                         VM_EXIT_LOAD_HOST_PAT;
     if (g_CetVmcsEnabled) requestedExit |= VM_EXIT_LOAD_CET_STATE;
     u32 exitCtl = AdjustControls(requestedExit, exitCtlMsr);
-    if ((exitCtl & requestedExit) != requestedExit) return false;
+    if ((exitCtl & requestedExit) != requestedExit) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           exitCtl, requestedExit);
+        return false;
+    }
     u32 supportedExit = requestedExit;
     const u32 exitMandatoryOn = ControlMandatoryOn(exitCtlMsr);
     if ((exitMandatoryOn & ~VMX_EXIT_MANDATORY_ON) != 0 ||
         (exitCtl & ~(supportedExit | VMX_EXIT_MANDATORY_ON)) != 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           exitCtl, exitMandatoryOn);
         return false;
     }
     if (!VmWriteChecked(CONTROL_VM_EXIT_CONTROLS, exitCtl)) return false;
@@ -5349,11 +5541,17 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                          VM_ENTRY_LOAD_GUEST_PAT;
     if (g_CetVmcsEnabled) requestedEntry |= VM_ENTRY_LOAD_CET_STATE;
     u32 entryCtl = AdjustControls(requestedEntry, entryCtlMsr);
-    if ((entryCtl & requestedEntry) != requestedEntry) return false;
+    if ((entryCtl & requestedEntry) != requestedEntry) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           entryCtl, requestedEntry);
+        return false;
+    }
     u32 supportedEntry = requestedEntry;
     const u32 entryMandatoryOn = ControlMandatoryOn(entryCtlMsr);
     if ((entryMandatoryOn & ~VMX_ENTRY_MANDATORY_ON) != 0 ||
         (entryCtl & ~(supportedEntry | VMX_ENTRY_MANDATORY_ON)) != 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                           entryCtl, entryMandatoryOn);
         return false;
     }
     if (!VmWriteChecked(CONTROL_VM_ENTRY_CONTROLS, entryCtl)) return false;
@@ -5388,6 +5586,9 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     u64 vmcsHostGsBase = 0;
     u64 vmcsHostEfer = 0;
     u64 vmcsHostPat = 0;
+    u64 vmcsHostSysenterCs = 0;
+    u64 vmcsHostSysenterEsp = 0;
+    u64 vmcsHostSysenterEip = 0;
     u64 vmcsHostTrBase = 0;
     u64 vmcsHostGdtBase = 0;
     u64 vmcsHostIdtBase = 0;
@@ -5416,6 +5617,10 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     u64 vmcsGuestGsBase = 0;
     u64 vmcsGuestEfer = 0;
     u64 vmcsGuestPat = 0;
+    u64 vmcsGuestSysenterCs = 0;
+    u64 vmcsGuestSysenterEsp = 0;
+    u64 vmcsGuestSysenterEip = 0;
+    u64 vmcsGuestDebugctl = 0;
     u64 vmcsGuestGdtBase = 0;
     u64 vmcsGuestIdtBase = 0;
     u64 vmcsGuestGdtLimit = 0;
@@ -5441,6 +5646,9 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             VmReadChecked(HOST_GS_BASE, &vmcsHostGsBase) &&
             VmReadChecked(HOST_EFER, &vmcsHostEfer) &&
             VmReadChecked(HOST_PAT, &vmcsHostPat) &&
+            VmReadChecked(HOST_IA32_SYSENTER_CS, &vmcsHostSysenterCs) &&
+            VmReadChecked(HOST_IA32_SYSENTER_ESP, &vmcsHostSysenterEsp) &&
+            VmReadChecked(HOST_IA32_SYSENTER_EIP, &vmcsHostSysenterEip) &&
             VmReadChecked(HOST_TR_BASE, &vmcsHostTrBase) &&
             VmReadChecked(HOST_GDTR_BASE, &vmcsHostGdtBase) &&
             VmReadChecked(HOST_IDTR_BASE, &vmcsHostIdtBase) &&
@@ -5469,6 +5677,10 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
             VmReadChecked(GUEST_GS_BASE, &vmcsGuestGsBase) &&
             VmReadChecked(GUEST_EFER, &vmcsGuestEfer) &&
             VmReadChecked(GUEST_PAT, &vmcsGuestPat) &&
+            VmReadChecked(GUEST_SYSENTER_CS, &vmcsGuestSysenterCs) &&
+            VmReadChecked(GUEST_SYSENTER_ESP, &vmcsGuestSysenterEsp) &&
+            VmReadChecked(GUEST_SYSENTER_EIP, &vmcsGuestSysenterEip) &&
+            VmReadChecked(GUEST_DEBUGCTL, &vmcsGuestDebugctl) &&
             VmReadChecked(GUEST_GDTR_BASE, &vmcsGuestGdtBase) &&
             VmReadChecked(GUEST_IDTR_BASE, &vmcsGuestIdtBase) &&
             VmReadChecked(GUEST_GDTR_LIMIT, &vmcsGuestGdtLimit) &&
@@ -5538,6 +5750,18 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                                          hostEfer, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, HOST_PAT, vmcsHostPat,
                                          pat, ~0ULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu,
+                                         HOST_IA32_SYSENTER_CS,
+                                         vmcsHostSysenterCs, sysenterCs,
+                                         0xFFFFFFFFULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu,
+                                         HOST_IA32_SYSENTER_ESP,
+                                         vmcsHostSysenterEsp, sysenterEsp,
+                                         ~0ULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu,
+                                         HOST_IA32_SYSENTER_EIP,
+                                         vmcsHostSysenterEip, sysenterEip,
+                                         ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, HOST_TR_BASE,
                                          vmcsHostTrBase, tssBase, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, HOST_GDTR_BASE,
@@ -5602,6 +5826,21 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                                          guestEfer, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, GUEST_PAT, vmcsGuestPat,
                                          guestPat, ~0ULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu,
+                                         GUEST_SYSENTER_CS,
+                                         vmcsGuestSysenterCs, sysenterCs,
+                                         0xFFFFFFFFULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu,
+                                         GUEST_SYSENTER_ESP,
+                                         vmcsGuestSysenterEsp, sysenterEsp,
+                                         ~0ULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu,
+                                         GUEST_SYSENTER_EIP,
+                                         vmcsGuestSysenterEip, sysenterEip,
+                                         ~0ULL);
+        valuesMatch &= VmcsValueMatches(mutableVcpu, GUEST_DEBUGCTL,
+                                         vmcsGuestDebugctl,
+                                         Vcpu->GuestDebugctl, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, GUEST_GDTR_BASE,
                                          vmcsGuestGdtBase, gdtBase, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, GUEST_IDTR_BASE,
@@ -5708,6 +5947,14 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                          vmcsGuestEfer, vmcsGuestPat,
                          vmcsGuestSCet, vmcsGuestSsp,
                          vmcsGuestInterruptSspTable);
+    }
+    if (!success && ReadVmcsFailureCommitState(mutableVcpu) !=
+                         HvVmcsFailureCommitted) {
+        PublishVmcsFailure(
+            mutableVcpu, HvVmcsFailureReadback,
+            static_cast<u64>(InterlockedCompareExchange(
+                &mutableVcpu->VmcsSetupPhase, 0, 0)),
+            readbackComplete ? 1ULL : 0ULL);
     }
     return success;
 }
@@ -5874,6 +6121,12 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
     InterlockedExchange(&vcpu->VmcsWriteState, 0);
     InterlockedExchange(&vcpu->VmcsReadFailed, 0);
     InterlockedExchange(&vcpu->VmcsReadState, 0);
+    InterlockedExchange(&vcpu->VmcsFailureCommitState,
+                        HvVmcsFailureEmpty);
+    InterlockedExchange(&vcpu->VmcsFailureReason,
+                        static_cast<LONG>(HvVmcsFailureNone));
+    vcpu->VmcsFailureArg0 = 0;
+    vcpu->VmcsFailureArg1 = 0;
     InterlockedExchange64(reinterpret_cast<volatile LONG64*>(
                               &vcpu->VmcsDiagnosticValidity),
                           static_cast<LONG64>(HvVmcsValidityNone));
@@ -6435,6 +6688,8 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         if (ShouldInjectFault(id, HvFaultAfterVmclear)) {
             WriteHvTrace(vcpu, id, HvTraceEventContractFail,
                          HvFaultAfterVmclear);
+            PublishVmcsFailure(vcpu, HvVmcsFailureInjected,
+                               HvFaultAfterVmclear, vmclearFlags);
             HvVmxOff();
             vmxActive = false;
             __writecr0(vcpu->OriginalCr0);
@@ -6456,6 +6711,8 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         if (ShouldInjectFault(id, HvFaultAfterVmptrld)) {
             WriteHvTrace(vcpu, id, HvTraceEventContractFail,
                          HvFaultAfterVmptrld);
+            PublishVmcsFailure(vcpu, HvVmcsFailureInjected,
+                               HvFaultAfterVmptrld, vmptrldFlags);
             if (!HvClearCurrentVmcsAndRecord()) {
                 HvFailVmcsClear();
             }
@@ -6469,8 +6726,25 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
         vcpu->LastVmclearFlags = vmclearFlags;
         vcpu->LastVmptrldFlags = vmptrldFlags;
         InterlockedExchange(&vcpu->LaunchCheckStage, LaunchCheckVmcs);
+        bool setupVmcsOk = false;
+        if (VmxOk(vmclearFlags) && VmxOk(vmptrldFlags)) {
+            setupVmcsOk = SetupVmcs(vcpu, GuestSp, GuestIp);
+        }
         if (!VmxOk(vmclearFlags) || !VmxOk(vmptrldFlags) ||
-            !SetupVmcs(vcpu, GuestSp, GuestIp)) {
+            !setupVmcsOk) {
+            if (!VmxOk(vmclearFlags)) {
+                PublishVmcsFailure(vcpu, HvVmcsFailureVmclear,
+                                   vmclearFlags, vcpu->VmcsPhys);
+            } else if (!VmxOk(vmptrldFlags)) {
+                PublishVmcsFailure(vcpu, HvVmcsFailureVmptrld,
+                                   vmptrldFlags, vcpu->VmcsPhys);
+            } else if (ReadVmcsFailureCommitState(vcpu) !=
+                       HvVmcsFailureCommitted) {
+                const long setupPhase = InterlockedCompareExchange(
+                    &vcpu->VmcsSetupPhase, 0, 0);
+                PublishVmcsFailure(vcpu, HvVmcsFailureReadback,
+                                   static_cast<u64>(setupPhase), 0);
+            }
             // SetupVmcs can fail after ordinary software validation or a
             // VMWRITE. Preserve an instruction error only when VMPTRLD itself
             // failed with VMfailValid; otherwise the field is not current
@@ -6551,6 +6825,8 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         InterlockedExchange(&vcpu->LaunchCheckStage, LaunchCheckException);
+        PublishVmcsFailure(vcpu, HvVmcsFailureException,
+                           static_cast<u64>(LaunchCheckException), 0);
         HV_VERBOSE_PRINT("[HV] CPU %u prepare raised an exception: vmx_active=%u "
                          "cr4_prepared=%u\n", id, vmxActive ? 1U : 0U,
                          cr4Prepared ? 1U : 0U);
@@ -6923,10 +7199,13 @@ static VOID TargetLaunchDpcRoutine(PKDPC Dpc,
                 : LaunchStageNone;
         const bool guestActive = launchState == VcpuLaunched &&
                                  launchStage == LaunchStageGuestActive;
-        const bool firstExitProbePassed =
-            guestActive && g_VcpuData &&
-            RunFirstExitProbe(&g_VcpuData[work->ProcessorIndex],
-                              work->ProcessorIndex);
+        bool firstExitProbePassed = guestActive;
+        if constexpr (kEnableLaunchFirstExitProbe) {
+            firstExitProbePassed =
+                guestActive && g_VcpuData &&
+                RunFirstExitProbe(&g_VcpuData[work->ProcessorIndex],
+                                  work->ProcessorIndex);
+        }
         if (firstExitProbePassed) {
             // this is the last recoverable boundary before the DPC reports
             // success to the coordinator, matching the generic DPC telemetry
@@ -7214,10 +7493,11 @@ static NTSTATUS QuarantineUnresolvedTargetWork() {
     return STATUS_SUCCESS;
 }
 
-static bool LaunchResultNeedsDetail(const VcpuContext& vcpu) {
+static bool LaunchResultNeedsDetail(u32 processorIndex,
+                                    const VcpuContext& vcpu) {
+    if (!ShouldReportLaunchResult(processorIndex)) return false;
     const long state = InterlockedCompareExchange(
         const_cast<volatile LONG*>(&vcpu.State), 0, 0);
-    const long firstExitProbeState = ReadFirstExitProbeState(&vcpu);
     const long action = InterlockedCompareExchange(
         const_cast<volatile LONG*>(&vcpu.LastExitAction), 0, 0);
     const long vmcsWriteFailed = InterlockedCompareExchange(
@@ -7227,10 +7507,8 @@ static bool LaunchResultNeedsDetail(const VcpuContext& vcpu) {
     const long vmcsValueMismatch = InterlockedCompareExchange(
         const_cast<volatile LONG*>(&vcpu.VmcsValueMismatch), 0, 0);
     const u64 diagnosticValidity = ReadVmcsDiagnosticValidity(&vcpu);
-    return state != VcpuLaunched ||
-           (!kUseHyperDbgGenericLaunch &&
-            firstExitProbeState != FirstExitProbeReturned) ||
-           action == kExitActionHalt ||
+    bool needsDetail = state != VcpuLaunched ||
+                       action == kExitActionHalt ||
            vcpu.LastExitEntryFailure != 0 ||
            vcpu.LastVmInstructionError != 0 ||
            (diagnosticValidity & HvVmcsValidityVmInstructionError) != 0 ||
@@ -7239,9 +7517,17 @@ static bool LaunchResultNeedsDetail(const VcpuContext& vcpu) {
            vmcsValueMismatch != 0 ||
            vcpu.LastExitReasonBasic == VM_EXIT_REASON_TRIPLE_FAULT ||
            vcpu.LastExitReasonBasic == VM_EXIT_REASON_INVALID_GUEST_STATE;
+    if constexpr (kEnableLaunchFirstExitProbe) {
+        const long firstExitProbeState = ReadFirstExitProbeState(&vcpu);
+        needsDetail = needsDetail ||
+                      (!kUseHyperDbgGenericLaunch &&
+                       firstExitProbeState != FirstExitProbeReturned);
+    }
+    return needsDetail;
 }
 
 static void PrintLaunchResult(u32 processorIndex, const VcpuContext& vcpu) {
+    if (!ShouldReportLaunchResult(processorIndex)) return;
     const long state = InterlockedCompareExchange(
         const_cast<volatile LONG*>(&vcpu.State), 0, 0);
     const long stage = InterlockedCompareExchange(
@@ -7272,7 +7558,7 @@ static void PrintLaunchResult(u32 processorIndex, const VcpuContext& vcpu) {
     const u64 launchHostCr3 = ReadLaunchCr3Field(&vcpu.LaunchHostCr3);
     const u64 launchCr3Metadata =
         ReadLaunchCr3Field(&vcpu.LaunchCr3Metadata);
-    if (!LaunchResultNeedsDetail(vcpu)) {
+    if (!LaunchResultNeedsDetail(processorIndex, vcpu)) {
         // keep the normal path below the debugger transport's burst size
         HV_PASSIVE_PRINT(
             "[HV] CPU %u launch result: state=%ld stage=%ld check=%ld "
@@ -7289,56 +7575,74 @@ static void PrintLaunchResult(u32 processorIndex, const VcpuContext& vcpu) {
         return;
     }
 
-    // retain the complete failure block for WinDbg and the crash blob
+    // keep each failure record below DbgPrintEx's 512-byte call limit so the
+    // fields needed to identify a VMCS failure are not truncated
+    const long vmcsSetupPhase = InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu.VmcsSetupPhase), 0, 0);
+    const long vmcsCurrent = InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu.VmcsCurrent), 0, 0);
+    const u64 probeResumeFlags = static_cast<u64>(InterlockedCompareExchange64(
+        reinterpret_cast<volatile LONG64*>(
+            const_cast<u64*>(&vcpu.FirstExitProbeResumeFlags)), 0, 0));
+    const long probeReason = InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu.FirstExitProbeReason), 0, 0);
+    const long probeAction = InterlockedCompareExchange(
+        const_cast<volatile LONG*>(&vcpu.FirstExitProbeAction), 0, 0);
+    u32 vmcsFailureCommit = 0;
+    u32 vmcsFailureReason = 0;
+    u64 vmcsFailureArg0 = 0;
+    u64 vmcsFailureArg1 = 0;
+    ReadVmcsFailureRecord(&vcpu, &vmcsFailureCommit, &vmcsFailureReason,
+                          &vmcsFailureArg0, &vmcsFailureArg1);
+
     HV_PASSIVE_PRINT(
-        "[HV] CPU %u launch result: state=%ld stage=%ld check=%ld "
+        "[HV] CPU %u launch failure: state=%ld stage=%ld check=%ld "
         "vmexits=%ld launch_flags=0x%llX raw_reason=0x%08X basic=%u "
-        "msr=0x%08X msr_value=0x%llX "
         "entry_failure=%u probe=%ld probe_exits=%ld probe_resumes=%ld "
-        "probe_reason=%ld probe_action=%ld probe_flags=0x%llX "
-        "action=%ld resumes=%ld rip=0x%llX "
-        "rsp=0x%llX exit_len=%llu qualification=0x%llX "
-        "instrerr=0x%llX resume_flags=0x%llX setup_phase=%ld "
-        "vmwrite_failed=%ld write_field=0x%llX write_flags=0x%llX "
-        "write_error=0x%llX vmread_failed=%ld read_field=0x%llX "
-        "read_flags=0x%llX read_error=0x%llX vmcs_mismatch=%ld "
-        "mismatch_field=0x%llX mismatch_expected=0x%llX "
-        "mismatch_actual=0x%llX mismatch_mask=0x%llX "
-         "validity=0x%llX "
-         "vmclear=0x%llX vmcs_current=%ld vmptrld=0x%llX "
-         "primary_caps=0x%llX tertiary_caps=0x%llX "
-         "cr3_raw_guest=0x%llX cr3_guest=0x%llX "
-         "cr3_raw_host=0x%llX cr3_host=0x%llX cr3_meta=0x%llX\n",
+        "probe_reason=%ld probe_action=%ld action=%ld resumes=%ld\n",
         processorIndex, state, stage, checkStage, vmExitCount,
         vcpu.LastLaunchFlags, vcpu.LastExitReasonRaw,
-        vcpu.LastExitReasonBasic, vcpu.LastExitMsrIndex,
-        vcpu.LastExitMsrValue, vcpu.LastExitEntryFailure,
+        vcpu.LastExitReasonBasic, vcpu.LastExitEntryFailure,
         firstExitProbeState, firstExitProbeExits, firstExitProbeResumes,
-        InterlockedCompareExchange(
-            const_cast<volatile LONG*>(&vcpu.FirstExitProbeReason), 0, 0),
-        InterlockedCompareExchange(
-            const_cast<volatile LONG*>(&vcpu.FirstExitProbeAction), 0, 0),
-        static_cast<u64>(InterlockedCompareExchange64(
-            reinterpret_cast<volatile LONG64*>(
-                const_cast<u64*>(&vcpu.FirstExitProbeResumeFlags)), 0, 0)),
-        action, vcpu.VmResumeAttempts, vcpu.LastGuestRip,
-        vcpu.LastGuestRsp, vcpu.LastExitInstructionLength,
-        vcpu.LastExitQualification, vcpu.LastVmInstructionError,
-        vcpu.LastVmResumeFlags,
-        vcpu.VmcsSetupPhase, vmcsWriteFailed, vcpu.FirstVmcsWriteField,
-        vcpu.FirstVmcsWriteFlags, vcpu.FirstVmcsWriteError,
-        vmcsReadFailed, vcpu.FirstVmcsReadField,
-        vcpu.FirstVmcsReadFlags, vcpu.FirstVmcsReadError,
-        vmcsValueMismatch, vcpu.FirstVmcsMismatchField,
+        probeReason, probeAction, action, vcpu.VmResumeAttempts);
+    HV_PASSIVE_PRINT(
+        "[HV] CPU %u VMCS rejection: commit=%ld reason=%ld "
+        "arg0=0x%llX arg1=0x%llX\n",
+        processorIndex, vmcsFailureCommit, vmcsFailureReason,
+        vmcsFailureArg0, vmcsFailureArg1);
+    HV_PASSIVE_PRINT(
+        "[HV] CPU %u launch transition: msr=0x%08X msr_value=0x%llX "
+        "rip=0x%llX rsp=0x%llX exit_len=%llu qualification=0x%llX "
+        "instrerr=0x%llX resume_flags=0x%llX probe_flags=0x%llX\n",
+        processorIndex, vcpu.LastExitMsrIndex, vcpu.LastExitMsrValue,
+        vcpu.LastGuestRip, vcpu.LastGuestRsp,
+        vcpu.LastExitInstructionLength, vcpu.LastExitQualification,
+        vcpu.LastVmInstructionError, vcpu.LastVmResumeFlags,
+        probeResumeFlags);
+    HV_PASSIVE_PRINT(
+        "[HV] CPU %u VMCS access: setup_phase=%ld vmwrite_failed=%ld "
+        "write_field=0x%llX write_flags=0x%llX write_error=0x%llX "
+        "vmread_failed=%ld read_field=0x%llX read_flags=0x%llX "
+        "read_error=0x%llX\n",
+        processorIndex, vmcsSetupPhase, vmcsWriteFailed,
+        vcpu.FirstVmcsWriteField, vcpu.FirstVmcsWriteFlags,
+        vcpu.FirstVmcsWriteError, vmcsReadFailed, vcpu.FirstVmcsReadField,
+        vcpu.FirstVmcsReadFlags, vcpu.FirstVmcsReadError);
+    HV_PASSIVE_PRINT(
+        "[HV] CPU %u VMCS image: mismatch=%ld field=0x%llX "
+        "expected=0x%llX actual=0x%llX mask=0x%llX validity=0x%llX "
+        "vmclear=0x%llX current=%ld vmptrld=0x%llX\n",
+        processorIndex, vmcsValueMismatch, vcpu.FirstVmcsMismatchField,
         vcpu.FirstVmcsMismatchExpected, vcpu.FirstVmcsMismatchActual,
-         vcpu.FirstVmcsMismatchMask, diagnosticValidity,
-         vcpu.LastVmclearFlags,
-         InterlockedCompareExchange(
-             const_cast<volatile LONG*>(&vcpu.VmcsCurrent), 0, 0),
-         vcpu.LastVmptrldFlags, vcpu.PrimaryControlsCapability,
-         vcpu.TertiaryControlsAllowed, launchRawGuestCr3,
-         launchGuestCr3, launchRawHostCr3, launchHostCr3,
-         launchCr3Metadata);
+        vcpu.FirstVmcsMismatchMask, diagnosticValidity,
+        vcpu.LastVmclearFlags, vmcsCurrent, vcpu.LastVmptrldFlags);
+    HV_PASSIVE_PRINT(
+        "[HV] CPU %u VMCS capabilities: primary=0x%llX tertiary=0x%llX "
+        "cr3_raw_guest=0x%llX cr3_guest=0x%llX "
+        "cr3_raw_host=0x%llX cr3_host=0x%llX cr3_meta=0x%llX\n",
+        processorIndex, vcpu.PrimaryControlsCapability,
+        vcpu.TertiaryControlsAllowed, launchRawGuestCr3, launchGuestCr3,
+        launchRawHostCr3, launchHostCr3, launchCr3Metadata);
 }
 
 extern "C" NTSTATUS StartHypervisor() {
@@ -7660,6 +7964,7 @@ extern "C" NTSTATUS StartHypervisor() {
 
             HV_PASSIVE_PRINT(
                 "[HV] DEBUG single-CPU VMLAUNCH path failed; rolling back\n");
+            PrintLaunchResult(debugCpu, g_VcpuData[debugCpu]);
 
             StopHypervisorInternal(true);
             ReleaseCoordinatorAffinity(&coordinatorAffinity,
@@ -7817,72 +8122,87 @@ extern "C" NTSTATUS StartHypervisor() {
                 WaitTargetLaunchDpc(i, launchDeadline, &unresolved);
             const long state = InterlockedCompareExchange(
                 &g_VcpuData[i].State, 0, 0);
-            const long stage = InterlockedCompareExchange(
-                &g_VcpuData[i].LaunchStage, 0, 0);
-            const long checkStage = InterlockedCompareExchange(
-                &g_VcpuData[i].LaunchCheckStage, 0, 0);
-            const long vmExitCount = InterlockedCompareExchange(
-                &g_VcpuData[i].VmExitCount, 0, 0);
-            const long firstExitProbeState =
-                ReadFirstExitProbeState(&g_VcpuData[i]);
-            const long firstExitProbeExits = InterlockedCompareExchange(
-                &g_VcpuData[i].FirstExitProbeObservedVmExits, 0, 0);
-            const long firstExitProbeResumes = InterlockedCompareExchange(
-                &g_VcpuData[i].FirstExitProbeObservedVmResumes, 0, 0);
-            const long action = InterlockedCompareExchange(
-                &g_VcpuData[i].LastExitAction, 0, 0);
-            const u64 launchRawGuestCr3 =
-                ReadLaunchCr3Field(&g_VcpuData[i].LaunchRawGuestCr3);
-            const u64 launchGuestCr3 =
-                ReadLaunchCr3Field(&g_VcpuData[i].LaunchGuestCr3);
-            const u64 launchRawHostCr3 =
-                ReadLaunchCr3Field(&g_VcpuData[i].LaunchRawHostCr3);
-            const u64 launchHostCr3 =
-                ReadLaunchCr3Field(&g_VcpuData[i].LaunchHostCr3);
-            const u64 launchCr3Metadata =
-                ReadLaunchCr3Field(&g_VcpuData[i].LaunchCr3Metadata);
-            HV_PASSIVE_PRINT(
-                "[HV] CPU %u staged launch: status=0x%08X state=%ld "
-                "stage=%ld check=%ld vmexits=%ld raw_reason=0x%08X "
-                "basic=%u msr=0x%08X msr_value=0x%llX exit_len=%llu "
-                "probe=%ld probe_exits=%ld probe_resumes=%ld "
-                "probe_reason=%ld probe_action=%ld action=%ld "
-                "resume_flags=0x%llX rip=0x%llX rsp=0x%llX "
-                "flags=0x%llX instrerr=0x%llX "
-                "cr3_guest=0x%llX cr3_host=0x%llX cr3_meta=0x%llX\n",
-                i, static_cast<ULONG>(waitStatus), state, stage, checkStage,
-                vmExitCount,
-                g_VcpuData[i].LastExitReasonRaw,
-                g_VcpuData[i].LastExitReasonBasic,
-                g_VcpuData[i].LastExitMsrIndex,
-                g_VcpuData[i].LastExitMsrValue,
-                g_VcpuData[i].LastExitInstructionLength,
-                firstExitProbeState,
-                firstExitProbeExits,
-                firstExitProbeResumes,
-                InterlockedCompareExchange(
-                    &g_VcpuData[i].FirstExitProbeReason, 0, 0),
-                InterlockedCompareExchange(
-                    &g_VcpuData[i].FirstExitProbeAction, 0, 0),
-                action,
-                g_VcpuData[i].LastVmResumeFlags,
-                g_VcpuData[i].LastGuestRip,
-                g_VcpuData[i].LastGuestRsp,
-                g_VcpuData[i].LastLaunchFlags,
-                g_VcpuData[i].LastVmInstructionError,
-                launchGuestCr3, launchHostCr3, launchCr3Metadata);
-            // keep raw CR3 values in a separate short record because the
-            // detailed launch line is close to DbgPrintEx's 512-byte limit
-            HV_PASSIVE_PRINT(
-                "[HV] CPU %u staged CR3: raw_guest=0x%llX guest=0x%llX "
-                "raw_host=0x%llX host=0x%llX meta=0x%llX\n",
-                i, launchRawGuestCr3, launchGuestCr3, launchRawHostCr3,
-                launchHostCr3, launchCr3Metadata);
+            if (!NT_SUCCESS(waitStatus) ||
+                LaunchResultNeedsDetail(i, g_VcpuData[i])) {
+                const long stage = InterlockedCompareExchange(
+                    &g_VcpuData[i].LaunchStage, 0, 0);
+                const long checkStage = InterlockedCompareExchange(
+                    &g_VcpuData[i].LaunchCheckStage, 0, 0);
+                const long vmExitCount = InterlockedCompareExchange(
+                    &g_VcpuData[i].VmExitCount, 0, 0);
+                const long firstExitProbeState =
+                    ReadFirstExitProbeState(&g_VcpuData[i]);
+                const long firstExitProbeExits = InterlockedCompareExchange(
+                    &g_VcpuData[i].FirstExitProbeObservedVmExits, 0, 0);
+                const long firstExitProbeResumes = InterlockedCompareExchange(
+                    &g_VcpuData[i].FirstExitProbeObservedVmResumes, 0, 0);
+                const long action = InterlockedCompareExchange(
+                    &g_VcpuData[i].LastExitAction, 0, 0);
+                const u64 launchRawGuestCr3 =
+                    ReadLaunchCr3Field(&g_VcpuData[i].LaunchRawGuestCr3);
+                const u64 launchGuestCr3 =
+                    ReadLaunchCr3Field(&g_VcpuData[i].LaunchGuestCr3);
+                const u64 launchRawHostCr3 =
+                    ReadLaunchCr3Field(&g_VcpuData[i].LaunchRawHostCr3);
+                const u64 launchHostCr3 =
+                    ReadLaunchCr3Field(&g_VcpuData[i].LaunchHostCr3);
+                const u64 launchCr3Metadata =
+                    ReadLaunchCr3Field(&g_VcpuData[i].LaunchCr3Metadata);
+                HV_PASSIVE_PRINT(
+                    "[HV] CPU %u staged launch: status=0x%08X state=%ld "
+                    "stage=%ld check=%ld vmexits=%ld raw_reason=0x%08X "
+                    "basic=%u msr=0x%08X msr_value=0x%llX exit_len=%llu "
+                    "probe=%ld probe_exits=%ld probe_resumes=%ld "
+                    "probe_reason=%ld probe_action=%ld action=%ld "
+                    "resume_flags=0x%llX rip=0x%llX rsp=0x%llX "
+                    "flags=0x%llX instrerr=0x%llX "
+                    "cr3_guest=0x%llX cr3_host=0x%llX cr3_meta=0x%llX\n",
+                    i, static_cast<ULONG>(waitStatus), state, stage, checkStage,
+                    vmExitCount,
+                    g_VcpuData[i].LastExitReasonRaw,
+                    g_VcpuData[i].LastExitReasonBasic,
+                    g_VcpuData[i].LastExitMsrIndex,
+                    g_VcpuData[i].LastExitMsrValue,
+                    g_VcpuData[i].LastExitInstructionLength,
+                    firstExitProbeState,
+                    firstExitProbeExits,
+                    firstExitProbeResumes,
+                    InterlockedCompareExchange(
+                        &g_VcpuData[i].FirstExitProbeReason, 0, 0),
+                    InterlockedCompareExchange(
+                        &g_VcpuData[i].FirstExitProbeAction, 0, 0),
+                    action,
+                    g_VcpuData[i].LastVmResumeFlags,
+                    g_VcpuData[i].LastGuestRip,
+                    g_VcpuData[i].LastGuestRsp,
+                    g_VcpuData[i].LastLaunchFlags,
+                    g_VcpuData[i].LastVmInstructionError,
+                    launchGuestCr3, launchHostCr3, launchCr3Metadata);
+                // keep raw CR3 values in a separate short record because the
+                // detailed launch line is close to DbgPrintEx's 512-byte limit
+                HV_PASSIVE_PRINT(
+                    "[HV] CPU %u staged CR3: raw_guest=0x%llX guest=0x%llX "
+                    "raw_host=0x%llX host=0x%llX meta=0x%llX\n",
+                    i, launchRawGuestCr3, launchGuestCr3, launchRawHostCr3,
+                    launchHostCr3, launchCr3Metadata);
+            }
             if (!NT_SUCCESS(waitStatus)) {
                 targetStatus = waitStatus;
                 break;
             }
             if (state == VcpuLaunched) ++launchedCount;
+        }
+
+        if (NT_SUCCESS(targetStatus) && !unresolved) {
+            HV_PASSIVE_PRINT(
+                "[HV] staged launch completed: %u/%u participating processors\n",
+                launchedCount, expected);
+        } else {
+            HV_PASSIVE_PRINT(
+                "[HV] staged launch stopped: status=0x%08X launched=%u/%u "
+                "unresolved=%u\n",
+                static_cast<ULONG>(targetStatus), launchedCount, expected,
+                unresolved ? 1U : 0U);
         }
 
         if (unresolved) {
@@ -7893,6 +8213,13 @@ extern "C" NTSTATUS StartHypervisor() {
             return quarantineStatus;
         }
         if (!NT_SUCCESS(targetStatus)) {
+            if (!unresolved) {
+                for (u32 i = 0; i < g_ProcessorCount; ++i) {
+                    if (LaunchResultNeedsDetail(i, g_VcpuData[i])) {
+                        PrintLaunchResult(i, g_VcpuData[i]);
+                    }
+                }
+            }
             StopHypervisorInternal(true);
             ReleaseCoordinatorAffinity(&coordinatorAffinity,
                                         &coordinatorBound);
@@ -7905,6 +8232,11 @@ extern "C" NTSTATUS StartHypervisor() {
     }
 
     if (launchedCount != expected) {
+        for (u32 i = 0; i < g_ProcessorCount; ++i) {
+            if (LaunchResultNeedsDetail(i, g_VcpuData[i])) {
+                PrintLaunchResult(i, g_VcpuData[i]);
+            }
+        }
         StopHypervisorInternal(true);
         ReleaseCoordinatorAffinity(&coordinatorAffinity, &coordinatorBound);
         return IsHypervisorQuarantined() ? STATUS_SUCCESS
@@ -7922,7 +8254,8 @@ extern "C" NTSTATUS StartHypervisor() {
             &g_VcpuData[i].State, 0, 0);
         if (state == VcpuLaunched) {
             ok++;
-        } else {
+        }
+        if (LaunchResultNeedsDetail(i, g_VcpuData[i])) {
             PrintLaunchResult(i, g_VcpuData[i]);
         }
     }
