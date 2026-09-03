@@ -70,7 +70,62 @@ enum HvTraceEvent : u32 {
     HvTraceEventFatalVmexit = 31,
     HvTraceEventFirstExitProbe = 32,
     HvTraceEventCr3LaunchContract = 33,
+    HvTraceEventHostIdtReady = 34,
+    HvTraceEventVmexitHostStateReady = 35,
+    HvTraceEventPostDpcCanary = 36,
 };
+
+// first-wins VMX-root exception evidence. The assembly exception stubs fill
+// the architectural prefix before calling any Windows routine so a recursive
+// host fault still leaves a debugger-visible vector, RIP and control state.
+struct HvHostFaultRecord {
+    volatile u32 CommitState;
+    u32 Vector;
+    u64 ErrorCode;
+    u64 Rip;
+    u64 Rsp;
+    u64 Rflags;
+    u64 Cr2;
+    u64 Cr3;
+    u64 Cr4;
+    u64 Tsc;
+    volatile u32 Cpu;
+    u32 Reserved;
+    u64 LastExitReasonRaw;
+    u64 LastGuestRip;
+    u64 LastGuestRsp;
+    u64 LastExitQualification;
+    u64 LastIdtVectoringInfo;
+    u64 LastVmExitIntrInfo;
+    u64 VmExitCount;
+    u64 LaunchStage;
+    u64 LaunchCheckStage;
+};
+
+static_assert(offsetof(HvHostFaultRecord, CommitState) == 0x00,
+              "host fault commit offset changed");
+static_assert(offsetof(HvHostFaultRecord, Vector) == 0x04,
+              "host fault vector offset changed");
+static_assert(offsetof(HvHostFaultRecord, ErrorCode) == 0x08,
+              "host fault error-code offset changed");
+static_assert(offsetof(HvHostFaultRecord, Rip) == 0x10,
+              "host fault RIP offset changed");
+static_assert(offsetof(HvHostFaultRecord, Rsp) == 0x18,
+              "host fault RSP offset changed");
+static_assert(offsetof(HvHostFaultRecord, Rflags) == 0x20,
+              "host fault RFLAGS offset changed");
+static_assert(offsetof(HvHostFaultRecord, Cr2) == 0x28,
+              "host fault CR2 offset changed");
+static_assert(offsetof(HvHostFaultRecord, Cr3) == 0x30,
+              "host fault CR3 offset changed");
+static_assert(offsetof(HvHostFaultRecord, Cr4) == 0x38,
+              "host fault CR4 offset changed");
+static_assert(offsetof(HvHostFaultRecord, Tsc) == 0x40,
+              "host fault TSC offset changed");
+static_assert(offsetof(HvHostFaultRecord, Cpu) == 0x48,
+              "host fault CPU offset changed");
+static_assert(sizeof(HvHostFaultRecord) == 0x98,
+              "host fault record layout changed");
 // these offsets belong to this software frame, not to CPU-specific VMCS fields
 // HvVmExitEntryPoint reserves the first 0x1000 bytes for XSAVE and starts the
 // GPR/GuestContext fields at offset 0x1000. Keep the limit in a shared header
@@ -303,6 +358,17 @@ static_assert(offsetof(GuestContext, GuestDr7) == 0x1130,
               "VM-exit DR7 layout changed");
 static_assert(offsetof(GuestContext, GuestDebugctl) == 0x1138,
               "VM-exit DEBUGCTL layout changed");
+// These two slots live in the existing tail padding before the host DR7 slot.
+// They are teardown metadata, not architectural guest state, so keep them out
+// of GuestContext to avoid increasing its 64-byte-aligned sizeof.
+constexpr u64 VMEXIT_NATIVE_IDT_BASE_OFFSET = 0x1140;
+constexpr u64 VMEXIT_NATIVE_IDT_LIMIT_OFFSET = 0x1148;
+static_assert(offsetof(GuestContext, GuestDebugctl) + sizeof(u64) <=
+                  VMEXIT_NATIVE_IDT_BASE_OFFSET,
+              "native IDT base overlaps GuestContext fields");
+static_assert(VMEXIT_NATIVE_IDT_LIMIT_OFFSET + sizeof(u64) <=
+                  VMEXIT_HOST_DR7_OFFSET,
+              "native IDT metadata overlaps host DR7 slot");
 // The VM-exit frame is 0x1180 bytes.  Its final eight bytes are reserved for
 // the per-CPU host KERNEL_GS_BASE shadow (HostStackTop - 8).
 static_assert(offsetof(GuestContext, GuestSysenterEip) + sizeof(u64) <= 0x1178,
@@ -322,6 +388,12 @@ struct VcpuContext {
 
     void* HostStack;
     u64   HostStackTop;
+
+    // VMX-root uses a private IDT copied from the owning CPU's Windows IDT.
+    // Critical exception gates point at tiny assembly stubs that publish raw
+    // fault evidence before the normal kernel bugcheck path is attempted.
+    void* VmxHostIdt;
+    u64   VmxHostIdtBase;
 
     // Fixed-size nonpaged storage owned by this logical processor. The write
     // index is monotonically increasing so readers can recover the newest
@@ -475,6 +547,7 @@ struct VcpuContext {
     u64 LastGuestCr0;
     u64 LastGuestCr3;
     u64 LastGuestCr4;
+    u64 LastGuestCr2;
     u64 LastGuestCs;
     u64 LastGuestSs;
     u64 LastGuestTr;

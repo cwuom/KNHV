@@ -27,6 +27,8 @@ extern MarkCurrentVcpuTearingDown:proc
 extern MarkCurrentVcpuStopped:proc
 extern HandleVmResumeFailure:proc
 extern HvFatalBugCheck:proc
+extern HvHostExceptionBugCheck:proc
+extern g_HvHostFaultRecord:byte
 extern g_LinearAddressBits:byte
 extern g_CetVmcsEnabled:byte
 extern g_XsavesEnabled:byte
@@ -104,6 +106,8 @@ CTX_GUEST_SSP   equ 01120h
 CTX_GUEST_INTR_SSP_TABLE equ 01128h
 CTX_GUEST_DR7   equ 01130h
 CTX_GUEST_DEBUGCTL equ 01138h
+CTX_NATIVE_IDT_BASE equ 01140h
+CTX_NATIVE_IDT_LIMIT equ 01148h
 
 ; The VMX host RSP is HostStackTop. The C++ preparation stores the host
 ; KERNEL_GS_BASE shadow at HostStackTop - 8, which is offset 0x1178 after the
@@ -148,6 +152,8 @@ RST_GUEST_CS    equ 0A8h
 RST_GUEST_SS    equ 0B0h
 RST_FRAME_RSP   equ 0B8h
 RST_RING        equ 0C0h
+RST_IDTR_LIMIT  equ 0C8h
+RST_IDTR_BASE   equ 0CAh
 
 ; The thunk returns this value in RAX through the normal C++ call return
 ; address.  Bits used by the VMLAUNCH CF/ZF result are deliberately not relied
@@ -163,10 +169,161 @@ HV_TRACE_PRE_VMRESUME    equ 20
 HV_TRACE_PRE_VMXOFF      equ 23
 HV_TRACE_POST_VMXOFF     equ 24
 HV_TRACE_VMRESUME_FAIL   equ 21
+HV_TRACE_VMEXIT_HOST_READY equ 35
 HV_TRACE_FATAL_SNAPSHOT_COMPLETE equ 29
 HV_TRACE_FATAL_PARKED   equ 30
 HV_FAULT_BEFORE_VMLAUNCH equ 8
 HV_FAULT_VMLAUNCH_FAIL  equ 9
+
+; VMX-root exception evidence offsets. Keep these synchronized with the
+; static_asserts on HvHostFaultRecord in common.h. The assembly path writes
+; this prefix before calling C++ so a second fault cannot erase the first one.
+HOST_FAULT_COMMIT equ 000h
+HOST_FAULT_VECTOR equ 004h
+HOST_FAULT_ERROR  equ 008h
+HOST_FAULT_RIP    equ 010h
+HOST_FAULT_RSP    equ 018h
+HOST_FAULT_RFLAGS equ 020h
+HOST_FAULT_CR2    equ 028h
+HOST_FAULT_CR3    equ 030h
+HOST_FAULT_CR4    equ 038h
+HOST_FAULT_TSC    equ 040h
+
+; error-code and no-error stubs normalize the no-IST root stack to:
+;   vector, error, RIP, CS, RFLAGS
+; the interrupted RSP is therefore the address immediately above RFLAGS.
+; Debug and breakpoint vectors deliberately keep the Windows handlers so KD
+; remains usable while the VMX-root diagnostic IDT is active.
+HvHostException0 proc
+    push 0
+    push 0
+    jmp HvHostExceptionCommon
+HvHostException0 endp
+
+HvHostException5 proc
+    push 0
+    push 5
+    jmp HvHostExceptionCommon
+HvHostException5 endp
+
+HvHostException6 proc
+    push 0
+    push 6
+    jmp HvHostExceptionCommon
+HvHostException6 endp
+
+HvHostException7 proc
+    push 0
+    push 7
+    jmp HvHostExceptionCommon
+HvHostException7 endp
+
+; #DF, #TS, #NP, #SS, #GP and #PF arrive with a hardware error code.
+HvHostException8 proc
+    push 8
+    jmp HvHostExceptionCommon
+HvHostException8 endp
+
+HvHostException10 proc
+    push 10
+    jmp HvHostExceptionCommon
+HvHostException10 endp
+
+HvHostException11 proc
+    push 11
+    jmp HvHostExceptionCommon
+HvHostException11 endp
+
+HvHostException12 proc
+    push 12
+    jmp HvHostExceptionCommon
+HvHostException12 endp
+
+HvHostException13 proc
+    push 13
+    jmp HvHostExceptionCommon
+HvHostException13 endp
+
+HvHostException14 proc
+    push 14
+    jmp HvHostExceptionCommon
+HvHostException14 endp
+
+HvHostException16 proc
+    push 0
+    push 16
+    jmp HvHostExceptionCommon
+HvHostException16 endp
+
+; #AC carries an error code. #MC and #XM do not.
+HvHostException17 proc
+    push 17
+    jmp HvHostExceptionCommon
+HvHostException17 endp
+
+HvHostException18 proc
+    push 0
+    push 18
+    jmp HvHostExceptionCommon
+HvHostException18 endp
+
+HvHostException19 proc
+    push 0
+    push 19
+    jmp HvHostExceptionCommon
+HvHostException19 endp
+
+; #CP carries the architectural control-protection error code.
+HvHostException21 proc
+    push 21
+    jmp HvHostExceptionCommon
+HvHostException21 endp
+
+HvHostExceptionCommon:
+    cli
+    cld
+
+    xor eax, eax
+    mov edx, 1
+    lock cmpxchg dword ptr [g_HvHostFaultRecord + HOST_FAULT_COMMIT], edx
+    jne hvHostFaultAlreadyCommitted
+
+    mov eax, dword ptr [rsp]
+    mov dword ptr [g_HvHostFaultRecord + HOST_FAULT_VECTOR], eax
+    mov rax, qword ptr [rsp + 08h]
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_ERROR], rax
+    mov rax, qword ptr [rsp + 10h]
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_RIP], rax
+    lea rax, [rsp + 28h]
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_RSP], rax
+    mov rax, qword ptr [rsp + 20h]
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_RFLAGS], rax
+    mov rax, cr2
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_CR2], rax
+    mov rax, cr3
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_CR3], rax
+    mov rax, cr4
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_CR4], rax
+    rdtsc
+    shl rdx, 20h
+    or rax, rdx
+    mov qword ptr [g_HvHostFaultRecord + HOST_FAULT_TSC], rax
+    mfence
+    mov dword ptr [g_HvHostFaultRecord + HOST_FAULT_COMMIT], 2
+
+    ; Only the CPU that won the first-fault record may enter C++. A recursive
+    ; fault or a simultaneous fault on another CPU must not overwrite the
+    ; evidence or race a second bugcheck path against the original failure.
+    and rsp, 0FFFFFFFFFFFFFFF0h
+    sub rsp, 20h
+    call HvHostExceptionBugCheck
+
+hvHostFaultAlreadyCommitted:
+
+hvHostFaultPark:
+    cli
+    hlt
+    jmp hvHostFaultPark
 
 ; ------------------------------------------------------------------------------
 ; HvVmExitEntryPoint
@@ -202,6 +359,8 @@ vmExitAsmRecorded:
     mov [rsp + 1060h], r13
     mov [rsp + 1068h], r14
     mov [rsp + 1070h], r15
+    mov qword ptr [rsp + CTX_NATIVE_IDT_BASE], 0
+    mov qword ptr [rsp + CTX_NATIVE_IDT_LIMIT], 0
     mov qword ptr [rsp + CTX_ABORT_VM], 0
     mov qword ptr [rsp + CTX_HALT_VM], 0
 
@@ -346,6 +505,15 @@ vmxHostMasksReady:
     ; restored from the VMCS on VMRESUME (or from the IRET frame during
     ; teardown), so clearing it here does not alter guest architectural state.
     cld
+
+    ; This is the earliest normal C++-safe VM-exit milestone: host KGS, debug
+    ; state, XCR0 and XSS are all restored. If KD sees VM-exit assembly entry
+    ; without this trace and no root-fault record, the stall is inside the
+    ; fixed assembly preservation prefix rather than VmExitHandler.
+    mov ecx, HV_TRACE_VMEXIT_HOST_READY
+    sub rsp, 20h
+    call HvTraceCurrentVcpuEvent
+    add rsp, 20h
 
     mov rcx, rsp
 
@@ -561,6 +729,21 @@ vmxHaltHostMasksReady:
     mov ecx, HV_TRACE_POST_VMXOFF
     sub rsp, 20h
     call HvTraceCurrentVcpuEvent
+    add rsp, 20h
+
+    ; VMX is off now. Put the Windows IDTR back before KeBugCheckEx so the
+    ; ordinary crash path no longer depends on the diagnostic root IDT. Keep
+    ; the private IDT on VMXOFF failure, where it is still needed for evidence.
+    mov rax, [rsp + CTX_NATIVE_IDT_BASE]
+    test rax, rax
+    jz vmxHaltBugCheck
+    mov r10, rsp
+    sub rsp, 20h
+    mov rax, [r10 + CTX_NATIVE_IDT_LIMIT]
+    mov word ptr [rsp], ax
+    mov rax, [r10 + CTX_NATIVE_IDT_BASE]
+    mov qword ptr [rsp + 2], rax
+    lidt fword ptr [rsp]
     add rsp, 20h
     jmp vmxHaltBugCheck
 vmxHaltVmxoffFailed:
@@ -844,6 +1027,10 @@ restoreFrameReady:
     mov [r9 + RST_GUEST_CS], r12
     mov [r9 + RST_GUEST_SS], r13
     mov [r9 + RST_FRAME_RSP], r8
+    mov rax, [r10 + CTX_NATIVE_IDT_LIMIT]
+    mov word ptr [r9 + RST_IDTR_LIMIT], ax
+    mov rax, [r10 + CTX_NATIVE_IDT_BASE]
+    mov qword ptr [r9 + RST_IDTR_BASE], rax
     mov rsi, r8
     mov rbp, r9
 
@@ -993,6 +1180,10 @@ restoreGuestStateDone:
     shr rdx, 20h
     wrmsr
 restoreGuestCetDone:
+    ; HOST_IDTR_BASE uses the private VMX-root table. Restore the exact native
+    ; Windows IDTR immediately before the architectural handoff. Interrupts
+    ; remain disabled until IRETQ restores the guest RFLAGS.
+    lidt fword ptr [r9 + RST_IDTR_LIMIT]
 
     ; VMXOFF leaves CR4.VMXE set. Install the guest CR4/CR3 pair only after
     ; all host-context reads and lifecycle callbacks are complete.
@@ -1421,17 +1612,8 @@ GuestStartThunk proc
     pop rdx
     pop rcx
     pop rax
-    ; keep the launch frame protected until RSP points at the caller frame
-    ; restore all saved flags except IF, then use STI's one-instruction shadow
-    ; so the stack transition completes before a maskable interrupt is taken
-    bt qword ptr [rsp], 9
-    jnc guestStartWithoutInterrupts
-    btr qword ptr [rsp], 9
-    popfq
-    sti
-    add rsp, 08h
-    ret
-guestStartWithoutInterrupts:
+    ; match HyperDbg's restore contract: the VMCS carries the saved DPC
+    ; RFLAGS image, so restore it directly and discard the alignment slot.
     popfq
     add rsp, 08h
     ret

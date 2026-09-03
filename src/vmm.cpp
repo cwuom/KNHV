@@ -46,6 +46,25 @@ extern "C" {
 
     // entry point for vm-exit, used in vmcs setup
     void HvVmExitEntryPoint();
+
+    // VMX-root exception stubs. The private host IDT keeps Windows' original
+    // descriptor attributes and replaces only these synchronous fault targets.
+    void HvHostException0();
+    void HvHostException5();
+    void HvHostException6();
+    void HvHostException7();
+    void HvHostException8();
+    void HvHostException10();
+    void HvHostException11();
+    void HvHostException12();
+    void HvHostException13();
+    void HvHostException14();
+    void HvHostException16();
+    void HvHostException17();
+    void HvHostException18();
+    void HvHostException19();
+    void HvHostException21();
+
     void HvTraceCurrentVcpuEvent(u32 Event);
     bool HvFaultInjectedCurrent(u32 Stage);
     void HvCaptureFatalSnapshotPreVmxoff(GuestContext* Ctx);
@@ -101,6 +120,9 @@ extern "C" {
 // ==============================================================================
 VcpuContext* g_VcpuData = nullptr;
 u32 g_ProcessorCount = 0;
+extern "C" {
+__declspec(align(64)) HvHostFaultRecord g_HvHostFaultRecord = {};
+}
 static volatile LONG g_HvLifecycle = 0;
 static volatile LONG g_HvImagePinned = 0;
 static constexpr LONG kHvLifecycleIdle = 0;
@@ -114,6 +136,7 @@ enum TargetOperation : LONG {
     TargetOperationProbe = 1,
     TargetOperationLaunch = 2,
     TargetOperationStop = 3,
+    TargetOperationRuntimeCanary = 4,
 };
 
 enum TargetWorkState : LONG {
@@ -139,6 +162,22 @@ struct __declspec(align(64)) TargetCpuWork {
     u64 QueueTime;
     u64 EnterTime;
     u64 ReturnTime;
+
+    // post-DPC canary evidence. The worker runs after the launch DPC has
+    // returned and therefore exercises ordinary scheduler context on the
+    // virtualized processor rather than the launch callback's saved frame.
+    volatile LONG CanaryBaselineVmExits;
+    volatile LONG CanaryObservedVmExits;
+    volatile LONG CanaryBaselineVmResumes;
+    volatile LONG CanaryObservedVmResumes;
+    volatile LONG CanaryLastExitReason;
+    volatile LONG CanaryIrql;
+    u32 CanaryCpuidEax;
+    u32 CanaryCpuidEbx;
+    u32 CanaryCpuidEcx;
+    u32 CanaryCpuidEdx;
+    u64 CanaryCr3;
+    u64 CanaryCr4;
 };
 
 // a launch DPC runs on the target processor's existing kernel context. Keep
@@ -260,9 +299,8 @@ extern "C" volatile LONG g_HvVerboseLogging = 1;
             HV_PASSIVE_PRINT(__VA_ARGS__); \
         } \
     } while (0)
-// Supervisor CET is not fully virtualized yet. The compatibility path hides
-// CET from the guest and intercepts its user and supervisor MSRs.
-static constexpr bool kGuestCetStateVirtualized = false;
+// V44 preserves the CET state selected by the running Windows instance and
+// does not redefine its already-established late-launch feature contract.
 
 static constexpr long kExitActionNone = 0;
 static constexpr long kExitActionResume = 1;
@@ -291,11 +329,11 @@ static constexpr u64 kDebugctlArchitecturalMask =
     IA32_DEBUGCTL_ARCHITECTURAL_MASK;
 static constexpr u64 kCr0WriteProtect = 1ULL << 16;
 
-// Production mode launches the same validated VMX contract on every
-// participating logical processor. Set this only in a dedicated bring-up
-// build when a debugger must isolate one processor deliberately.
-static constexpr bool kDebugSingleCpu = false;
-static constexpr u32  kDebugCpuIndex = 0;
+// This build is deliberately diagnostic: keep CPU0 and every processor except
+// CPU1 native so KD and the scheduler retain a large native execution surface
+// while the late-launch contract is isolated to one logical processor.
+static constexpr bool kDebugSingleCpu = true;
+static constexpr u32  kDebugCpuIndex = 1;
 
 // keep the processor that owns the startup rendezvous native. on a late load
 // from a live kernel-debug session this is also the processor most likely to
@@ -1061,8 +1099,9 @@ constexpr u32 TAG_HV00 = 0x30305648; // 'HV00' little endian
 constexpr u32 TAG_HVST = 0x54535648; // 'HVST' little endian
 constexpr u32 TAG_HVCB = 0x42435648; // 'HVCB' little endian
 constexpr u32 TAG_HVTR = 0x52545648; // 'HVTR' little endian
+constexpr u32 TAG_HVID = 0x44495648; // HVID in little endian
 static constexpr u64 kHvCrashBlobSignature = 0x48564342524D5541; // HVCBRMA
-static constexpr u32 kHvCrashBlobVersion = 11;
+static constexpr u32 kHvCrashBlobVersion = 13;
 static const GUID kHvCrashBlobGuid = {
     0xC6A3D9F0, 0x2F6F, 0x4E4A,
     {0xA5, 0x9E, 0x61, 0x34, 0x12, 0x88, 0x4B, 0xE6}
@@ -1100,6 +1139,7 @@ struct HvFatalSnapshot {
     u64 GuestCr0;
     u64 GuestCr3;
     u64 GuestCr4;
+    u64 GuestCr2;
     u64 LaunchRawGuestCr3;
     u64 LaunchGuestCr3;
     u64 LaunchRawHostCr3;
@@ -1189,6 +1229,7 @@ struct HvCrashBlob {
     u32 LaunchLastDispatchProcessor;
     u32 LaunchLastPrepareProcessor;
     u32 LaunchLastReturnProcessor;
+    HvHostFaultRecord HostFault;
     HvFatalSnapshot CpuSnapshots[1];
 };
 
@@ -1476,16 +1517,11 @@ static __forceinline bool IsFixedCrValueValid(u64 value, u32 fixed0Msr,
 }
 
 static __forceinline u64 GetCr4GuestHostMask() {
-    // Bits in the guest-host mask are supplied by CR4_READ_SHADOW on MOV
-    // from CR4. Keep the mask limited to state that this monitor can enforce.
-    return CR4_VMXE |
-           (g_CetVmcsEnabled ? 0ULL : CR4_CET) |
-           CR4_OSXSAVE |
-           CR4_FRED |
-           ((g_XstateMode == XstateSaveFxsave ||
-             (g_HostXcr0Mask & XCR0_PKRU) == 0)
-                ? CR4_PKE
-                : 0ULL);
+    // A live Windows kernel has already committed its CR4 contract before
+    // this driver loads. HyperDbg keeps both guest/host masks at zero; doing
+    // the same avoids trapping ordinary CR4 updates or synthesizing a view
+    // that differs from the native coordinator processor.
+    return 0;
 }
 
 static __forceinline bool IsCanonical(u64 value) {
@@ -1499,6 +1535,80 @@ static __forceinline bool IsCanonical(u64 value) {
     const u64 upperMask = ~((1ULL << bits) - 1ULL);
     return (value & signBit) ? ((value & upperMask) == upperMask)
                              : ((value & upperMask) == 0);
+}
+
+#pragma pack(push, 1)
+struct HvIdtGate64 {
+    u16 OffsetLow;
+    u16 Selector;
+    u8 Ist;
+    u8 TypeAttributes;
+    u16 OffsetMiddle;
+    u32 OffsetHigh;
+    u32 Reserved;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(HvIdtGate64) == 16,
+              "64-bit IDT gates must remain 16 bytes");
+
+static __forceinline void SetVmxHostIdtHandler(HvIdtGate64* gate,
+                                                void (*handler)()) {
+    if (!gate || !handler) return;
+    const u64 address = reinterpret_cast<u64>(handler);
+    gate->OffsetLow = static_cast<u16>(address & 0xFFFFULL);
+    gate->OffsetMiddle = static_cast<u16>((address >> 16) & 0xFFFFULL);
+    gate->OffsetHigh = static_cast<u32>(address >> 32);
+
+    // match HyperDbg's current private-host-IDT model when no dedicated IST
+    // stack is configured. A uniform no-IST frame also lets the raw assembly
+    // recorder compute the interrupted RSP without guessing Windows' per-vector
+    // IST policy.
+    gate->Ist = 0;
+}
+
+static bool PrepareVmxHostIdt(VcpuContext* vcpu, u64 nativeIdtBase,
+                              u16 nativeIdtLimit, u32 cpuId) {
+    if (!vcpu || !vcpu->VmxHostIdt || !IsCanonical(nativeIdtBase)) {
+        return false;
+    }
+
+    constexpr SIZE_T kMinimumExceptionIdtBytes = 32 * sizeof(HvIdtGate64);
+    SIZE_T copyBytes = static_cast<SIZE_T>(nativeIdtLimit) + 1;
+    if (copyBytes < kMinimumExceptionIdtBytes) return false;
+    if (copyBytes > PAGE_SIZE) copyBytes = PAGE_SIZE;
+
+    RtlZeroMemory(vcpu->VmxHostIdt, PAGE_SIZE);
+    RtlCopyMemory(vcpu->VmxHostIdt,
+                  reinterpret_cast<const void*>(nativeIdtBase), copyBytes);
+
+    auto* idt = static_cast<HvIdtGate64*>(vcpu->VmxHostIdt);
+    // Keep Windows' selector, gate type, DPL and IST choice. Only replace the
+    // synchronous exception targets that can hide a VMX-root failure behind a
+    // reset or a recursive kernel exception on the private host stack.
+    SetVmxHostIdtHandler(&idt[0], HvHostException0);
+    SetVmxHostIdtHandler(&idt[5], HvHostException5);
+    SetVmxHostIdtHandler(&idt[6], HvHostException6);
+    SetVmxHostIdtHandler(&idt[7], HvHostException7);
+    SetVmxHostIdtHandler(&idt[8], HvHostException8);
+    SetVmxHostIdtHandler(&idt[10], HvHostException10);
+    SetVmxHostIdtHandler(&idt[11], HvHostException11);
+    SetVmxHostIdtHandler(&idt[12], HvHostException12);
+    SetVmxHostIdtHandler(&idt[13], HvHostException13);
+    SetVmxHostIdtHandler(&idt[14], HvHostException14);
+    SetVmxHostIdtHandler(&idt[16], HvHostException16);
+    SetVmxHostIdtHandler(&idt[17], HvHostException17);
+    SetVmxHostIdtHandler(&idt[18], HvHostException18);
+    SetVmxHostIdtHandler(&idt[19], HvHostException19);
+    SetVmxHostIdtHandler(&idt[21], HvHostException21);
+
+    vcpu->VmxHostIdtBase = reinterpret_cast<u64>(vcpu->VmxHostIdt);
+    if (!IsCanonical(vcpu->VmxHostIdtBase)) return false;
+
+    WriteHvTrace(vcpu, cpuId, HvTraceEventHostIdtReady,
+                 nativeIdtBase, vcpu->VmxHostIdtBase, nativeIdtLimit,
+                 static_cast<u64>(copyBytes));
+    return true;
 }
 
 static __forceinline bool IsValidPatValue(u64 value) {
@@ -2304,6 +2414,8 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
         InterlockedCompareExchange(&g_HvLaunchLastPrepareProcessor, 0, 0));
     blob->LaunchLastReturnProcessor = static_cast<u32>(
         InterlockedCompareExchange(&g_HvLaunchLastReturnProcessor, 0, 0));
+    RtlCopyMemory(&blob->HostFault, &g_HvHostFaultRecord,
+                  sizeof(blob->HostFault));
     const u64 vmxOffFailureFlags = static_cast<u64>(
         InterlockedCompareExchange64(
             reinterpret_cast<volatile LONG64*>(&g_HvVmxOffFailureFlagsAsm),
@@ -2339,6 +2451,7 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
         out.GuestCr0 = 0;
         out.GuestCr3 = 0;
         out.GuestCr4 = 0;
+        out.GuestCr2 = 0;
         out.LaunchRawGuestCr3 = 0;
         out.LaunchGuestCr3 = 0;
         out.LaunchRawHostCr3 = 0;
@@ -2447,6 +2560,7 @@ static void CaptureHvCrashBlob(ULONG_PTR bugcheckCode,
             out.GuestCr0 = vcpu.LastGuestCr0;
             out.GuestCr3 = vcpu.LastGuestCr3;
             out.GuestCr4 = vcpu.LastGuestCr4;
+            out.GuestCr2 = vcpu.LastGuestCr2;
             out.LaunchRawGuestCr3 =
                 ReadLaunchCr3Field(&vcpu.LaunchRawGuestCr3);
             out.LaunchGuestCr3 = ReadLaunchCr3Field(&vcpu.LaunchGuestCr3);
@@ -2863,6 +2977,45 @@ extern "C" __declspec(noreturn) void HvFatalBugCheck(GuestContext* c) {
     }
     MemoryBarrier();
     KeBugCheckEx(kHvFatalBugCheck, cpu, reason, rip, rsp);
+    __assume(0);
+}
+
+extern "C" __declspec(noreturn) void HvHostExceptionBugCheck() {
+    // The assembly stub has already committed the architectural prefix using
+    // only flat-address writes. Everything below is best-effort enrichment;
+    // even a recursive fault leaves the first vector/RIP/CR2 tuple intact.
+    const u32 cpu = CurrentProcessorIndex();
+    g_HvHostFaultRecord.Cpu = cpu;
+
+    if (g_VcpuData && cpu < g_ProcessorCount) {
+        const VcpuContext& vcpu = g_VcpuData[cpu];
+        g_HvHostFaultRecord.LastExitReasonRaw = vcpu.LastExitReasonRaw;
+        g_HvHostFaultRecord.LastGuestRip = vcpu.LastGuestRip;
+        g_HvHostFaultRecord.LastGuestRsp = vcpu.LastGuestRsp;
+        g_HvHostFaultRecord.LastExitQualification = vcpu.LastExitQualification;
+        g_HvHostFaultRecord.LastIdtVectoringInfo = vcpu.LastIdtVectoringInfo;
+        g_HvHostFaultRecord.LastVmExitIntrInfo = vcpu.LastVmExitIntrInfo;
+        g_HvHostFaultRecord.VmExitCount = static_cast<u64>(
+            InterlockedCompareExchange(
+                const_cast<volatile LONG*>(&vcpu.VmExitCount), 0, 0));
+        g_HvHostFaultRecord.LaunchStage = static_cast<u64>(
+            InterlockedCompareExchange(
+                const_cast<volatile LONG*>(&vcpu.LaunchStage), 0, 0));
+        g_HvHostFaultRecord.LaunchCheckStage = static_cast<u64>(
+            InterlockedCompareExchange(
+                const_cast<volatile LONG*>(&vcpu.LaunchCheckStage), 0, 0));
+    }
+
+    MemoryBarrier();
+    constexpr ULONG_PTR kHostRootFaultMarker = 0x544F4F52ULL; // "ROOT"
+    const ULONG_PTR cpuVector =
+        (static_cast<ULONG_PTR>(cpu) << 32) |
+        static_cast<ULONG_PTR>(g_HvHostFaultRecord.Vector);
+    KeBugCheckEx(kHvFatalBugCheck,
+                 kHostRootFaultMarker,
+                 cpuVector,
+                 static_cast<ULONG_PTR>(g_HvHostFaultRecord.ErrorCode),
+                 static_cast<ULONG_PTR>(g_HvHostFaultRecord.Rip));
     __assume(0);
 }
 
@@ -3632,81 +3785,12 @@ bool HandleMsrWrite(GuestContext* Ctx) {
 static bool ConfigureMsrBitmap(VcpuContext* vcpu) {
     if (!vcpu || !vcpu->MsrBitmapVirt) return false;
 
-    // A one bit means "cause a VM-exit".  VMX loads the VMCS-managed values
-    // on entry and restores the host copies on exit.  Reads can therefore run
-    // natively, while writes still need the handler to update the VMCS before
-    // the next transition.  This is the low-overhead baseline used by
-    // HyperDbg and avoids trapping ordinary kernel RDMSR instructions.
+    // One means intercept and zero means execute natively. Windows has
+    // already enabled CET/XSS and may write CET, FS/GS, PAT, EFER or PT
+    // state immediately after the launch DPC returns. Injecting #GP for
+    // those legitimate late-boot writes breaks the pre-existing OS
+    // contract. HyperDbg starts from the same all-zero bitmap baseline.
     RtlZeroMemory(vcpu->MsrBitmapVirt, PAGE_SIZE);
-
-    auto setBit = [&](u32 msr, bool write) -> bool {
-        u32 base = 0;
-        if (msr <= 0x1FFFU) {
-            base = write ? 0x800U : 0x000U;
-        } else if (msr >= 0xC0000000U && msr <= 0xC0001FFFU) {
-            base = write ? 0xC00U : 0x400U;
-            msr -= 0xC0000000U;
-        } else {
-            return false;
-        }
-        const u32 byteOffset = base + ((msr & 0x1FFFU) >> 3);
-        const u8 bit = static_cast<u8>(1U << (msr & 7U));
-        static_cast<u8*>(vcpu->MsrBitmapVirt)[byteOffset] |= bit;
-        return true;
-    };
-
-    // KERNEL_GS_BASE stays pass-through like HyperDbg because it is not a
-    // VMCS field; the assembly boundary snapshots it before host code runs
-    // and restores that snapshot before VMRESUME
-    constexpr u32 vmxManagedWriteMsrs[] = {
-        MSR_FS_BASE, MSR_GS_BASE,
-        MSR_IA32_EFER, MSR_IA32_PAT,
-        MSR_IA32_DEBUGCTL,
-        MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP,
-        MSR_IA32_SYSENTER_EIP,
-    };
-    for (u32 msr : vmxManagedWriteMsrs) {
-        if (!setBit(msr, true)) return false;
-    }
-
-    // XFD is not part of the VMCS state used by this monitor. Keep both
-    // directions trapped so the hidden guest contract can return #GP without
-    // exposing or changing the host selector.
-    constexpr u32 hiddenXfdMsrs[] = {
-        MSR_IA32_XFD, MSR_IA32_XFD_ERR,
-    };
-    for (u32 msr : hiddenXfdMsrs) {
-        if (!setBit(msr, false) || !setBit(msr, true)) return false;
-    }
-
-    // trap the complete RTIT window and leave VMX before native PT access
-    for (u32 msr = MSR_IA32_RTIT_OUTPUT_BASE; msr <= 0x58FU; ++msr) {
-        if (!setBit(msr, false) || !setBit(msr, true)) return false;
-    }
-
-    // IA32_XSS has no VMCS field, so keep the initial selector per virtual CPU
-    // and leave VMX before a later selector or CET contract change
-    if (!setBit(MSR_IA32_XSS, false) || !setBit(MSR_IA32_XSS, true)) {
-        return false;
-    }
-    // The guest contract hides user CET even when the host XSAVES frame can
-    // preserve its component: the MSR handlers expose a reset read view and
-    // reject writes, so native non-root access must never reach the hardware.
-    // Trap these MSRs unconditionally to prevent a guest from changing the
-    // logical processor's CET state behind the VMCS contract.
-    constexpr u32 hiddenCetUserMsrs[] = {
-        MSR_IA32_U_CET, MSR_IA32_PL3_SSP,
-    };
-    for (u32 msr : hiddenCetUserMsrs) {
-        if (!setBit(msr, false) || !setBit(msr, true)) return false;
-    }
-    constexpr u32 cetSupervisorMsrs[] = {
-        MSR_IA32_S_CET, MSR_IA32_PL0_SSP, MSR_IA32_PL1_SSP,
-        MSR_IA32_PL2_SSP, MSR_IA32_INTERRUPT_SSP_TABLE,
-    };
-    for (u32 msr : cetSupervisorMsrs) {
-        if (!setBit(msr, false) || !setBit(msr, true)) return false;
-    }
     return true;
 }
 
@@ -4041,6 +4125,16 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         return;
     }
     VcpuContext* vcpu = &g_VcpuData[cpuId];
+
+    // CR2 is not part of the VMCS. capture it before the root handler performs
+    // any operation that could itself fault so a guest #PF -> #DF chain still
+    // leaves the original linear address in the per-CPU record.
+    vcpu->LastGuestCr2 = __readcr2();
+
+    *reinterpret_cast<u64*>(reinterpret_cast<u8*>(Ctx) +
+                           VMEXIT_NATIVE_IDT_BASE_OFFSET) = vcpu->HostIdtBase;
+    *reinterpret_cast<u64*>(reinterpret_cast<u8*>(Ctx) +
+                           VMEXIT_NATIVE_IDT_LIMIT_OFFSET) = vcpu->HostIdtLimit;
     if (AcquireFatalSnapshotCommitState(vcpu) != HvFatalSnapshotEmpty) {
         FailFirstExitProbeAtFatalBoundary(vcpu, cpuId);
         Ctx->AbortVm = 0;
@@ -4390,230 +4484,16 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
                 Ctx->Rdx = kFirstExitProbeEdx;
             }
             else {
+                // Late launch must not renegotiate CPU capabilities after
+                // Windows has already initialized CET, XSTATE and PT. Run
+                // the requested leaf natively so virtualized processors and
+                // the reserved native coordinator expose one coherent view.
                 int regs[4] = {};
+                __cpuidex(regs, static_cast<int>(leaf),
+                          static_cast<int>(subleaf));
 
-                // CPUID leaves outside the advertised basic/extended ranges
-                // are architecturally treated as unsupported.  Returning
-                // zeros is deterministic and avoids exposing host-specific
-                // undefined values through the monitor.
-                int maxRegs[4] = {};
-                __cpuidex(maxRegs, 0, 0);
-                const u32 maxBasicLeaf = static_cast<u32>(maxRegs[0]);
-                __cpuidex(maxRegs, 0x80000000, 0);
-                const u32 maxExtendedLeaf = static_cast<u32>(maxRegs[0]);
-                const bool basicLeaf = leaf <= maxBasicLeaf;
-                const bool extendedLeaf = leaf >= 0x80000000U &&
-                                          leaf <= maxExtendedLeaf;
-                // Hypervisor leaves are deliberately not implemented by this
-                // non-nested monitor.  Do not leak a host hypervisor ABI.
-                const bool hypervisorLeaf = leaf >= 0x40000000U &&
-                                            leaf <= 0x4FFFFFFFU;
-                if ((basicLeaf || extendedLeaf) && !hypervisorLeaf) {
-                    bool subleafSupported = true;
-                    if (leaf == 7) {
-                        int leaf7MaxRegs[4] = {};
-                        __cpuidex(leaf7MaxRegs, 7, 0);
-                        const u32 maxSubleaf =
-                            static_cast<u32>(leaf7MaxRegs[0]);
-                        if (subleaf > maxSubleaf) {
-                            RtlZeroMemory(regs, sizeof(regs));
-                            subleafSupported = false;
-                        } else if (subleaf == 0) {
-                            RtlCopyMemory(regs, leaf7MaxRegs, sizeof(regs));
-                        } else {
-                            __cpuidex(regs, 7, static_cast<int>(subleaf));
-                        }
-                    } else {
-                        __cpuidex(regs, static_cast<int>(leaf),
-                                  static_cast<int>(subleaf));
-                    }
-
-                    if (subleafSupported && leaf == 1) {
-                        // Do not advertise VMX to a guest: nested
-                        // virtualization is intentionally unsupported.
-                        regs[2] &= ~(1 << 5);
-                        if (g_XstateMode == XstateSaveFxsave) {
-                            regs[2] &= ~static_cast<int>(CPUID_1_ECX_XSAVE |
-                                                         CPUID_1_ECX_OSXSAVE |
-                                                         CPUID_1_ECX_AVX);
-                        }
-                        if ((vcpu->HostXcr0 & XCR0_AVX) == 0) {
-                            regs[2] &= ~static_cast<int>(CPUID_1_ECX_AVX |
-                                                         CPUID_1_ECX_FMA |
-                                                         CPUID_1_ECX_F16C);
-                        }
-                    } else if (subleafSupported && leaf == 7 && subleaf == 0) {
-                        // PT and incomplete CET state are not guest-virtualized
-                        regs[1] &= ~static_cast<int>(CPUID_7_EBX_INTEL_PT);
-                        if (!kGuestCetStateVirtualized) {
-                            regs[2] &= ~static_cast<int>(CPUID_7_ECX_CET_SHSTK);
-                            regs[3] &= ~static_cast<int>(CPUID_7_EDX_CET_IBT);
-                        }
-                        if ((static_cast<u32>(g_VmxGuestOptionalProfile) &
-                             VmxProfileInvpcid) == 0) {
-                            regs[1] &= ~(1 << 10);  // INVPCID
-                        }
-                        const bool avxEnabled =
-                            (vcpu->HostXcr0 & XCR0_AVX) != 0;
-                        const bool avx512Enabled =
-                            (vcpu->HostXcr0 & XCR0_AVX512) == XCR0_AVX512;
-                        const bool amxEnabled =
-                            (vcpu->HostXcr0 & XCR0_AMX) == XCR0_AMX;
-                        if (!avxEnabled) {
-                            regs[1] &= ~static_cast<int>(CPUID_7_EBX_AVX2);
-                        }
-                        if (!avx512Enabled) {
-                            regs[1] &= ~static_cast<int>(
-                                CPUID_7_EBX_AVX512F |
-                                CPUID_7_EBX_AVX512DQ |
-                                CPUID_7_EBX_AVX512_IFMA |
-                                CPUID_7_EBX_AVX512PF |
-                                CPUID_7_EBX_AVX512ER |
-                                CPUID_7_EBX_AVX512CD |
-                                CPUID_7_EBX_AVX512BW |
-                                CPUID_7_EBX_AVX512VL);
-                            regs[2] &= ~static_cast<int>(
-                                CPUID_7_ECX_AVX512_VBMI |
-                                CPUID_7_ECX_AVX512_VBMI2 |
-                                CPUID_7_ECX_AVX512_VNNI);
-                        }
-                        if (!amxEnabled) {
-                            regs[3] &= ~static_cast<int>(
-                                CPUID_7_EDX_AMX_BF16 |
-                                CPUID_7_EDX_AMX_TILE |
-                                CPUID_7_EDX_AMX_INT8);
-                        }
-                        const bool mpxEnabled =
-                            (vcpu->HostXcr0 & XCR0_MPX) == XCR0_MPX;
-                        if (!mpxEnabled) {
-                            regs[1] &= ~static_cast<int>(CPUID_7_EBX_MPX);
-                        }
-                        const bool pkruEnabled =
-                            (vcpu->HostXcr0 & XCR0_PKRU) != 0;
-                        if (!pkruEnabled) {
-                            regs[2] &= ~static_cast<int>(CPUID_7_ECX_PKU |
-                                                         CPUID_7_ECX_OSPKE);
-                        } else if ((Ctx->GuestCr4 & CR4_PKE) == 0) {
-                            regs[2] &= ~static_cast<int>(CPUID_7_ECX_OSPKE);
-                        }
-                    } else if (subleafSupported && leaf == 7 && subleaf == 1) {
-                        // FRED and its architectural companion LKGS are not
-                        // virtualized by this monitor. Hide both bits so the
-                        // guest cannot observe a partially exposed contract.
-                        regs[0] &= ~static_cast<int>(CPUID_7_1_EAX_FRED);
-                        regs[0] &= ~static_cast<int>(CPUID_7_1_EAX_LKGS);
-                        if ((vcpu->HostXcr0 & XCR0_AVX) == 0) {
-                            regs[0] &= ~static_cast<int>(CPUID_7_1_EAX_AVX_VNNI);
-                        }
-                        if ((vcpu->HostXcr0 & XCR0_AVX512) !=
-                            XCR0_AVX512) {
-                            regs[0] &= ~static_cast<int>(CPUID_7_1_EAX_AVX512_BF16);
-                        }
-                    } else if (subleafSupported && leaf == 0x80000001U) {
-                        if ((static_cast<u32>(g_VmxGuestOptionalProfile) &
-                             VmxProfileRdtscp) == 0) {
-                            regs[3] &= ~(1 << 27);  // RDTSCP
-                        }
-                    } else if (subleafSupported && leaf == 0xD &&
-                               g_XstateMode == XstateSaveFxsave) {
-                        // FXSAVE cannot preserve any XSAVE-managed component
-                        RtlZeroMemory(regs, sizeof(regs));
-                    } else if (subleafSupported && leaf == 0xD && subleaf == 0) {
-                        // The guest may select any validated subset of the
-                        // host XCR0 mask; CPUID reports the current and maximum
-                        // sizes for that per-guest selection.
-                        const u64 guestCurrentXcr0 = vcpu->GuestXcr0;
-                        const u64 guestSupportedXcr0 = vcpu->HostXcr0;
-                        u32 guestCurrentXsaveSize = 0;
-                        u32 guestMaximumXsaveSize = 0;
-                        if (!ComputeStandardXsaveAreaSize(
-                                guestCurrentXcr0, &guestCurrentXsaveSize) ||
-                            !ComputeStandardXsaveAreaSize(
-                                guestSupportedXcr0, &guestMaximumXsaveSize)) {
-                            RtlZeroMemory(regs, sizeof(regs));
-                        } else {
-                            // D.0 uses the standard XSAVE layout. EBX is the
-                            // current XCR0 size and ECX is the maximum size for
-                            // the guest-supported XCR0 components.
-                            regs[0] = static_cast<int>(guestSupportedXcr0);
-                            regs[1] = static_cast<int>(guestCurrentXsaveSize);
-                            regs[2] = static_cast<int>(guestMaximumXsaveSize);
-                            regs[3] = static_cast<int>(guestSupportedXcr0 >> 32);
-                        }
-                    } else if (subleafSupported && leaf == 0xD && subleaf == 1) {
-                        // xcr1 is not virtualized by this monitor. Hide both
-                        // the xgetbv(1) capability and xfd, whose state is not
-                        // included in the immutable VM-exit save contract
-                        regs[0] &= ~static_cast<int>(CPUID_D1_XGETBV1 |
-                                                     CPUID_D1_XFD);
-                        const bool hostXsavec =
-                            (static_cast<u32>(regs[0]) & CPUID_D1_XSAVEC) != 0;
-                        u64 guestXssCapabilities = 0;
-                        u32 guestXsaveSize = 0;
-                        // D.1 ECX/EDX describe components that the guest may
-                        // select, while EBX describes the current selection.
-                        // Keep those two views separate because the fixed
-                        // XSAVES frame preserves the interrupted host XSS.
-                        const u64 guestXssCapabilityMask =
-                            g_XsavesEnabled ? g_SupportedXssMask : 0ULL;
-                        const u64 guestXssSelection =
-                            g_XsavesEnabled
-                                ? (vcpu->GuestXss & guestXssCapabilityMask)
-                                : 0ULL;
-                        // D.1:EBX is nonzero only when the processor supports
-                        // the compacted XSAVE format. With XSAVES enabled it
-                        // covers XCR0|IA32_XSS; with XSAVEC only it covers
-                        // XCR0. If neither instruction is available, Intel
-                        // defines the field as zero.
-                        const bool compactedSupported =
-                            g_XsavesEnabled != 0 || hostXsavec;
-                        if (compactedSupported &&
-                            ComputeXsaveAreaSize(
-                                vcpu->GuestXcr0,
-                                guestXssSelection,
-                                &guestXssCapabilities, &guestXsaveSize)) {
-                            regs[1] = static_cast<int>(guestXsaveSize);
-                        } else {
-                            regs[1] = 0;
-                        }
-                        if (!g_XsavesEnabled) {
-                            // Do not advertise XSAVES/XRSTORS when the
-                            // compacted supervisor-state path is unavailable.
-                            regs[0] &= ~(1 << 3);  // XSAVES
-                            regs[0] &= ~(1 << 4);  // XFD
-                        }
-                        // IA32_XSS is a guest selector. ECX/EDX are capability
-                        // masks, not the current selector, so preserve the
-                        // architectural component descriptions while hiding
-                        // state that this monitor cannot restore.
-                        regs[2] &= static_cast<int>(
-                            static_cast<u32>(guestXssCapabilityMask));
-                        regs[3] &= static_cast<int>(
-                            static_cast<u32>(guestXssCapabilityMask >> 32));
-                    } else if (subleafSupported && leaf == 0xD &&
-                               subleaf >= 2 && subleaf < 64) {
-                        const u64 component = 1ULL << subleaf;
-                        const bool xcr0Component =
-                            (vcpu->HostXcr0 & component) != 0;
-                        const u64 guestXssCapabilityMask =
-                            g_XsavesEnabled ? g_SupportedXssMask : 0ULL;
-                        const bool xssComponent =
-                            (guestXssCapabilityMask & component) != 0;
-                        if (!xcr0Component && !xssComponent) {
-                            RtlZeroMemory(regs, sizeof(regs));
-                        }
-                    } else if (subleafSupported && leaf == 0x14) {
-                        // Intel PT output and filtering are not virtualized.
-                        RtlZeroMemory(regs, sizeof(regs));
-                    }
-                } else {
-                    RtlZeroMemory(regs, sizeof(regs));
-                }
-
-                // CPUID writes four 32-bit registers and zero-extends them
-                // in 64-bit mode.  `regs` is an `int[4]`; assigning directly
-                // would sign-extend outputs whose high bit is set and leak
-                // non-architectural ones in the upper halves of GPRs.
+                // CPUID writes 32-bit outputs and zero-extends them in
+                // 64-bit mode. Avoid sign extension from int.
                 Ctx->Rax = static_cast<u32>(regs[0]);
                 Ctx->Rbx = static_cast<u32>(regs[1]);
                 Ctx->Rcx = static_cast<u32>(regs[2]);
@@ -5053,6 +4933,19 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         return false;
     }
 
+    if (!PrepareVmxHostIdt(mutableVcpu, idtBase, idtLimit, cpuId)) {
+        WriteHvTrace(mutableVcpu, cpuId, HvTraceEventContractFail,
+                     idtBase, idtLimit, mutableVcpu->VmxHostIdtBase, 0);
+        HV_VERBOSE_PRINT(
+            "[HV] CPU %u VMCS setup rejected private host IDT: "
+            "native=0x%llX/0x%X private=0x%llX\n",
+            cpuId, idtBase, idtLimit, mutableVcpu->VmxHostIdtBase);
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureDescriptorCr3,
+                           idtBase, mutableVcpu->VmxHostIdtBase);
+        return false;
+    }
+    const u64 vmxHostIdtBase = mutableVcpu->VmxHostIdtBase;
+
     mutableVcpu->HostSegmentSelectorsLow =
         PackSegmentSelectors(csSelector, ssSelector, dsSelector, esSelector);
     mutableVcpu->HostSegmentSelectorsHigh =
@@ -5095,7 +4988,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(HOST_EFER, hostEfer);
     VmWriteChecked(HOST_TR_BASE, tssBase);
     VmWriteChecked(HOST_GDTR_BASE, gdtBase);
-    VmWriteChecked(HOST_IDTR_BASE, idtBase);
+    VmWriteChecked(HOST_IDTR_BASE, vmxHostIdtBase);
 
     // host sysenter
     VmWriteChecked(HOST_IA32_SYSENTER_CS, sysenterCs);
@@ -5240,21 +5133,22 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     }
     VmWriteChecked(GUEST_RIP, reinterpret_cast<u64>(GuestIp));
     VmWriteChecked(GUEST_RSP, reinterpret_cast<u64>(GuestSp));
-    // keep interrupts masked while the launch frame is the active guest stack
-    // the thunk restores the saved flags only after it has moved back to the
-    // caller stack, which closes the late-launch corruption window
-    u64 guestRflags = GetRflags();
-    const u64 callbackRflags = guestRflags;
-    guestRflags |= (1ULL << 1);                 // architectural fixed bit
-    guestRflags &= ~((1ULL << 9) |              // IF during stack handoff
-                     (1ULL << 17) |             // VM (invalid in long mode)
-                     (1ULL << 19) |             // VIF
-                     (1ULL << 20));             // VIP
+    // HyperDbg restores the DPC's saved flags directly instead of inventing a
+    // second IF handoff contract. Keep the live Windows RFLAGS image intact;
+    // VM/VIF/VIP must already be clear in the long-mode kernel context
+    const u64 callbackRflags = GetRflags();
+    constexpr u64 kLongModeInvalidRflags =
+        (1ULL << 17) | (1ULL << 19) | (1ULL << 20);
+    if ((callbackRflags & kLongModeInvalidRflags) != 0) {
+        PublishVmcsFailure(mutableVcpu, HvVmcsFailureGuestEntry,
+                           callbackRflags, kLongModeInvalidRflags);
+        return false;
+    }
+    const u64 guestRflags = callbackRflags | (1ULL << 1);
     HV_VERBOSE_PRINT("[HV] CPU %u guest launch flags: source=0x%llX "
-                     "handoff=0x%llX source_if=%u handoff_if=%u irql=%u "
+                     "guest=0x%llX if=%u irql=%u "
                      "guest_sp=0x%llX guest_ip=0x%llX\n", cpuId,
                      callbackRflags, guestRflags,
-                     (callbackRflags & (1ULL << 9)) != 0 ? 1U : 0U,
                      (guestRflags & (1ULL << 9)) != 0 ? 1U : 0U,
                      static_cast<ULONG>(KeGetCurrentIrql()),
                      reinterpret_cast<u64>(GuestSp),
@@ -5516,7 +5410,9 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     // Bit 9: Host Address Space Size (Must be 1 for x64 Host)
     u32 requestedExit = VM_EXIT_HOST_ADDRESS_SPACE_SIZE |
                         VM_EXIT_SAVE_DEBUG_CONTROLS |
+                        VM_EXIT_SAVE_GUEST_EFER |
                         VM_EXIT_LOAD_HOST_EFER |
+                        VM_EXIT_SAVE_GUEST_PAT |
                         VM_EXIT_LOAD_HOST_PAT;
     if (g_CetVmcsEnabled) requestedExit |= VM_EXIT_LOAD_CET_STATE;
     u32 exitCtl = AdjustControls(requestedExit, exitCtlMsr);
@@ -5557,17 +5453,16 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     }
     if (!VmWriteChecked(CONTROL_VM_ENTRY_CONTROLS, entryCtl)) return false;
 
-    // Set CR0/CR4 Guest/Host Masks
+    // Preserve the live Windows CR contract. With both masks zero, the
+    // read-shadow fields are inactive and no CR0/CR4 write is synthesized.
     VmWriteChecked(GUEST_CR0, guestCr0);
     VmWriteChecked(GUEST_CR4, guestCr4);
 
     VmWriteChecked(CONTROL_CR0_GUEST_HOST_MASK, 0ULL);
-    VmWriteChecked(CONTROL_CR0_READ_SHADOW, guestCr0);
+    VmWriteChecked(CONTROL_CR0_READ_SHADOW, 0ULL);
 
     const u64 cr4GuestHostMask = GetCr4GuestHostMask();
-    // MOV-from-CR4 returns unmasked bits from GUEST_CR4 and masked bits from
-    // CR4_READ_SHADOW. Store the guest-visible values only in the masked view.
-    const u64 cr4ReadShadow = guestCr4 & cr4GuestHostMask;
+    const u64 cr4ReadShadow = 0;
     VmWriteChecked(CONTROL_CR4_GUEST_HOST_MASK, cr4GuestHostMask);
     VmWriteChecked(CONTROL_CR4_READ_SHADOW, cr4ReadShadow);
 
@@ -5768,7 +5663,8 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
         valuesMatch &= VmcsValueMatches(mutableVcpu, HOST_GDTR_BASE,
                                          vmcsHostGdtBase, gdtBase, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu, HOST_IDTR_BASE,
-                                         vmcsHostIdtBase, idtBase, ~0ULL);
+                                         vmcsHostIdtBase, vmxHostIdtBase,
+                                         ~0ULL);
         valuesMatch &= VmcsValueMatches(
             mutableVcpu, CONTROL_PIN_BASED_VM_EXECUTION_CONTROLS, vmcsPinCtl,
             pinCtl, 0xFFFFFFFFULL);
@@ -5793,7 +5689,7 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                                          vmcsCr0Mask, 0ULL, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu,
                                          CONTROL_CR0_READ_SHADOW,
-                                         vmcsCr0Shadow, guestCr0, ~0ULL);
+                                         vmcsCr0Shadow, 0ULL, ~0ULL);
         valuesMatch &= VmcsValueMatches(mutableVcpu,
                                          CONTROL_CR4_GUEST_HOST_MASK,
                                          vmcsCr4Mask, cr4GuestHostMask, ~0ULL);
@@ -7113,9 +7009,78 @@ static VOID TargetCpuWorker(PVOID Context) {
             ProbeIpiRendezvousCallback(0);
             result = STATUS_SUCCESS;
         } else if (operation == TargetOperationLaunch) {
-            // A launch must never use a temporary worker stack.  The startup
+            // a launch must never use a temporary worker stack. the startup
             // path routes this operation through TargetLaunchDpcRoutine.
             result = STATUS_NOT_SUPPORTED;
+        } else if (operation == TargetOperationRuntimeCanary) {
+            VcpuContext* vcpu = &g_VcpuData[work->ProcessorIndex];
+            const long vcpuState =
+                InterlockedCompareExchange(&vcpu->State, 0, 0);
+            if (vcpuState != VcpuLaunched) {
+                result = STATUS_INVALID_DEVICE_STATE;
+            } else {
+                const long baselineExits =
+                    InterlockedCompareExchange(&vcpu->VmExitCount, 0, 0);
+                const long baselineResumes =
+                    InterlockedCompareExchange(&vcpu->VmResumeAttempts, 0, 0);
+                InterlockedExchange(&work->CanaryBaselineVmExits,
+                                    baselineExits);
+                InterlockedExchange(&work->CanaryBaselineVmResumes,
+                                    baselineResumes);
+                InterlockedExchange(&work->CanaryIrql,
+                                    static_cast<LONG>(KeGetCurrentIrql()));
+                work->CanaryCr3 = __readcr3();
+                work->CanaryCr4 = __readcr4();
+
+                int regs[4] = {};
+                __cpuidex(regs, 0, 0);
+
+                work->CanaryCpuidEax = static_cast<u32>(regs[0]);
+                work->CanaryCpuidEbx = static_cast<u32>(regs[1]);
+                work->CanaryCpuidEcx = static_cast<u32>(regs[2]);
+                work->CanaryCpuidEdx = static_cast<u32>(regs[3]);
+
+                const long observedExits =
+                    InterlockedCompareExchange(&vcpu->VmExitCount, 0, 0);
+                const long observedResumes =
+                    InterlockedCompareExchange(&vcpu->VmResumeAttempts, 0, 0);
+                const long lastReason =
+                    InterlockedCompareExchange(&vcpu->LastExitReason, 0, 0);
+                InterlockedExchange(&work->CanaryObservedVmExits,
+                                    observedExits);
+                InterlockedExchange(&work->CanaryObservedVmResumes,
+                                    observedResumes);
+                InterlockedExchange(&work->CanaryLastExitReason, lastReason);
+
+                const bool intelVendor =
+                    work->CanaryCpuidEbx == 0x756E6547U &&
+                    work->CanaryCpuidEdx == 0x49656E69U &&
+                    work->CanaryCpuidEcx == 0x6C65746EU;
+                const bool exitAdvanced = observedExits >= baselineExits + 1;
+                const bool resumeAdvanced =
+                    observedResumes >= baselineResumes + 1;
+                const bool cpuidExit =
+                    lastReason == static_cast<long>(VM_EXIT_REASON_CPUID);
+                const bool resumeClean =
+                    static_cast<u64>(InterlockedCompareExchange64(
+                        reinterpret_cast<volatile LONG64*>(
+                            &vcpu->LastVmResumeFlags), 0, 0)) == 0;
+                const bool stillLaunched =
+                    InterlockedCompareExchange(&vcpu->State, 0, 0) ==
+                    VcpuLaunched;
+
+                WriteHvTrace(vcpu, work->ProcessorIndex,
+                             HvTraceEventPostDpcCanary,
+                             static_cast<u64>(baselineExits),
+                             static_cast<u64>(observedExits),
+                             static_cast<u64>(baselineResumes),
+                             static_cast<u64>(observedResumes));
+
+                result = intelVendor && exitAdvanced && resumeAdvanced &&
+                                 cpuidExit && resumeClean && stillLaunched
+                             ? STATUS_SUCCESS
+                             : STATUS_UNSUCCESSFUL;
+            }
         } else if (operation == TargetOperationStop) {
             StopHvCallback(static_cast<ULONG_PTR>(work->Generation));
             const long stoppedState = InterlockedCompareExchange(
@@ -7613,10 +7578,11 @@ static void PrintLaunchResult(u32 processorIndex, const VcpuContext& vcpu) {
         vmcsFailureArg0, vmcsFailureArg1);
     HV_PASSIVE_PRINT(
         "[HV] CPU %u launch transition: msr=0x%08X msr_value=0x%llX "
-        "rip=0x%llX rsp=0x%llX exit_len=%llu qualification=0x%llX "
-        "instrerr=0x%llX resume_flags=0x%llX probe_flags=0x%llX\n",
+        "rip=0x%llX rsp=0x%llX cr2=0x%llX exit_len=%llu "
+        "qualification=0x%llX instrerr=0x%llX "
+        "resume_flags=0x%llX probe_flags=0x%llX\n",
         processorIndex, vcpu.LastExitMsrIndex, vcpu.LastExitMsrValue,
-        vcpu.LastGuestRip, vcpu.LastGuestRsp,
+        vcpu.LastGuestRip, vcpu.LastGuestRsp, vcpu.LastGuestCr2,
         vcpu.LastExitInstructionLength, vcpu.LastExitQualification,
         vcpu.LastVmInstructionError, vcpu.LastVmResumeFlags,
         probeResumeFlags);
@@ -7686,6 +7652,9 @@ extern "C" NTSTATUS StartHypervisor() {
     HV_PASSIVE_PRINT("[HV] StartHypervisor: profile=0x%X CET_VMCS=%u XSAVES=%u\n",
              g_VmxCapabilityProfile, g_CetVmcsEnabled ? 1U : 0U,
              g_XsavesEnabled ? 1U : 0U);
+    HV_PASSIVE_PRINT("[HV] late-launch baseline: cpuid=native "
+                     "msr_bitmap=zero cr0_mask=zero cr4_mask=zero "
+                     "save_guest_efer_pat=1\n");
 
     int regs[4] = {};
     __cpuidex(regs, 0x80000000, 0);
@@ -7767,6 +7736,8 @@ extern "C" NTSTATUS StartHypervisor() {
         return rejectStart(STATUS_NOT_SUPPORTED);
     }
 
+    RtlZeroMemory(&g_HvHostFaultRecord, sizeof(g_HvHostFaultRecord));
+
     g_ProcessorCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
     if (g_ProcessorCount == 0) {
         HV_PASSIVE_PRINT("[HV] StartHypervisor rejected: no active processors\n");
@@ -7823,6 +7794,13 @@ extern "C" NTSTATUS StartHypervisor() {
             g_VcpuData[i].HostStackTop =
                 stackLastByte & ~(kVmxHostStackAlignment - 1);
         }
+        g_VcpuData[i].VmxHostIdt = ExAllocatePoolWithTag(
+            NonPagedPoolNx, PAGE_SIZE, TAG_HVID);
+        if (g_VcpuData[i].VmxHostIdt) {
+            RtlZeroMemory(g_VcpuData[i].VmxHostIdt, PAGE_SIZE);
+            g_VcpuData[i].VmxHostIdtBase =
+                reinterpret_cast<u64>(g_VcpuData[i].VmxHostIdt);
+        }
         g_VcpuData[i].TraceCapacity = HV_TRACE_RECORDS_PER_CPU;
         g_VcpuData[i].TraceRing = static_cast<HvTraceRecord*>(
             ExAllocatePoolWithTag(NonPagedPoolNx,
@@ -7836,13 +7814,14 @@ extern "C" NTSTATUS StartHypervisor() {
 
         if (!g_VcpuData[i].VmxOnVirt || !g_VcpuData[i].VmcsVirt ||
             !g_VcpuData[i].MsrBitmapVirt || !g_VcpuData[i].HostStack ||
-            !g_VcpuData[i].TraceRing) {
+            !g_VcpuData[i].VmxHostIdt || !g_VcpuData[i].TraceRing) {
                 HV_PASSIVE_PRINT("[HV] CPU %u allocation failed: vmxon=%u vmcs=%u "
-                          "msr_bitmap=%u host_stack=%u trace_ring=%u\n", i,
+                          "msr_bitmap=%u host_stack=%u host_idt=%u trace_ring=%u\n", i,
                           g_VcpuData[i].VmxOnVirt ? 1U : 0U,
                           g_VcpuData[i].VmcsVirt ? 1U : 0U,
                           g_VcpuData[i].MsrBitmapVirt ? 1U : 0U,
                           g_VcpuData[i].HostStack ? 1U : 0U,
+                          g_VcpuData[i].VmxHostIdt ? 1U : 0U,
                           g_VcpuData[i].TraceRing ? 1U : 0U);
                 StopHypervisorInternal(true);
                 ReleaseHvCrashBlob();
@@ -7973,54 +7952,98 @@ extern "C" NTSTATUS StartHypervisor() {
             return STATUS_NOT_SUPPORTED;
         }
 
-        //
-        // The single-CPU launch has completed. Use another native processor to
-        // observe the first VMCALL-induced VM-exit without letting the target run
-        // through the normal VM-exit prologue immediately.
-        //
-
+        // the launch DPC and its private CPUID probe have returned. run a
+        // second CPUID from a normal system thread that is scheduled onto CPU1.
+        // this is the first test that crosses the exact boundary implicated by
+        // the V44 log: DPC return -> normal scheduler context -> VM-exit.
         HV_PASSIVE_PRINT(
-            "[HV] DEBUG single-CPU launch succeeded; "
-            "arming VM-exit stage probe\n");
+            "[HV] DEBUG single-CPU launch returned; "
+            "queueing post-DPC runtime canary on CPU %u\n",
+            debugCpu);
 
-        //
-        // Once this flag is set, the next VM-exit on the debug CPU will stop at the
-        // current hold point in HvVmExitEntryPoint. A frozen machine therefore means
-        // execution reached that point. A reset means the processor failed before it.
-        //
-        InterlockedExchange(
-            &g_HvVmExitDebugHold,
-            1);
-
-        //
-        // Do not print anything after setting the hold flag. Kernel debugger output
-        // can require interprocessor coordination, while the debug CPU deliberately
-        // spins with interrupts disabled.
-        //
         targetStatus =
-            QueueTargetOperation(
-                debugCpu,
-                TargetOperationStop);
+            QueueTargetOperation(debugCpu, TargetOperationRuntimeCanary);
+        if (NT_SUCCESS(targetStatus)) {
+            const u64 canaryDeadline =
+                KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+            targetStatus =
+                WaitTargetOperation(debugCpu, canaryDeadline, &unresolved);
+        }
+
+        TargetCpuWork* canaryWork = &g_HvTargetCpuWork[debugCpu];
+        HV_PASSIVE_PRINT(
+            "[HV] DEBUG post-DPC canary: cpu=%u status=0x%08X "
+            "worker_state=%ld irql=%ld vmexits=%ld->%ld "
+            "resumes=%ld->%ld reason=%ld cpuid=%08X-%08X-%08X-%08X "
+            "cr3=0x%llX cr4=0x%llX\n",
+            debugCpu,
+            static_cast<ULONG>(targetStatus),
+            InterlockedCompareExchange(&canaryWork->State, 0, 0),
+            InterlockedCompareExchange(&canaryWork->CanaryIrql, 0, 0),
+            InterlockedCompareExchange(
+                &canaryWork->CanaryBaselineVmExits, 0, 0),
+            InterlockedCompareExchange(
+                &canaryWork->CanaryObservedVmExits, 0, 0),
+            InterlockedCompareExchange(
+                &canaryWork->CanaryBaselineVmResumes, 0, 0),
+            InterlockedCompareExchange(
+                &canaryWork->CanaryObservedVmResumes, 0, 0),
+            InterlockedCompareExchange(
+                &canaryWork->CanaryLastExitReason, 0, 0),
+            canaryWork->CanaryCpuidEax,
+            canaryWork->CanaryCpuidEbx,
+            canaryWork->CanaryCpuidEcx,
+            canaryWork->CanaryCpuidEdx,
+            canaryWork->CanaryCr3,
+            canaryWork->CanaryCr4);
+
+        if (unresolved) {
+            HV_PASSIVE_PRINT(
+                "[HV] DEBUG post-DPC canary became unresolved; "
+                "quarantining VMX image\n");
+            const NTSTATUS quarantineStatus =
+                QuarantineUnresolvedTargetWork();
+            ReleaseCoordinatorAffinity(&coordinatorAffinity,
+                                        &coordinatorBound);
+            return quarantineStatus;
+        }
 
         if (!NT_SUCCESS(targetStatus)) {
-            InterlockedExchange(
-                &g_HvVmExitDebugHold,
-                0);
-
             HV_PASSIVE_PRINT(
-                "[HV] DEBUG failed to queue VM-exit stage probe: 0x%08X\n",
-                static_cast<ULONG>(targetStatus));
-
+                "[HV] DEBUG post-DPC canary failed; retaining detailed "
+                "CPU1 launch/exit evidence\n");
+            PrintLaunchResult(debugCpu, g_VcpuData[debugCpu]);
             StopHypervisorInternal(true);
             ReleaseCoordinatorAffinity(&coordinatorAffinity,
                                         &coordinatorBound);
             return targetStatus;
         }
 
-        //
-        // Reaching this point is not expected while the ASM hold is enabled.
-        // The target processor should remain stopped at the selected VM-exit stage.
-        //
+        const ULONG candidateOptionalProfile =
+            static_cast<ULONG>(InterlockedCompareExchange(
+                &g_VmxGuestOptionalProfileCandidate, 0, 0));
+        if (KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) !=
+            g_ProcessorCount) {
+            StopHypervisorInternal(true);
+            ReleaseCoordinatorAffinity(&coordinatorAffinity,
+                                        &coordinatorBound);
+            return STATUS_DEVICE_CONFIGURATION_ERROR;
+        }
+
+        InterlockedExchange(
+            &g_VmxGuestOptionalProfile,
+            static_cast<LONG>(candidateOptionalProfile));
+        InterlockedExchange(&g_HvLifecycle, kHvLifecycleRunning);
+
+        HV_PASSIVE_PRINT(
+            "[HV] DEBUG single-CPU runtime contract passed: cpu=%u "
+            "vmexits=%ld resumes=%ld\n",
+            debugCpu,
+            InterlockedCompareExchange(
+                &g_VcpuData[debugCpu].VmExitCount, 0, 0),
+            InterlockedCompareExchange(
+                &g_VcpuData[debugCpu].VmResumeAttempts, 0, 0));
+
         ReleaseCoordinatorAffinity(&coordinatorAffinity,
                                     &coordinatorBound);
         return STATUS_SUCCESS;
@@ -8195,9 +8218,25 @@ extern "C" NTSTATUS StartHypervisor() {
         }
 
         if (NT_SUCCESS(targetStatus) && !unresolved) {
+            u32 firstExitReturned = 0;
+            u64 totalVmExits = 0;
+            for (u32 i = 0; i < g_ProcessorCount; ++i) {
+                if (i == reservedProcessor) continue;
+                if (ReadFirstExitProbeState(&g_VcpuData[i]) ==
+                    FirstExitProbeReturned) {
+                    ++firstExitReturned;
+                }
+                totalVmExits += static_cast<u64>(InterlockedCompareExchange(
+                    &g_VcpuData[i].VmExitCount, 0, 0));
+            }
             HV_PASSIVE_PRINT(
-                "[HV] staged launch completed: %u/%u participating processors\n",
-                launchedCount, expected);
+                "[HV] staged launch completed: %u/%u participating processors "
+                "first_exit=%u/%u total_vmexits=%llu vmexit_asm=%ld "
+                "first_vmexit=%ld\n",
+                launchedCount, expected, firstExitReturned, expected,
+                totalVmExits,
+                InterlockedCompareExchange(&g_HvLaunchVmExitAsmReached, 0, 0),
+                InterlockedCompareExchange(&g_HvLaunchFirstVmExitEntered, 0, 0));
         } else {
             HV_PASSIVE_PRINT(
                 "[HV] staged launch stopped: status=0x%08X launched=%u/%u "
@@ -8494,6 +8533,9 @@ static void StopHypervisorInternal(bool startRollback) {
         }
         if (g_VcpuData[i].HostStack) {
             ExFreePoolWithTag(g_VcpuData[i].HostStack, TAG_HVST);
+        }
+        if (g_VcpuData[i].VmxHostIdt) {
+            ExFreePoolWithTag(g_VcpuData[i].VmxHostIdt, TAG_HVID);
         }
         if (g_VcpuData[i].TraceRing) {
             ExFreePoolWithTag(g_VcpuData[i].TraceRing, TAG_HVTR);
