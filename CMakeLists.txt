@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 
-project(Nested_HV LANGUAGES C CXX)
+project(KNHV LANGUAGES C CXX)
 
 # Keep the compilation database available to CMake Tools and other IDEs even
 # when a caller does not provide a cache option explicitly.
@@ -13,34 +13,34 @@ endif()
 # CMake adds user-mode Debug switches to every MSVC target.  Remove switches
 # that are invalid or noisy for a WDK driver before the target is created
 if(MSVC)
-    function(nested_hv_strip_msvc_flag variable_name flag_regex)
+    function(knhv_strip_msvc_flag variable_name flag_regex)
         if(DEFINED ${variable_name})
-            set(_nested_hv_flags "${${variable_name}}")
-            separate_arguments(_nested_hv_flags WINDOWS_COMMAND
-                               "${_nested_hv_flags}")
-            list(FILTER _nested_hv_flags EXCLUDE REGEX "${flag_regex}")
-            list(JOIN _nested_hv_flags " " _nested_hv_flags_text)
-            set(${variable_name} "${_nested_hv_flags_text}" CACHE STRING
+            set(_knhv_flags "${${variable_name}}")
+            separate_arguments(_knhv_flags WINDOWS_COMMAND
+                               "${_knhv_flags}")
+            list(FILTER _knhv_flags EXCLUDE REGEX "${flag_regex}")
+            list(JOIN _knhv_flags " " _knhv_flags_text)
+            set(${variable_name} "${_knhv_flags_text}" CACHE STRING
                 "MSVC flags filtered for the WDK target" FORCE)
         endif()
     endfunction()
 
-    nested_hv_strip_msvc_flag(CMAKE_C_FLAGS_DEBUG "^[/-]RTC1$")
-    nested_hv_strip_msvc_flag(CMAKE_CXX_FLAGS "^[/-]GR$")
-    nested_hv_strip_msvc_flag(CMAKE_CXX_FLAGS "^[/-]EHsc$")
-    nested_hv_strip_msvc_flag(CMAKE_CXX_FLAGS_DEBUG "^[/-]RTC1$")
-    nested_hv_strip_msvc_flag(CMAKE_EXE_LINKER_FLAGS_DEBUG
+    knhv_strip_msvc_flag(CMAKE_C_FLAGS_DEBUG "^[/-]RTC1$")
+    knhv_strip_msvc_flag(CMAKE_CXX_FLAGS "^[/-]GR$")
+    knhv_strip_msvc_flag(CMAKE_CXX_FLAGS "^[/-]EHsc$")
+    knhv_strip_msvc_flag(CMAKE_CXX_FLAGS_DEBUG "^[/-]RTC1$")
+    knhv_strip_msvc_flag(CMAKE_EXE_LINKER_FLAGS_DEBUG
                                "^[/-]INCREMENTAL$")
 endif()
 
 if(NOT WIN32)
-    message(FATAL_ERROR "Nested_HV is a Windows kernel driver and requires the Windows WDK")
+    message(FATAL_ERROR "KNHV is a Windows kernel driver and requires the Windows WDK")
 endif()
 
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
    (CMAKE_CXX_COMPILER_ARCHITECTURE_ID AND
     NOT CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64"))
-    message(FATAL_ERROR "Nested_HV requires an AMD64/x64 Windows kernel toolchain")
+    message(FATAL_ERROR "KNHV requires an AMD64/x64 Windows kernel toolchain")
 endif()
 
 # MASM is supplied by the MSVC/WDK toolchain. Do not hard-code a Visual
@@ -63,103 +63,132 @@ find_package(WDK REQUIRED)
 # CMake launched outside a Visual Studio developer shell does not always
 # populate MSVC's implicit standard-header search path. Derive the compiler
 # include directory instead of relying on process-global INCLUDE variables.
-set(_nested_hv_toolchain_includes "")
-set(_nested_hv_user_toolchain_libdirs "")
+set(_knhv_toolchain_includes "")
+set(_knhv_user_toolchain_libdirs "")
 if(MSVC AND CMAKE_CXX_COMPILER)
-    get_filename_component(_nested_hv_msvc_bin
+    get_filename_component(_knhv_msvc_bin
                            "${CMAKE_CXX_COMPILER}" DIRECTORY)
-    get_filename_component(_nested_hv_msvc_host_bin
-                           "${_nested_hv_msvc_bin}" DIRECTORY)
-    get_filename_component(_nested_hv_msvc_bin_root
-                           "${_nested_hv_msvc_host_bin}" DIRECTORY)
-    get_filename_component(_nested_hv_msvc_root
-                           "${_nested_hv_msvc_bin_root}" DIRECTORY)
-    set(_nested_hv_msvc_include "${_nested_hv_msvc_root}/include")
-    if(EXISTS "${_nested_hv_msvc_include}")
-        list(APPEND _nested_hv_toolchain_includes
-             "${_nested_hv_msvc_include}")
+    get_filename_component(_knhv_msvc_host_bin
+                           "${_knhv_msvc_bin}" DIRECTORY)
+    get_filename_component(_knhv_msvc_bin_root
+                           "${_knhv_msvc_host_bin}" DIRECTORY)
+    get_filename_component(_knhv_msvc_root
+                           "${_knhv_msvc_bin_root}" DIRECTORY)
+    set(_knhv_msvc_include "${_knhv_msvc_root}/include")
+    if(EXISTS "${_knhv_msvc_include}")
+        list(APPEND _knhv_toolchain_includes
+             "${_knhv_msvc_include}")
     endif()
-    set(_nested_hv_msvc_lib "${_nested_hv_msvc_root}/lib/x64")
-    if(EXISTS "${_nested_hv_msvc_lib}")
-        list(APPEND _nested_hv_user_toolchain_libdirs
-             "${_nested_hv_msvc_lib}")
+    set(_knhv_msvc_lib "${_knhv_msvc_root}/lib/x64")
+    if(EXISTS "${_knhv_msvc_lib}")
+        list(APPEND _knhv_user_toolchain_libdirs
+             "${_knhv_msvc_lib}")
     endif()
 endif()
 if(WDK_INC_VERSION AND
    EXISTS "${WDK_ROOT}/Include/${WDK_INC_VERSION}/ucrt")
-    list(APPEND _nested_hv_toolchain_includes
+    list(APPEND _knhv_toolchain_includes
          "${WDK_ROOT}/Include/${WDK_INC_VERSION}/ucrt")
 endif()
 if(WDK_INC_VERSION)
-    foreach(_nested_hv_wdk_user_subdir IN ITEMS shared um)
-        set(_nested_hv_wdk_user_include
-            "${WDK_ROOT}/Include/${WDK_INC_VERSION}/${_nested_hv_wdk_user_subdir}")
-        if(EXISTS "${_nested_hv_wdk_user_include}")
-            list(APPEND _nested_hv_toolchain_includes
-                 "${_nested_hv_wdk_user_include}")
+    foreach(_knhv_wdk_user_subdir IN ITEMS shared um)
+        set(_knhv_wdk_user_include
+            "${WDK_ROOT}/Include/${WDK_INC_VERSION}/${_knhv_wdk_user_subdir}")
+        if(EXISTS "${_knhv_wdk_user_include}")
+            list(APPEND _knhv_toolchain_includes
+                 "${_knhv_wdk_user_include}")
         endif()
     endforeach()
 endif()
 if(WDK_LIB_VERSION)
-    foreach(_nested_hv_wdk_user_lib_subdir IN ITEMS um ucrt)
-        set(_nested_hv_wdk_user_lib
-            "${WDK_ROOT}/Lib/${WDK_LIB_VERSION}/${_nested_hv_wdk_user_lib_subdir}/x64")
-        if(EXISTS "${_nested_hv_wdk_user_lib}")
-            list(APPEND _nested_hv_user_toolchain_libdirs
-                 "${_nested_hv_wdk_user_lib}")
+    foreach(_knhv_wdk_user_lib_subdir IN ITEMS um ucrt)
+        set(_knhv_wdk_user_lib
+            "${WDK_ROOT}/Lib/${WDK_LIB_VERSION}/${_knhv_wdk_user_lib_subdir}/x64")
+        if(EXISTS "${_knhv_wdk_user_lib}")
+            list(APPEND _knhv_user_toolchain_libdirs
+                 "${_knhv_wdk_user_lib}")
         endif()
     endforeach()
 endif()
 
-option(NESTED_HV_SIGN "Sign the driver as a post-build step" OFF)
-option(NESTED_HV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
-option(NESTED_HV_FAULT_INJECTION
+option(KNHV_SIGN "Sign the driver as a post-build step" OFF)
+option(KNHV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
+option(KNHV_FAULT_INJECTION
        "Enable deterministic launch fault injection for isolated tests" OFF)
-set(HV_TEST_FAIL_CPU "-1" CACHE STRING
+set(KNHV_TEST_FAIL_CPU "-1" CACHE STRING
     "Logical processor index used by fault injection (-1 disables it)")
-set(HV_TEST_FAIL_STAGE "0" CACHE STRING
+set(KNHV_TEST_FAIL_STAGE "0" CACHE STRING
     "Fault injection stage number (0 disables it)")
-set(NESTED_HV_BUILD_ID "0" CACHE STRING
+set(KNHV_BUILD_ID "0" CACHE STRING
     "Numeric build identifier embedded in crash telemetry")
-set(NESTED_HV_SIGNTOOL "" CACHE FILEPATH "Path to signtool.exe (required when NESTED_HV_SIGN=ON)")
-set(NESTED_HV_SIGN_CERT "" CACHE FILEPATH "PFX containing the signing private key (required when NESTED_HV_SIGN=ON)")
-set(NESTED_HV_SIGN_PASSWORD "" CACHE STRING "PFX password (optional; avoid storing secrets in CMake cache)")
-set(NESTED_HV_SIGN_TIMESTAMP_URL "" CACHE STRING "RFC3161 timestamp URL (optional for test certificates)")
+set(KNHV_SIGNTOOL "" CACHE FILEPATH "Path to signtool.exe (required when KNHV_SIGN=ON)")
+set(KNHV_SIGN_CERT "" CACHE FILEPATH "PFX containing the signing private key (required when KNHV_SIGN=ON)")
+set(KNHV_SIGN_PASSWORD "" CACHE STRING "PFX password (optional; avoid storing secrets in CMake cache)")
+set(KNHV_SIGN_TIMESTAMP_URL "" CACHE STRING "RFC3161 timestamp URL (optional for test certificates)")
 
 # sources
 set(SOURCES
-        src/main.cpp
-        src/vmm.cpp
-        src/asm/arch.asm
-        src/header/common.h
-        src/header/vmx.h
+        src/core/main.cpp
+        src/core/vmm.cpp
+        src/core/vmm_state.cpp
+        src/vmx/vmx_features.cpp
+        src/vmx/vmx_diagnostics.cpp
+        src/vmx/vmx_crash.cpp
+        src/vmx/vmx_teardown_state.cpp
+        src/vmx/vmx_exit.cpp
+        src/vmx/vmx_vmcs.cpp
+        src/vmx/vmx_launch.cpp
+        src/vmx/vmx_stop.cpp
+        src/asm/vmx_entry.asm
+        src/asm/vmx_instructions.asm
+        src/asm/vmx_launch.asm
+        src/asm/vmx_asm.inc
+        src/include/common.h
+        src/include/knhv_logging.h
+        src/include/vmm.h
+        src/include/vmm_internal.h
+        src/include/vmx.h
+        src/include/vmx_contract.h
 )
+
+# MASM does not always emit include dependencies for Ninja. Keep the shared
+# ABI include attached to every assembly object so offset changes rebuild all
+# consumers.
+set(_knhv_asm_contract "${CMAKE_CURRENT_SOURCE_DIR}/src/asm/vmx_asm.inc")
+set_source_files_properties(
+        src/asm/vmx_entry.asm
+        src/asm/vmx_instructions.asm
+        src/asm/vmx_launch.asm
+        PROPERTIES OBJECT_DEPENDS "${_knhv_asm_contract}")
 
 # The MSVC toolchain may populate these variables with user-mode CRT libraries.
 # Capture them for the contract test, but keep them empty while the WDK driver
 # target is created so NODEFAULTLIB remains effective at link time.
-set(_nested_hv_saved_c_standard_libraries "${CMAKE_C_STANDARD_LIBRARIES}")
-set(_nested_hv_saved_cxx_standard_libraries "${CMAKE_CXX_STANDARD_LIBRARIES}")
+set(_knhv_saved_c_standard_libraries "${CMAKE_C_STANDARD_LIBRARIES}")
+set(_knhv_saved_cxx_standard_libraries "${CMAKE_CXX_STANDARD_LIBRARIES}")
 set(CMAKE_C_STANDARD_LIBRARIES "")
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
-wdk_add_driver(Nested_HV ${SOURCES})
-if(_nested_hv_toolchain_includes)
-    target_include_directories(Nested_HV SYSTEM BEFORE PRIVATE
-                               ${_nested_hv_toolchain_includes})
+wdk_add_driver(KNHV ${SOURCES})
+if(_knhv_toolchain_includes)
+    target_include_directories(KNHV SYSTEM BEFORE PRIVATE
+                               ${_knhv_toolchain_includes})
 endif()
+target_include_directories(KNHV PRIVATE
+                           "${CMAKE_CURRENT_SOURCE_DIR}/src/include")
 
 # A kernel image has no user-mode CRT.  An empty runtime property prevents
 # CMake from adding /MDd or /MD to the WDK target
 if(MSVC)
-    set_property(TARGET Nested_HV PROPERTY MSVC_RUNTIME_LIBRARY "")
+    set_property(TARGET KNHV PROPERTY MSVC_RUNTIME_LIBRARY "")
 endif()
 
 # Kernel-only C/C++ options belong on the driver target.  Keeping them out of
 # the user-mode contract test avoids contradictory MSVC switches such as
 # /EHsc followed by /EHs-c- and /GS followed by /GS-, while the MASM source is
 # still protected by the language-qualified expressions below.
-target_compile_options(Nested_HV PRIVATE
+target_compile_options(KNHV PRIVATE
         "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/EHs-c->"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/GS->"
         # MSVC's option spelling is case-sensitive here: /Zc (lowercase c).
@@ -168,52 +197,52 @@ target_compile_options(Nested_HV PRIVATE
         "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:wchar_t->"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/std:c++17>"
 )
-target_compile_definitions(Nested_HV PRIVATE
-        NESTED_HV_BUILD_ID=${NESTED_HV_BUILD_ID})
-if(NESTED_HV_FAULT_INJECTION)
-    target_compile_definitions(Nested_HV PRIVATE
-            HV_TEST_FAIL_CPU=${HV_TEST_FAIL_CPU}
-            HV_TEST_FAIL_STAGE=${HV_TEST_FAIL_STAGE})
+target_compile_definitions(KNHV PRIVATE
+        KNHV_BUILD_ID=${KNHV_BUILD_ID})
+if(KNHV_FAULT_INJECTION)
+    target_compile_definitions(KNHV PRIVATE
+            KNHV_TEST_FAIL_CPU=${KNHV_TEST_FAIL_CPU}
+            KNHV_TEST_FAIL_STAGE=${KNHV_TEST_FAIL_STAGE})
 endif()
 
 # link. WDK targets point at the selected kit, so no machine-specific library
 # directory is needed here.
-target_link_libraries(Nested_HV
+target_link_libraries(KNHV
         WDK::NTOSKRNL
         WDK::HAL
 )
 if(TARGET WDK::WDMSEC)
-    target_link_libraries(Nested_HV WDK::WDMSEC)
+    target_link_libraries(KNHV WDK::WDMSEC)
 endif()
 
 # Keep the WDK-provided GsDriverEntry startup wrapper (it initializes the
 # kernel-mode security cookie and calls DriverEntry). Always emit a linker PDB
 # alongside the SYS, including Release builds, so WinDbg can resolve symbols.
-set_property(TARGET Nested_HV APPEND_STRING PROPERTY LINK_FLAGS " /INTEGRITYCHECK /DEBUG")
+set_property(TARGET KNHV APPEND_STRING PROPERTY LINK_FLAGS " /INTEGRITYCHECK /DEBUG")
 
 # Signing is opt-in. An unsigned build remains useful for static analysis and
 # avoids silently selecting an unrelated certificate from the local machine.
-if(NESTED_HV_SIGN)
-    if(NOT NESTED_HV_SIGNTOOL OR NOT EXISTS "${NESTED_HV_SIGNTOOL}")
-        message(FATAL_ERROR "NESTED_HV_SIGN=ON requires a valid NESTED_HV_SIGNTOOL path")
+if(KNHV_SIGN)
+    if(NOT KNHV_SIGNTOOL OR NOT EXISTS "${KNHV_SIGNTOOL}")
+        message(FATAL_ERROR "KNHV_SIGN=ON requires a valid KNHV_SIGNTOOL path")
     endif()
-    if(NOT NESTED_HV_SIGN_CERT OR NOT EXISTS "${NESTED_HV_SIGN_CERT}")
-        message(FATAL_ERROR "NESTED_HV_SIGN=ON requires a valid NESTED_HV_SIGN_CERT path")
+    if(NOT KNHV_SIGN_CERT OR NOT EXISTS "${KNHV_SIGN_CERT}")
+        message(FATAL_ERROR "KNHV_SIGN=ON requires a valid KNHV_SIGN_CERT path")
     endif()
 
-    set(_nested_hv_sign_args sign /v /fd SHA256)
-    if(NESTED_HV_SIGN_PASSWORD)
-        list(APPEND _nested_hv_sign_args /p "${NESTED_HV_SIGN_PASSWORD}")
+    set(_knhv_sign_args sign /v /fd SHA256)
+    if(KNHV_SIGN_PASSWORD)
+        list(APPEND _knhv_sign_args /p "${KNHV_SIGN_PASSWORD}")
     endif()
-    if(NESTED_HV_SIGN_TIMESTAMP_URL)
-        list(APPEND _nested_hv_sign_args /tr "${NESTED_HV_SIGN_TIMESTAMP_URL}" /td SHA256)
+    if(KNHV_SIGN_TIMESTAMP_URL)
+        list(APPEND _knhv_sign_args /tr "${KNHV_SIGN_TIMESTAMP_URL}" /td SHA256)
     endif()
-    list(APPEND _nested_hv_sign_args /f "${NESTED_HV_SIGN_CERT}" "$<TARGET_FILE:Nested_HV>")
+    list(APPEND _knhv_sign_args /f "${KNHV_SIGN_CERT}" "$<TARGET_FILE:KNHV>")
 
     add_custom_command(
-            TARGET Nested_HV
+            TARGET KNHV
             POST_BUILD
-            COMMAND "${NESTED_HV_SIGNTOOL}" ${_nested_hv_sign_args}
+            COMMAND "${KNHV_SIGNTOOL}" ${_knhv_sign_args}
             COMMENT "Signing ${PROJECT_NAME}.sys"
             VERBATIM
     )
@@ -224,30 +253,34 @@ endif()
 # kernel/assembly ABI and can optionally exercise the installed service on an
 # isolated test machine.  Keeping it as a separate target prevents
 # /kernel,/NODEFAULTLIB driver flags from leaking into the test binary.
-if(NESTED_HV_BUILD_TESTS)
+if(KNHV_BUILD_TESTS)
     enable_testing()
-    add_executable(Nested_HV_ContractTests tests/vmx_contract_test.cpp)
-    if(_nested_hv_toolchain_includes)
-        target_include_directories(Nested_HV_ContractTests SYSTEM BEFORE PRIVATE
-                                   ${_nested_hv_toolchain_includes})
+    add_executable(KNHV_ContractTests
+            tests/vmx_contract_test.cpp
+            tests/test_support.cpp
+            tests/source_contract_test.cpp
+            tests/runtime_contract_test.cpp)
+    if(_knhv_toolchain_includes)
+        target_include_directories(KNHV_ContractTests SYSTEM BEFORE PRIVATE
+                                   ${_knhv_toolchain_includes})
     endif()
-    if(_nested_hv_user_toolchain_libdirs)
-        target_link_directories(Nested_HV_ContractTests PRIVATE
-                                ${_nested_hv_user_toolchain_libdirs})
+    if(_knhv_user_toolchain_libdirs)
+        target_link_directories(KNHV_ContractTests PRIVATE
+                                ${_knhv_user_toolchain_libdirs})
     endif()
-    target_compile_definitions(Nested_HV_ContractTests PRIVATE
-            NESTED_HV_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
-    target_compile_options(Nested_HV_ContractTests PRIVATE
-            /W4 /EHsc /GR /GS /permissive- /std:c++17)
-    target_link_libraries(Nested_HV_ContractTests PRIVATE advapi32 wintrust)
-    if(_nested_hv_saved_cxx_standard_libraries)
-        set(_nested_hv_test_standard_libraries
-            "${_nested_hv_saved_cxx_standard_libraries}")
-        separate_arguments(_nested_hv_test_standard_libraries WINDOWS_COMMAND
-                           "${_nested_hv_test_standard_libraries}")
-        target_link_libraries(Nested_HV_ContractTests PRIVATE
-                              ${_nested_hv_test_standard_libraries})
+    target_compile_definitions(KNHV_ContractTests PRIVATE
+            KNHV_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_options(KNHV_ContractTests PRIVATE
+            /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    target_link_libraries(KNHV_ContractTests PRIVATE advapi32 wintrust)
+    if(_knhv_saved_cxx_standard_libraries)
+        set(_knhv_test_standard_libraries
+            "${_knhv_saved_cxx_standard_libraries}")
+        separate_arguments(_knhv_test_standard_libraries WINDOWS_COMMAND
+                           "${_knhv_test_standard_libraries}")
+        target_link_libraries(KNHV_ContractTests PRIVATE
+                              ${_knhv_test_standard_libraries})
     endif()
-    add_test(NAME Nested_HV_ContractTests
-            COMMAND Nested_HV_ContractTests --root "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME KNHV_ContractTests
+            COMMAND KNHV_ContractTests --root "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()

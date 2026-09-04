@@ -151,7 +151,7 @@ function(wdk_add_driver _target)
     set_target_properties(${_target} PROPERTIES SUFFIX ".sys")
     # WDK_COMPILE_FLAGS are compiler switches (/kernel, /FI..., /GR-, ...),
     # not MASM switches.  Qualify them so CMake/Ninja does not forward these
-    # options to ml64 when the driver contains arch.asm.
+    # options to ml64 when the driver contains MASM VMX modules.
     foreach(_wdk_flag IN LISTS WDK_COMPILE_FLAGS)
         target_compile_options(${_target} PRIVATE
                 "$<$<COMPILE_LANGUAGE:C,CXX>:${_wdk_flag}>")

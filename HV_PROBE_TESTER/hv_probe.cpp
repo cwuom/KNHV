@@ -106,7 +106,7 @@ ProbeResult probeCurrentProcessor(std::uint32_t expectedIndex) {
 } // namespace
 
 int main() {
-    std::puts("Nested_HV VMX non-root self-test");
+    std::puts("KNHV VMX non-root self-test");
     std::puts("probe: private CPUID leaf -> VM-exit handler -> signed response");
 
     int featureRegs[4]{};
@@ -169,7 +169,7 @@ int main() {
                 processors.size());
 
     if (passed == processors.size()) {
-        std::puts("VERDICT: every active logical processor answered from Nested_HV's VM-exit path.");
+        std::puts("VERDICT: every active logical processor answered from KNHV's VM-exit path.");
         return 0;
     }
 

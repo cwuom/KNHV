@@ -16,7 +16,7 @@ $ErrorActionPreference = "Stop"
 $driverItem = Get-Item -LiteralPath $DriverPath -ErrorAction SilentlyContinue
 if (-not $driverItem) {
     # Visual Studio generators place multi-config outputs one level deeper
-    # (build\<config>\<config>\Nested_HV.sys). Keep the task generator
+    # (build\<config>\<config>\KNHV.sys). Keep the task generator
     # agnostic while restricting discovery to the requested build directory.
     $driverParent = Split-Path -Parent ([IO.Path]::GetFullPath($DriverPath))
     $matches = @(Get-ChildItem -LiteralPath $driverParent -Filter ([IO.Path]::GetFileName($DriverPath)) -File -Recurse -ErrorAction SilentlyContinue)
@@ -139,7 +139,7 @@ finally {
 }
 if ($kpExitCode -ne 0) {
     $kpText = ($kpOutput -join "`n")
-    $knownUntrustedRoot = $kpText -match "not trusted by the trust provider|not trusted|terminated in a root|root.*not trusted|does not chain to a Microsoft Root|Microsoft Root Cert|不受信任|不受信任的根|微软根|0x800B0109|0x80096010|0x800B010A"
+    $knownUntrustedRoot = $kpText -match "not trusted by the trust provider|not trusted|terminated in a root|root.*not trusted|does not chain to a Microsoft Root|Microsoft Root Cert|不受信任|不受信任的根|微软根证书|0x800B0109|0x80096010|0x800B010A"
     if ($AllowUntrustedTestCertificate -and $knownUntrustedRoot) {
         Write-Warning "signtool /kp rejected the private test root. The SYS is correctly Authenticode-signed for local testing, but this is not Microsoft kernel-policy/production trust. Use an isolated test VM with the appropriate test-signing policy."
     }

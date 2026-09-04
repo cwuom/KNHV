@@ -107,6 +107,10 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue) -or
     throw "The MSVC x64 toolchain was not found (cl.exe/ml64.exe). Install the Visual Studio Desktop C++ workload and run this task from a Developer PowerShell."
 }
 
+# request the English MSVC message resource when it is installed. CMake still
+# detects the compiler's localized /showIncludes prefix during configuration
+$env:VSLANG = "1033"
+
 $programFilesX86 = ${env:ProgramFiles(x86)}
 $programFiles = $env:ProgramFiles
 $cmakeCommand = Get-Command cmake.exe -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -200,8 +204,8 @@ if ($generator -eq "Ninja") {
 }
 $configureArgs += @(
     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-    "-DNESTED_HV_SIGN=OFF",
-    "-DNESTED_HV_BUILD_TESTS=ON",
+    "-DKNHV_SIGN=OFF",
+    "-DKNHV_BUILD_TESTS=ON",
     "-DWDK_WINVER=0x0A00"
 )
 if ($WdkRoot) { $configureArgs += "-DWDK_CONTENT_ROOT=$WdkRoot" }
@@ -212,7 +216,7 @@ if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXI
 if ($ConfigureOnly) { exit 0 }
 
 $buildArgs = @("--build", $BuildDirectory, "--config", $Configuration, "--parallel")
-Write-Host "Building Nested_HV ($Configuration)"
+Write-Host "Building KNHV ($Configuration)"
 & $cmake @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCODE." }
 
@@ -220,17 +224,17 @@ if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCOD
 # Code; the SYS is loaded by the service manager and the matching PDB is used
 # by WinDbg/symbol tooling.  Keep the check recursive for Visual Studio's
 # multi-configuration generator, which may place outputs below <Config>\Debug.
-$sysArtifacts = @(Get-ChildItem -LiteralPath $BuildDirectory -Filter "Nested_HV.sys" -File -Recurse -ErrorAction SilentlyContinue)
+$sysArtifacts = @(Get-ChildItem -LiteralPath $BuildDirectory -Filter "KNHV.sys" -File -Recurse -ErrorAction SilentlyContinue)
 if ($sysArtifacts.Count -eq 0) {
-    throw "Build completed but Nested_HV.sys was not found below $BuildDirectory."
+    throw "Build completed but KNHV.sys was not found below $BuildDirectory."
 }
 foreach ($sysArtifact in $sysArtifacts) {
     Write-Host "SYS: $($sysArtifact.FullName) [$($sysArtifact.Length) bytes]"
-    $pdbPath = Join-Path $sysArtifact.DirectoryName "Nested_HV.pdb"
+    $pdbPath = Join-Path $sysArtifact.DirectoryName "KNHV.pdb"
     if (Test-Path -LiteralPath $pdbPath) {
         $pdb = Get-Item -LiteralPath $pdbPath
         Write-Host "PDB: $($pdb.FullName) [$($pdb.Length) bytes]"
     } else {
-        throw "Nested_HV.sys was produced without its matching Nested_HV.pdb: $($sysArtifact.FullName)"
+        throw "KNHV.sys was produced without its matching KNHV.pdb: $($sysArtifact.FullName)"
     }
 }

@@ -1,31 +1,21 @@
-//
-// Created by cwuom on 17 Feb 2026.
-//
-
 #include <intrin.h>
 #include <ntddk.h>
 
-#include "header/common.h"
-#include "header/vmm.h"
-#include "header/vmx.h"
+#include "common.h"
+#include "knhv_logging.h"
+#include "vmm.h"
+#include "vmx.h"
 
 extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
 
-#define HV_PASSIVE_PRINT(...) \
-    do { \
-        if (KeGetCurrentIrql() == PASSIVE_LEVEL) { \
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, __VA_ARGS__); \
-        } \
-    } while (0)
-
 static constexpr const char* kDriverContractTag =
-    "V58-ALLCPU-SEQUENTIAL-TEARDOWN-RETRY-DIAG-CET-PL0-PRESERVE-SEGMENT-VALIDATE-USER-PROBE-INTEL-WAITPKG-IRETQ-5WORD-HYPERDBG";
+    "KNHV-ALLCPU-SEQUENTIAL-TEARDOWN-RETRY-DIAG-CET-PL0-PRESERVE-SEGMENT-VALIDATE-USER-PROBE-INTEL-WAITPKG-IRETQ-5WORD";
 static constexpr ULONG kHvFatalBugCheck = 0x48564D58UL;
 static constexpr ULONG_PTR kHvFatalUnloadIncomplete = 0x554E4C44ULL;
 static constexpr ULONG_PTR kHvFatalUnloadCallbackState = 0x43425354ULL;
 
 static bool RejectVmx(const char* reason) {
-    HV_PASSIVE_PRINT("[HV] VMX gate rejected: %s\n", reason);
+    KNHV_PASSIVE_PRINT("[KNHV] VMX gate rejected: %s\n", reason);
     return false;
 }
 
@@ -81,7 +71,7 @@ bool IsVmxSupported() {
     int cpuInfo[4] = {};
     __cpuid(cpuInfo, 0);
     const int maxBasicLeaf = cpuInfo[0];
-    HV_PASSIVE_PRINT("[HV] CPUID.0: max_basic=0x%X vendor=%08X-%08X-%08X\n",
+    KNHV_PASSIVE_PRINT("[KNHV] CPUID.0: max_basic=0x%X vendor=%08X-%08X-%08X\n",
              maxBasicLeaf, static_cast<ULONG>(cpuInfo[1]),
              static_cast<ULONG>(cpuInfo[3]), static_cast<ULONG>(cpuInfo[2]));
     if (maxBasicLeaf < 1) return RejectVmx("CPUID basic leaf 1 is unavailable");
@@ -104,8 +94,8 @@ bool IsVmxSupported() {
                                  CPUID_1_ECX_OSXSAVE) != 0;
     const u64 currentCr4 = __readcr4();
     const bool cr4OsxsaveEnabled = (currentCr4 & CR4_OSXSAVE) != 0;
-    HV_PASSIVE_PRINT("[HV] CPUID.1:ECX=0x%08X\n", static_cast<ULONG>(cpuInfo[2]));
-    HV_PASSIVE_PRINT("[HV] CPUID.1: VMX=%u XSAVE=%u OSXSAVE=%u hypervisor=%u CET_CR4=%u\n",
+    KNHV_PASSIVE_PRINT("[KNHV] CPUID.1:ECX=0x%08X\n", static_cast<ULONG>(cpuInfo[2]));
+    KNHV_PASSIVE_PRINT("[KNHV] CPUID.1: VMX=%u XSAVE=%u OSXSAVE=%u hypervisor=%u CET_CR4=%u\n",
              (cpuInfo[2] & (1 << 5)) != 0 ? 1U : 0U,
              xsaveEnumerated ? 1U : 0U,
              osxsaveEnabled ? 1U : 0U,
@@ -121,12 +111,12 @@ bool IsVmxSupported() {
     // IA32_{U,S}_CET, while IA32_XSS advertises supervisor XSTATE components
     // that ordinary XSAVE/XRSTOR does not preserve. Read the complete state
     // before deciding which capability is outside this monitor's contract.
-    HV_PASSIVE_PRINT("[HV] CR4=0x%llX\n", currentCr4);
+    KNHV_PASSIVE_PRINT("[KNHV] CR4=0x%llX\n", currentCr4);
     if ((currentCr4 & CR4_FRED) != 0) {
         return RejectVmx("FRED event delivery is active and unsupported");
     }
     const u64 currentCr0 = __readcr0();
-    HV_PASSIVE_PRINT("[HV] CR0=0x%llX\n", currentCr0);
+    KNHV_PASSIVE_PRINT("[KNHV] CR0=0x%llX\n", currentCr0);
     // XSAVE(S)/XRSTOR(S) raise #NM while CR0.TS is set and #UD while EM is
     // set. The VM-exit entry stub cannot safely take either fault, so reject a
     // nonstandard lazy-FPU configuration before VMXON instead of risking a
@@ -146,7 +136,7 @@ bool IsVmxSupported() {
     __try {
         if (xsaveEnumerated && osxsaveEnabled && cr4OsxsaveEnabled) {
             const u64 xcr0 = _xgetbv(0);
-            HV_PASSIVE_PRINT("[HV] XCR0=0x%llX\n", xcr0);
+            KNHV_PASSIVE_PRINT("[KNHV] XCR0=0x%llX\n", xcr0);
             if ((xcr0 & 0x3ULL) != 0x3ULL) {
                 return RejectVmx("XCR0 lacks x87/SSE state");
             }
@@ -162,7 +152,7 @@ bool IsVmxSupported() {
                    (currentCr4 & CR4_PKE) != 0) {
             return RejectVmx("legacy FXSAVE state is unavailable");
         } else {
-            HV_PASSIVE_PRINT("[HV] XSTATE: using legacy FXSAVE backend\n");
+            KNHV_PASSIVE_PRINT("[KNHV] XSTATE: using legacy FXSAVE backend\n");
         }
         // CPUID.0D.0 enumerates every XCR0 component the processor can
         // support, not only the components enabled by the running OS. The
@@ -190,7 +180,7 @@ bool IsVmxSupported() {
             (static_cast<u32>(cpuInfo[3]) & CPUID_7_EDX_CET_IBT) != 0;
         const u32 cpuid7MaxSubleaf = static_cast<u32>(cpuInfo[0]);
         bool fredEnumerated = false;
-        HV_PASSIVE_PRINT("[HV] CPUID.7.0: EBX=0x%08X ECX=0x%08X EDX=0x%08X "
+        KNHV_PASSIVE_PRINT("[KNHV] CPUID.7.0: EBX=0x%08X ECX=0x%08X EDX=0x%08X "
                  "CET_SS=%u CET_IBT=%u PT=%u\n",
                  static_cast<ULONG>(cpuInfo[1]), static_cast<ULONG>(cpuInfo[2]),
                  static_cast<ULONG>(cpuInfo[3]), cetShadowStackEnumerated ? 1U : 0U,
@@ -199,7 +189,7 @@ bool IsVmxSupported() {
             __cpuidex(cpuInfo, 7, 1);
             fredEnumerated =
                 (static_cast<u32>(cpuInfo[0]) & CPUID_7_1_EAX_FRED) != 0;
-            HV_PASSIVE_PRINT("[HV] CPUID.7.1: EAX=0x%08X FRED=%u\n",
+            KNHV_PASSIVE_PRINT("[KNHV] CPUID.7.1: EAX=0x%08X FRED=%u\n",
                      static_cast<ULONG>(cpuInfo[0]),
                      fredEnumerated ? 1U : 0U);
         }
@@ -210,7 +200,7 @@ bool IsVmxSupported() {
                 !ReadMsrSafe(MSR_IA32_RTIT_CTL, &ptControl)) {
                 return RejectVmx("reading Intel PT capability state faulted");
             }
-            HV_PASSIVE_PRINT("[HV] Intel PT policy: VMX_MISC=0x%llX post_vmxon=%u "
+            KNHV_PASSIVE_PRINT("[KNHV] Intel PT policy: VMX_MISC=0x%llX post_vmxon=%u "
                      "RTIT_CTL=0x%llX guest=hidden\n",
                      vmxMisc, (vmxMisc & VMX_MISC_INTEL_PT) != 0 ? 1U : 0U,
                      ptControl);
@@ -220,7 +210,7 @@ bool IsVmxSupported() {
         }
         if (maxBasicLeaf >= 0x14) {
             __cpuidex(cpuInfo, 0x14, 0);
-            HV_PASSIVE_PRINT("[HV] CPUID.14.0: EAX=0x%08X EBX=0x%08X ECX=0x%08X "
+            KNHV_PASSIVE_PRINT("[KNHV] CPUID.14.0: EAX=0x%08X EBX=0x%08X ECX=0x%08X "
                      "EDX=0x%08X guest=hidden\n",
                      static_cast<ULONG>(cpuInfo[0]),
                      static_cast<ULONG>(cpuInfo[1]),
@@ -228,7 +218,7 @@ bool IsVmxSupported() {
                      static_cast<ULONG>(cpuInfo[3]));
             if (static_cast<u32>(cpuInfo[0]) >= 1) {
                 __cpuidex(cpuInfo, 0x14, 1);
-                HV_PASSIVE_PRINT("[HV] CPUID.14.1: EAX=0x%08X EBX=0x%08X ECX=0x%08X "
+                KNHV_PASSIVE_PRINT("[KNHV] CPUID.14.1: EAX=0x%08X EBX=0x%08X ECX=0x%08X "
                          "EDX=0x%08X\n",
                          static_cast<ULONG>(cpuInfo[0]),
                          static_cast<ULONG>(cpuInfo[1]),
@@ -253,7 +243,7 @@ bool IsVmxSupported() {
         xsavesEnumerated = (cpuInfo[0] & CPUID_D1_XSAVES) != 0;
         xrstorsEnumerated = xsavesEnumerated;
         xfdEnumerated = (cpuInfo[0] & CPUID_D1_XFD) != 0;
-        HV_PASSIVE_PRINT("[HV] CPUID.0D.1: EAX=0x%08X EBX=%u ECX=0x%08X EDX=0x%08X "
+        KNHV_PASSIVE_PRINT("[KNHV] CPUID.0D.1: EAX=0x%08X EBX=%u ECX=0x%08X EDX=0x%08X "
                  "XSAVES=%u XRSTORS=%u XFD=%u\n",
                  static_cast<ULONG>(cpuInfo[0]), static_cast<ULONG>(cpuInfo[1]),
                  static_cast<ULONG>(cpuInfo[2]), static_cast<ULONG>(cpuInfo[3]),
@@ -267,7 +257,7 @@ bool IsVmxSupported() {
             !ReadMsrSafe(MSR_IA32_XFD_ERR, &xfdError)) {
             return RejectVmx("reading XFD state faulted");
         }
-        HV_PASSIVE_PRINT("[HV] XFD policy: IA32_XFD=0x%llX IA32_XFD_ERR=0x%llX "
+        KNHV_PASSIVE_PRINT("[KNHV] XFD policy: IA32_XFD=0x%llX IA32_XFD_ERR=0x%llX "
                  "guest=hidden\n", xfd, xfdError);
         if (xfd != 0 || xfdError != 0) {
             return RejectVmx("active XFD state is not virtualized");
@@ -287,10 +277,10 @@ bool IsVmxSupported() {
             return RejectVmx("reading IA32_XSS faulted");
         }
     }
-    HV_PASSIVE_PRINT("[HV] CET: IA32_U_CET=0x%llX IA32_S_CET=0x%llX "
+    KNHV_PASSIVE_PRINT("[KNHV] CET: IA32_U_CET=0x%llX IA32_S_CET=0x%llX "
              "IA32_XSS=0x%llX\n",
              userCet, supervisorCet, xss);
-    HV_PASSIVE_PRINT("[HV] CET SSP: PL0=0x%llX PL1=0x%llX PL2=0x%llX "
+    KNHV_PASSIVE_PRINT("[KNHV] CET SSP: PL0=0x%llX PL1=0x%llX PL2=0x%llX "
              "PL3=0x%llX IST=0x%llX\n",
              pl0Ssp, pl1Ssp, pl2Ssp, pl3Ssp, interruptSspTable);
 
@@ -317,8 +307,8 @@ bool IsVmxSupported() {
             "supervisor CET state requires paired VMCS CET controls");
     }
     if (hasSupervisorVmcsState) {
-        HV_PASSIVE_PRINT(
-            "[HV] CET: inactive supervisor VMCS state will be preserved: "
+        KNHV_PASSIVE_PRINT(
+            "[KNHV] CET: inactive supervisor VMCS state will be preserved: "
             "S_CET=0x%llX PL0=0x%llX IST=0x%llX\n",
             supervisorCet, pl0Ssp, interruptSspTable);
     }
@@ -329,7 +319,7 @@ bool IsVmxSupported() {
     if (xss != 0 && !IsXsavesEnabled()) {
         return RejectVmx("IA32_XSS is non-zero but XSAVES is unavailable");
     }
-    HV_PASSIVE_PRINT("[HV] CET contract selected: VMCS=%u XSAVES=%u\n",
+    KNHV_PASSIVE_PRINT("[KNHV] CET contract selected: VMCS=%u XSAVES=%u\n",
              IsCETVmcsEnabled() ? 1U : 0U,
              IsXsavesEnabled() ? 1U : 0U);
     __try {
@@ -338,7 +328,7 @@ bool IsVmxSupported() {
         // irreversible until reset and can conflict with firmware, BitLocker,
         // or another type-1 monitor.  A driver that cannot prove VMXON is
         // already permitted must fail closed before allocating VMX state.
-        HV_PASSIVE_PRINT("[HV] IA32_FEATURE_CONTROL=0x%llX\n", featureControl);
+        KNHV_PASSIVE_PRINT("[KNHV] IA32_FEATURE_CONTROL=0x%llX\n", featureControl);
         if ((featureControl & (IA32_FEATURE_CONTROL_LOCK |
                                IA32_FEATURE_CONTROL_VMXON_OUTSIDE_SMX)) !=
             (IA32_FEATURE_CONTROL_LOCK |
@@ -347,7 +337,7 @@ bool IsVmxSupported() {
         }
 
         const u64 vmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
-        HV_PASSIVE_PRINT("[HV] IA32_VMX_BASIC=0x%llX\n", vmxBasic);
+        KNHV_PASSIVE_PRINT("[KNHV] IA32_VMX_BASIC=0x%llX\n", vmxBasic);
         // VMX regions must be WB and fit in the 4-KiB region allocated below.
         if (((vmxBasic >> 50) & 0xFULL) != 6) {
             return RejectVmx("VMX region memory type is not write-back");
@@ -373,7 +363,7 @@ bool IsVmxSupported() {
         xsaveSize > sizeof(GuestContext{}.FxArea)) {
         return RejectVmx("XSAVE area exceeds the VM-exit frame");
     }
-    HV_PASSIVE_PRINT("[HV] VMX gate accepted: xsave_frame=%u cet_vmcs=%u xsaves=%u\n",
+    KNHV_PASSIVE_PRINT("[KNHV] VMX gate accepted: xsave_frame=%u cet_vmcs=%u xsaves=%u\n",
              xsaveSize, IsCETVmcsEnabled() ? 1U : 0U,
              IsXsavesEnabled() ? 1U : 0U);
 
@@ -381,7 +371,7 @@ bool IsVmxSupported() {
 }
 
 void DriverUnload(PDRIVER_OBJECT DriverObject) {
-    HV_PASSIVE_PRINT("[HV] Unloading...\n");
+    KNHV_PASSIVE_PRINT("[KNHV] Unloading...\n");
     StopHypervisor();
     // The VMM owns the per-CPU VMXOFF and teardown-quiescence proof.  Do not
     // infer safety from a state enum or let an incomplete stop return to the
@@ -408,17 +398,17 @@ void DriverUnload(PDRIVER_OBJECT DriverObject) {
                      reinterpret_cast<ULONG_PTR>(DriverObject),
                      0);
     }
-    HV_PASSIVE_PRINT("[HV] Stopped.\n");
+    KNHV_PASSIVE_PRINT("[KNHV] Stopped.\n");
 }
 
 extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     UNREFERENCED_PARAMETER(RegistryPath);
     g_HvDriverObject = DriverObject;
 
-    HV_PASSIVE_PRINT("[HV] Driver Entry. contract=%s\n", kDriverContractTag);
+    KNHV_PASSIVE_PRINT("[KNHV] Driver Entry. contract=%s\n", kDriverContractTag);
 
     if (!IsVmxSupported()) {
-        HV_PASSIVE_PRINT("[HV] VMX capability gate rejected; see the preceding reason.\n");
+        KNHV_PASSIVE_PRINT("[KNHV] VMX capability gate rejected; see the preceding reason.\n");
         return STATUS_NOT_SUPPORTED;
     }
 
@@ -429,16 +419,16 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     // Register before the VMX transaction starts so a failure during prepare
     // or launch can still be exported through secondary dump data.
     if (!RegisterSecondaryDumpCallback()) {
-        HV_PASSIVE_PRINT("[HV] Secondary dump callback registration failed; continuing without it\n");
+        KNHV_PASSIVE_PRINT("[KNHV] Secondary dump callback registration failed; continuing without it\n");
     }
 
     NTSTATUS status = StartHypervisor();
     if (!NT_SUCCESS(status)) {
-        HV_PASSIVE_PRINT("[HV] Failed to start: 0x%X\n", status);
+        KNHV_PASSIVE_PRINT("[KNHV] Failed to start: 0x%X\n", status);
         StopHypervisor();
         if (IsHypervisorQuarantined()) {
             DriverObject->DriverUnload = nullptr;
-            HV_PASSIVE_PRINT("[HV] Start failure quarantined; driver remains resident\n");
+            KNHV_PASSIVE_PRINT("[KNHV] Start failure quarantined; driver remains resident\n");
             return STATUS_SUCCESS;
         }
         if (!IsHypervisorStopComplete()) {
@@ -461,7 +451,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
 
     if (IsHypervisorQuarantined()) {
         DriverObject->DriverUnload = nullptr;
-        HV_PASSIVE_PRINT("[HV] Start timed out; driver remains resident in quarantine\n");
+        KNHV_PASSIVE_PRINT("[KNHV] Start timed out; driver remains resident in quarantine\n");
         return STATUS_SUCCESS;
     }
 

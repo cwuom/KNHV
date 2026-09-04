@@ -20,9 +20,9 @@ $generateCertificateScript = Join-Path $PSScriptRoot "Generate-Test-Certificate.
 
 $usingGeneratedCertificate = [string]::IsNullOrWhiteSpace($Certificate)
 if ($usingGeneratedCertificate) {
-    $Certificate = Join-Path $repoRoot "certs\Nested_HV_test.pfx"
+    $Certificate = Join-Path $repoRoot "certs\KNHV_test.pfx"
     if (-not $PasswordFile) {
-        $PasswordFile = Join-Path $repoRoot "certs\Nested_HV_test.pwd"
+        $PasswordFile = Join-Path $repoRoot "certs\KNHV_test.pwd"
     }
     # Run the generator on every automatic-signing invocation. It reuses a
     # valid chain, but repairs the old single self-signed PFX that this project
@@ -50,7 +50,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Driver build failed with exit code $LASTEXITCODE."
 }
 
-$driverPath = Join-Path $repoRoot (Join-Path "build\vscode" (Join-Path $Configuration "Nested_HV.sys"))
+$driverPath = Join-Path $repoRoot (Join-Path "build\vscode" (Join-Path $Configuration "KNHV.sys"))
 $signArgs = @{
     DriverPath = $driverPath
     Certificate = $Certificate
@@ -60,7 +60,7 @@ if ($TimestampUrl) { $signArgs.TimestampUrl = $TimestampUrl }
 if ($SignTool) { $signArgs.SignTool = $SignTool }
 if ($usingGeneratedCertificate) { $signArgs.AllowUntrustedTestCertificate = $true }
 
-Write-Host "Signing Nested_HV.sys"
+Write-Host "Signing KNHV.sys"
 & $signScript @signArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Driver signing failed with exit code $LASTEXITCODE."

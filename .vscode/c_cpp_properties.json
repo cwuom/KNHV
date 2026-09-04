@@ -6,7 +6,10 @@
         {
             "name": "Windows Kernel x64",
             "includePath": [
-                "${workspaceFolder}/**",
+                "${workspaceFolder}/src/include",
+                "${workspaceFolder}/src/core",
+                "${workspaceFolder}/src/vmx",
+                "${workspaceFolder}/src/asm",
                 "${env:WDKContentRoot}/Include/**/km",
                 "${env:WDKContentRoot}/Include/**/shared",
                 "${env:WDKContentRoot}/Include/**/um",
@@ -28,7 +31,10 @@
             "cppStandard": "c++17",
             "browse": {
                 "path": [
-                    "${workspaceFolder}",
+                    "${workspaceFolder}/src/include",
+                    "${workspaceFolder}/src/core",
+                    "${workspaceFolder}/src/vmx",
+                    "${workspaceFolder}/src/asm",
                     "${env:WDKContentRoot}/Include/**/km",
                     "${env:WDKContentRoot}/Include/**/shared",
                     "${env:WDKContentRoot}/Include/**/um",

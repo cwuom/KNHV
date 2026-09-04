@@ -5,12 +5,15 @@
     "cmake.sourceDirectory": "${workspaceFolder}",
     "cmake.generator": "Ninja",
     "cmake.useVsDeveloperEnvironment": "always",
+    "cmake.configureEnvironment": {
+        "VSLANG": "1033"
+    },
     "cmake.buildDirectory": "${workspaceFolder}/build/vscode/${buildType}",
     "cmake.configureSettings": {
         "CMAKE_CXX_STANDARD": "17",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "NESTED_HV_SIGN": "OFF",
-        "NESTED_HV_BUILD_TESTS": "ON",
+        "KNHV_SIGN": "OFF",
+        "KNHV_BUILD_TESTS": "ON",
         "WDK_WINVER": "0x0A00"
     },
     "cmake.exportCompileCommandsFile": true,
@@ -27,7 +30,10 @@
     "C_Cpp.default.compileCommands": "${workspaceFolder}/compile_commands.json",
     "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
     "C_Cpp.default.includePath": [
-        "${workspaceFolder}/**",
+        "${workspaceFolder}/src/include",
+        "${workspaceFolder}/src/core",
+        "${workspaceFolder}/src/vmx",
+        "${workspaceFolder}/src/asm",
         "${env:WDKContentRoot}/Include/**/km",
         "${env:WDKContentRoot}/Include/**/shared",
         "C:/Program Files (x86)/Windows Kits/10/Include/**/km",

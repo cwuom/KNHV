@@ -1,7 +1,3 @@
-//
-// Created by cwuom on 17 Feb 2026.
-//
-
 #pragma once
 
 #include <cstddef>
@@ -293,7 +289,7 @@ enum HvVmcsDiagnosticValidity : u64 {
     HvVmcsValidityVmcsReadback = 1ULL << 7,
 };
 
-// 记录原生拆除被拒绝的具体契约原因，供崩溃后的离线分析使用
+// records why native teardown was rejected so post-crash analysis can stay offline
 enum HvNativeTeardownReject : u32 {
     HvNativeTeardownRejectNone = 0,
     HvNativeTeardownRejectSelector = 1U << 0,

@@ -17,12 +17,12 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 $OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
-$rootSubject = "CN=Nested_HV Test Root CA"
-$leafSubject = "CN=Nested_HV Test Code Signing"
-$rootPath = Join-Path $OutputDirectory "Nested_HV_test_root.cer"
-$leafPath = Join-Path $OutputDirectory "Nested_HV_test.cer"
-$pfxPath = Join-Path $OutputDirectory "Nested_HV_test.pfx"
-$passwordPath = Join-Path $OutputDirectory "Nested_HV_test.pwd"
+$rootSubject = "CN=KNHV Test Root CA"
+$leafSubject = "CN=KNHV Test Code Signing"
+$rootPath = Join-Path $OutputDirectory "KNHV_test_root.cer"
+$leafPath = Join-Path $OutputDirectory "KNHV_test.cer"
+$pfxPath = Join-Path $OutputDirectory "KNHV_test.pfx"
+$passwordPath = Join-Path $OutputDirectory "KNHV_test.pwd"
 
 function New-RandomPassword {
     $bytes = New-Object byte[] 48
@@ -49,9 +49,9 @@ function Remove-GeneratedStoreCertificates {
     $subjects = @(
         $rootSubject,
         $leafSubject,
-        "CN=Nested_HV Test Root Code Signing 2026",
-        "CN=Nested_HV Test Root Critical 2026",
-        "CN=Nested_HV Test Kernel Signing 2026"
+        "CN=KNHV Test Root Code Signing 2026",
+        "CN=KNHV Test Root Critical 2026",
+        "CN=KNHV Test Kernel Signing 2026"
     )
     $stores = @("Cert:\CurrentUser\My", "Cert:\CurrentUser\Root", "Cert:\CurrentUser\TrustedPublisher")
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -141,7 +141,7 @@ Remove-OldArtifacts
 
 if (-not $Recreate -and (Test-ExistingChain $password)) {
     $existingLeaf = Get-PfxLeaf $pfxPath $password
-    Write-Host "Existing Nested_HV test certificate chain is valid; reusing it."
+    Write-Host "Existing KNHV test certificate chain is valid; reusing it."
 }
 else {
     Remove-GeneratedStoreCertificates
@@ -156,7 +156,7 @@ else {
     $root = New-SelfSignedCertificate `
         -Type Custom `
         -Subject $rootSubject `
-        -FriendlyName "Nested_HV local test root CA" `
+        -FriendlyName "KNHV local test root CA" `
         -KeyAlgorithm RSA `
         -KeyLength 2048 `
         -HashAlgorithm SHA256 `
@@ -174,7 +174,7 @@ else {
     $leaf = New-SelfSignedCertificate `
         -Type Custom `
         -Subject $leafSubject `
-        -FriendlyName "Nested_HV local test kernel code signing" `
+        -FriendlyName "KNHV local test kernel code signing" `
         -Signer $root `
         -KeyAlgorithm RSA `
         -KeyLength 2048 `

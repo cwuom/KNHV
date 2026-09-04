@@ -1,14 +1,7 @@
-//
-// Created by cwuom on 17 Feb 2026.
-//
-
-
 #pragma once
 #include <ntddk.h>
 
-// ==============================================================================
 // Reference: Intel SDM Vol. 3C Appendix B, Intel SDM Vol. 4
-// ==============================================================================
 
 #define CR4_VMXE (1ULL << 13)
 #define CR4_LA57 (1ULL << 12)

@@ -2,9 +2,8 @@
 
 #include <stdint.h>
 
-// ia32_vmx_procbased_ctls3 is a 64-bit allowed-one bitmap. It does not use
-// the low-half mandatory-one and high-half allowed-one layout of older VMX
-// capability MSRs
+// IA32_VMX_PROCBASED_CTLS3 is an allowed-one bitmap, unlike the two-half
+// layout used by the older VMX capability MSRs
 constexpr uint64_t HvNormalizeTertiaryControls(uint64_t requested,
                                                 uint64_t allowedOne) noexcept {
     return requested & allowedOne;
