@@ -508,9 +508,9 @@ struct VcpuContext {
     u64   GuestDr7;
     u64   GuestDebugctl;
     // Native teardown is safe only while the guest still uses the descriptor
-    // tables and segment selectors that were active at launch.  VMX restores
-    // the host tables on exit, so a changed guest table cannot be IRETed back
-    // without an explicit table-switch contract.
+    // tables and a reproducible segment environment from launch. VMX restores
+    // the host tables on exit; CS and non-SS selectors stay paired with that
+    // snapshot, while SS is validated against the shared GDT at teardown.
     u64   HostSegmentSelectorsLow;
     u64   HostSegmentSelectorsHigh;
     u64   HostGdtBase;

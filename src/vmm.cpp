@@ -1104,8 +1104,8 @@ bool InitializeVmxFeatureContract() {
              static_cast<ULONG>(xsavesSize));
 
     // CR4.CET is set on current Windows 11 builds even when supervisor CET
-    // is inactive.  In that state VMX still requires the paired CET
-    // entry/exit controls and valid zeroed VMCS CET fields.
+    // is inactive. In that state VMX still requires the paired CET entry/exit
+    // controls and architecturally valid VMCS CET fields.
     if ((currentCr4 & CR4_CET) != 0) {
         const u32 exitMsr = ControlMsr(vmxBasic,
                                        MSR_IA32_VMX_EXIT_CTLS,
@@ -1586,6 +1586,34 @@ static __forceinline bool IsCanonical(u64 value) {
     const u64 upperMask = ~((1ULL << bits) - 1ULL);
     return (value & signBit) ? ((value & upperMask) == upperMask)
                              : ((value & upperMask) == 0);
+}
+
+static __forceinline bool IsSupervisorCetStateVmcsSafe(
+    u64 supervisorCet, u64 pl0Ssp, u64 pl1Ssp, u64 pl2Ssp,
+    u64 interruptSspTable) {
+    // vmx checks the CET fields even when the enable bits are clear. keep the
+    // same reserved-bit, bitmap, SSP, and interrupt-table rules as VM-entry
+    constexpr u64 kCetReservedBits = 0xFULL << 6;
+    constexpr u64 kCetSuppress = 1ULL << 10;
+    constexpr u64 kCetTracker = 1ULL << 11;
+    constexpr u64 kCetBitmapBaseAlignmentBits = 0x3ULL << 12;
+    constexpr u64 kSspReservedBits = 0x3ULL;
+
+    if ((supervisorCet & IA32_CET_ENABLE_MASK) != 0 ||
+        (supervisorCet & kCetReservedBits) != 0 ||
+        (supervisorCet & kCetBitmapBaseAlignmentBits) != 0 ||
+        !IsCanonical(supervisorCet) ||
+        ((supervisorCet & kCetSuppress) != 0 &&
+         (supervisorCet & kCetTracker) != 0)) {
+        return false;
+    }
+    if (!IsCanonical(pl0Ssp) || (pl0Ssp & kSspReservedBits) != 0) {
+        return false;
+    }
+    // pl1/pl2 have no vmcs fields in this monitor. keep rejecting a live
+    // value rather than silently exposing an unpreserved supervisor state
+    if (pl1Ssp != 0 || pl2Ssp != 0) return false;
+    return IsCanonical(interruptSspTable);
 }
 
 #pragma pack(push, 1)
@@ -3204,8 +3232,34 @@ static __forceinline u64 PackSegmentSelectors(u16 first, u16 second,
            (static_cast<u64>(fourth) << 48);
 }
 
-// VMX restores the host descriptor tables on VM-exit.  Native teardown can
+static bool IsNativeTeardownSegmentValid(
+    u64 gdtBase, u16 gdtLimit, u64 selector, u64 limit, u64 ar,
+    bool requireCode, bool requireWritableData) {
+    if (selector > 0xFFFFULL || limit > 0xFFFFFFFFULL ||
+        ar > 0xFFFFFFFFULL) {
+        return false;
+    }
+
+    const u16 selector16 = static_cast<u16>(selector);
+    if (selector16 == 0) {
+        // A null SS is valid for a ring-0 64-bit IRET only when VMX marks it
+        // unusable. CS never has a legal null form in this teardown path.
+        return !requireCode && requireWritableData && limit == 0 &&
+               ar == 0x10000ULL;
+    }
+    if (!IsGdtSelectorUsable(gdtBase, gdtLimit, selector16, false, false,
+                             requireCode, true, requireWritableData)) {
+        return false;
+    }
+    return HvGetSegmentLimit(selector16) == static_cast<u32>(limit) &&
+           HvGetSegmentAr(selector16) == static_cast<u32>(ar);
+}
+
+// VMX restores the host descriptor tables on VM-exit. Native teardown can
 // therefore use IRET only while the guest descriptor environment is unchanged.
+// Windows may expose a transient null host SS while the guest has a valid
+// kernel SS, so that selector is validated against the shared GDT instead of
+// compared with the host snapshot.
 static bool UpdateNativeTeardownContract(VcpuContext* vcpu) {
     if (!vcpu) return false;
 
@@ -3255,21 +3309,39 @@ static bool UpdateNativeTeardownContract(VcpuContext* vcpu) {
         return false;
     }
 
+    const bool guestSelectorsFit =
+        guestCs <= 0xFFFFULL && guestSs <= 0xFFFFULL &&
+        guestDs <= 0xFFFFULL && guestEs <= 0xFFFFULL &&
+        guestFs <= 0xFFFFULL && guestGs <= 0xFFFFULL &&
+        guestLdtr <= 0xFFFFULL && guestTr <= 0xFFFFULL;
     const u64 guestSelectorsLow =
-        PackSegmentSelectors(static_cast<u16>(guestCs), static_cast<u16>(guestSs),
-                             static_cast<u16>(guestDs), static_cast<u16>(guestEs));
+        PackSegmentSelectors(static_cast<u16>(guestCs),
+                             static_cast<u16>(guestSs),
+                             static_cast<u16>(guestDs),
+                             static_cast<u16>(guestEs));
     const u64 guestSelectorsHigh =
         PackSegmentSelectors(static_cast<u16>(guestFs), static_cast<u16>(guestGs),
                              static_cast<u16>(guestLdtr), static_cast<u16>(guestTr));
-    const bool selectorsSame =
-        guestSelectorsLow == vcpu->HostSegmentSelectorsLow &&
-        guestSelectorsHigh == vcpu->HostSegmentSelectorsHigh;
-    const bool csSsSame =
-        guestCsLimit == vcpu->HostCsLimit &&
-        guestSsLimit == vcpu->HostSsLimit &&
-        guestCsAr == vcpu->HostCsAr && guestSsAr == vcpu->HostSsAr;
     const bool gdtSame = guestGdtBase == vcpu->HostGdtBase &&
                          guestGdtLimit == vcpu->HostGdtLimit;
+    const bool guestSegmentsSafe =
+        !gdtSame ||
+        (IsNativeTeardownSegmentValid(
+             vcpu->HostGdtBase, static_cast<u16>(vcpu->HostGdtLimit), guestCs,
+             guestCsLimit, guestCsAr, true, false) &&
+         IsNativeTeardownSegmentValid(
+             vcpu->HostGdtBase, static_cast<u16>(vcpu->HostGdtLimit), guestSs,
+             guestSsLimit, guestSsAr, false, true));
+    constexpr u64 kSsSelectorMask = 0xFFFFULL << 16;
+    const bool nonSsSelectorsSame =
+        guestSelectorsFit &&
+        (guestSelectorsLow & ~kSsSelectorMask) ==
+            (vcpu->HostSegmentSelectorsLow & ~kSsSelectorMask) &&
+        guestSelectorsHigh == vcpu->HostSegmentSelectorsHigh;
+    const bool selectorsSame = nonSsSelectorsSame && guestSegmentsSafe;
+    const bool csSsSame = guestCsLimit == vcpu->HostCsLimit &&
+                          guestCsAr == vcpu->HostCsAr &&
+                          guestSegmentsSafe;
     const bool idtSame = guestIdtBase == vcpu->HostIdtBase &&
                          guestIdtLimit == vcpu->HostIdtLimit;
     const bool trSame = guestTrBase == vcpu->HostTrBase &&
@@ -5021,6 +5093,40 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
                            hostEfer, pat);
         return false;
     }
+    // capture CET state once on the owning processor and reuse it for both
+    // VMCS sides. This keeps the host and initial guest state coherent while
+    // following HyperDbg's per-processor VMCS setup pattern.
+    u64 hostSCet = 0;
+    u64 hostSsp = 0;
+    u64 hostPl1Ssp = 0;
+    u64 hostPl2Ssp = 0;
+    u64 hostInterruptSspTable = 0;
+    if (g_CetVmcsEnabled) {
+        const bool cetSnapshotRead =
+            ReadMsrSafe(MSR_IA32_S_CET, &hostSCet) &&
+            ReadMsrSafe(MSR_IA32_PL0_SSP, &hostSsp) &&
+            ReadMsrSafe(MSR_IA32_PL1_SSP, &hostPl1Ssp) &&
+            ReadMsrSafe(MSR_IA32_PL2_SSP, &hostPl2Ssp) &&
+            ReadMsrSafe(MSR_IA32_INTERRUPT_SSP_TABLE,
+                        &hostInterruptSspTable);
+        if (!cetSnapshotRead ||
+            !IsSupervisorCetStateVmcsSafe(hostSCet, hostSsp, hostPl1Ssp,
+                                          hostPl2Ssp,
+                                          hostInterruptSspTable)) {
+            WriteHvTrace(mutableVcpu, cpuId, HvTraceEventContractFail,
+                         hostSCet, hostSsp, hostPl1Ssp,
+                         hostInterruptSspTable);
+            HV_VERBOSE_PRINT(
+                "[HV] CPU %u VMCS setup rejected supervisor CET state: "
+                "read=%u s_cet=0x%llX pl0=0x%llX pl1=0x%llX pl2=0x%llX "
+                "ist=0x%llX\n",
+                cpuId, cetSnapshotRead ? 1U : 0U, hostSCet, hostSsp,
+                hostPl1Ssp, hostPl2Ssp, hostInterruptSspTable);
+            PublishVmcsFailure(mutableVcpu, HvVmcsFailureControlPolicy,
+                               hostSCet, hostSsp);
+            return false;
+        }
+    }
     const u64 guestEfer = hostEfer;
     const u64 guestPat = pat;
     const bool guestTrUsable =
@@ -5214,19 +5320,13 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     }
 
     // CET supervisor state is loaded by VM-exit/VM-entry controls rather than
-    // by XSAVES.  Keep the host and initial guest copies identical; later
+    // by XSAVES. Keep the host and initial guest copies identical; later
     // guest WRMSR operations update the guest VMCS fields in the exit handler.
-    u64 hostSCet = 0;
-    u64 hostSsp = 0;
-    u64 hostInterruptSspTable = 0;
     if (g_CetVmcsEnabled) {
-        hostSCet = __readmsr(MSR_IA32_S_CET);
-        hostSsp = __readmsr(MSR_IA32_PL0_SSP);
-        hostInterruptSspTable = __readmsr(MSR_IA32_INTERRUPT_SSP_TABLE);
         if (!VmWriteChecked(HOST_S_CET, hostSCet) ||
             !VmWriteChecked(HOST_SSP, hostSsp) ||
             !VmWriteChecked(HOST_INTR_SSP_TABLE, hostInterruptSspTable)) {
-            return 0;
+            return false;
         }
     }
 
@@ -5304,13 +5404,10 @@ bool SetupVmcs(const VcpuContext* Vcpu, void* GuestSp, void* GuestIp) {
     VmWriteChecked(GUEST_PAT, guestPat);
     VmWriteChecked(HOST_PAT, pat);
 
-    u64 guestSCet = 0;
-    u64 guestSsp = 0;
-    u64 guestInterruptSspTable = 0;
+    const u64 guestSCet = hostSCet;
+    const u64 guestSsp = hostSsp;
+    const u64 guestInterruptSspTable = hostInterruptSspTable;
     if (g_CetVmcsEnabled) {
-        guestSCet = __readmsr(MSR_IA32_S_CET);
-        guestSsp = __readmsr(MSR_IA32_PL0_SSP);
-        guestInterruptSspTable = __readmsr(MSR_IA32_INTERRUPT_SSP_TABLE);
         if (!VmWriteChecked(GUEST_S_CET, guestSCet) ||
             !VmWriteChecked(GUEST_SSP, guestSsp) ||
             !VmWriteChecked(GUEST_INTR_SSP_TABLE, guestInterruptSspTable)) {
@@ -6653,13 +6750,23 @@ extern "C" ULONG PrepareHvCallback(ULONG_PTR Context, void* GuestSp, void* Guest
             u64 localPl1 = 0;
             u64 localPl2 = 0;
             u64 localIst = 0;
-            if (!ReadMsrSafe(MSR_IA32_S_CET, &localSCet) ||
-                !ReadMsrSafe(MSR_IA32_PL0_SSP, &localPl0) ||
-                !ReadMsrSafe(MSR_IA32_PL1_SSP, &localPl1) ||
-                !ReadMsrSafe(MSR_IA32_PL2_SSP, &localPl2) ||
-                !ReadMsrSafe(MSR_IA32_INTERRUPT_SSP_TABLE, &localIst) ||
-                localSCet != 0 || localPl0 != 0 || localPl1 != 0 ||
-                localPl2 != 0 || localIst != 0) {
+            const bool localCetStateRead =
+                ReadMsrSafe(MSR_IA32_S_CET, &localSCet) &&
+                ReadMsrSafe(MSR_IA32_PL0_SSP, &localPl0) &&
+                ReadMsrSafe(MSR_IA32_PL1_SSP, &localPl1) &&
+                ReadMsrSafe(MSR_IA32_PL2_SSP, &localPl2) &&
+                ReadMsrSafe(MSR_IA32_INTERRUPT_SSP_TABLE, &localIst);
+            if (!localCetStateRead ||
+                !IsSupervisorCetStateVmcsSafe(localSCet, localPl0, localPl1,
+                                               localPl2, localIst)) {
+                WriteHvTrace(vcpu, id, HvTraceEventContractFail, localSCet,
+                             localPl0, localPl1, localIst);
+                HV_VERBOSE_PRINT(
+                    "[HV] CPU %u supervisor CET state outside VMCS contract: "
+                    "s_cet=0x%llX pl0=0x%llX pl1=0x%llX pl2=0x%llX "
+                    "ist=0x%llX read=%u\n",
+                    id, localSCet, localPl0, localPl1, localPl2, localIst,
+                    localCetStateRead ? 1U : 0U);
                 InterlockedExchange(&vcpu->State, VcpuFailed);
                 return 0;
             }

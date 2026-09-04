@@ -1626,6 +1626,29 @@ void TestSourceContract(const fs::path& root, TestState& state) {
       setup_begin != std::string::npos && setup_end > setup_begin
           ? vmm.substr(setup_begin, setup_end - setup_begin)
           : std::string{};
+  const std::size_t cet_snapshot_begin =
+      setup_source.find("ReadMsrSafe(MSR_IA32_S_CET");
+  const std::size_t cet_host_write =
+      setup_source.find("VmWriteChecked(HOST_S_CET");
+  const std::size_t cet_guest_write =
+      setup_source.find("VmWriteChecked(GUEST_S_CET");
+  Check(state, "CET VMCS setup reuses one coherent MSR snapshot",
+        cet_snapshot_begin != std::string::npos &&
+            cet_host_write > cet_snapshot_begin &&
+            cet_guest_write > cet_host_write &&
+            setup_source.find("const u64 guestSCet = hostSCet") !=
+                std::string::npos &&
+            setup_source.find("__readmsr(MSR_IA32_S_CET",
+                              cet_guest_write) == std::string::npos);
+  Check(state, "CET VMCS setup validates inactive supervisor state",
+        vmm.find("IsSupervisorCetStateVmcsSafe") != std::string::npos &&
+            vmm.find("kCetReservedBits") != std::string::npos &&
+            vmm.find("kCetBitmapBaseAlignmentBits") != std::string::npos &&
+            vmm.find("kSspReservedBits") != std::string::npos &&
+            vmm.find("!IsCanonical(supervisorCet)") != std::string::npos &&
+            vmm.find("pl1Ssp != 0 || pl2Ssp != 0") != std::string::npos &&
+            vmm.find("return IsCanonical(interruptSspTable)") !=
+                std::string::npos);
   Check(state, "VMCS optional controls start from an explicit baseline",
         !setup_source.empty() &&
             TokensInOrder(setup_source,
@@ -1691,6 +1714,45 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   Check(state, "GDT validation bounds the descriptor before reading access",
         gdt_bound_check != std::string::npos &&
             descriptor_access > gdt_bound_check);
+  const std::size_t native_teardown_contract =
+      vmm.find("static bool UpdateNativeTeardownContract(");
+  const std::size_t native_teardown_contract_end =
+      vmm.find("// called by the launch wrapper", native_teardown_contract);
+  const std::string native_teardown_source =
+      native_teardown_contract != std::string::npos &&
+              native_teardown_contract_end > native_teardown_contract
+          ? vmm.substr(native_teardown_contract,
+                       native_teardown_contract_end - native_teardown_contract)
+          : std::string{};
+  Check(state, "native teardown validates guest SS independently of host SS",
+        !native_teardown_source.empty() &&
+            vmm.find("static bool IsNativeTeardownSegmentValid(") !=
+                std::string::npos &&
+            native_teardown_source.find("guestSegmentsSafe") !=
+                std::string::npos &&
+            native_teardown_source.find("kSsSelectorMask") !=
+                std::string::npos &&
+            native_teardown_source.find("guestSsLimit == vcpu->HostSsLimit") ==
+                std::string::npos &&
+            native_teardown_source.find("guestSsAr == vcpu->HostSsAr") ==
+                std::string::npos &&
+            native_teardown_source.find("IsNativeTeardownSegmentValid(") !=
+                std::string::npos);
+  Check(state, "native teardown keeps null SS architecturally constrained",
+        !native_teardown_source.empty() &&
+            native_teardown_source.find("selector16 == 0") !=
+                std::string::npos &&
+            native_teardown_source.find("ar == 0x10000ULL") !=
+                std::string::npos &&
+            native_teardown_source.find("requireWritableData") !=
+                std::string::npos);
+  constexpr std::uint64_t kTeardownSsSelectorMask = 0xFFFFULL << 16;
+  constexpr std::uint64_t kObservedHostSelectors = 0x002B002B00000010ULL;
+  constexpr std::uint64_t kObservedGuestSelectors = 0x002B002B00180010ULL;
+  Check(state, "native teardown regression accepts the observed host SS gap",
+        (kObservedHostSelectors & ~kTeardownSsSelectorMask) ==
+            (kObservedGuestSelectors & ~kTeardownSsSelectorMask) &&
+            kObservedHostSelectors != kObservedGuestSelectors);
   CheckPattern(state, "VMCS accepts current user data selectors", vmm,
                R"(dsSelector,\s*true,\s*false,\s*false,\s*false,\s*false[\s\S]{0,180}esSelector,\s*true,\s*false,\s*false,\s*false,\s*false)");
   CheckPattern(state, "VMCS keeps CS and SS at kernel privilege", vmm,
@@ -2400,6 +2462,12 @@ void TestSourceContract(const fs::path& root, TestState& state) {
                R"(localCetEnumerated[\s\S]{0,900}ReadMsrSafe\(MSR_IA32_U_CET[\s\S]{0,260}IA32_CET_ENABLE_MASK[\s\S]{0,260}VcpuFailed)");
   CheckPattern(state, "each CPU rejects active PL3 shadow stack", vmm,
                R"(localCetShadowStackEnumerated[\s\S]{0,700}ReadMsrSafe\(MSR_IA32_PL3_SSP[\s\S]{0,260}localPl3Ssp\s*!=\s*0[\s\S]{0,260}VcpuFailed)");
+  Check(state, "each CPU validates VMCS-preservable supervisor CET state",
+        vmm.find("localCetStateRead") != std::string::npos &&
+            vmm.find("IsSupervisorCetStateVmcsSafe(localSCet, localPl0,") !=
+                std::string::npos &&
+            vmm.find("supervisor CET state outside VMCS contract") !=
+                std::string::npos);
   CheckPattern(state, "PT MSR window is intercepted", vmm,
                R"(MSR_IA32_RTIT_OUTPUT_BASE[\s\S]{0,220}0x58FU[\s\S]{0,220}setBit\(msr, false\))");
   CheckPattern(state, "XFD MSRs are intercepted", vmm,
@@ -3340,8 +3408,23 @@ void TestSourceContract(const fs::path& root, TestState& state) {
   Check(state, "active CET state is rejected before VMXON",
         main.find("active user CET state is outside the safe VMX contract") !=
                 std::string::npos &&
-            main.find("active supervisor CET state is outside the safe VMX contract") !=
+            main.find("active or unpreserved supervisor CET state is outside the safe VMX contract") !=
                 std::string::npos);
+  Check(state, "inactive supervisor SSP state is not blanket-rejected",
+        main.find("pl0Ssp != 0 || pl1Ssp != 0") == std::string::npos &&
+            main.find("pl1Ssp != 0 || pl2Ssp != 0") != std::string::npos &&
+            main.find("pl0Ssp != 0 || interruptSspTable != 0") !=
+                std::string::npos &&
+            main.find("hasSupervisorVmcsState && !IsCETVmcsEnabled()") !=
+                std::string::npos &&
+            main.find("supervisor CET state requires paired VMCS CET controls") !=
+                std::string::npos &&
+            main.find("inactive supervisor VMCS state will be preserved") !=
+                std::string::npos);
+  Check(state, "driver contract identifies CET PL0 reload support",
+        contract_tag.find("V58-") == 0 &&
+            contract_tag.find("CET-PL0-PRESERVE") != std::string::npos &&
+            contract_tag.find("SEGMENT-VALIDATE") != std::string::npos);
   CheckPattern(state, "CET_U requires XSAVES", main,
                R"(CET_U is enabled without an XSAVES CET_U component)");
   CheckPattern(state, "hidden CET_U MSRs are always intercepted", vmm,

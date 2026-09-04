@@ -19,7 +19,7 @@ extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
     } while (0)
 
 static constexpr const char* kDriverContractTag =
-    "V56-ALLCPU-SEQUENTIAL-TEARDOWN-RETRY-DIAG-USER-PROBE-INTEL-WAITPKG-IRETQ-5WORD-HYPERDBG";
+    "V58-ALLCPU-SEQUENTIAL-TEARDOWN-RETRY-DIAG-CET-PL0-PRESERVE-SEGMENT-VALIDATE-USER-PROBE-INTEL-WAITPKG-IRETQ-5WORD-HYPERDBG";
 static constexpr ULONG kHvFatalBugCheck = 0x48564D58UL;
 static constexpr ULONG_PTR kHvFatalUnloadIncomplete = 0x554E4C44ULL;
 static constexpr ULONG_PTR kHvFatalUnloadCallbackState = 0x43425354ULL;
@@ -299,15 +299,28 @@ bool IsVmxSupported() {
     }
 
     // Windows 11 25H2 commonly leaves CR4.CET set while CET state is inactive.
-    // The host frame can preserve a selected CET_U component, but this build
-    // does not expose or virtualize active user or supervisor CET state.
+    // The host frame preserves CET_U through XSAVES and the VMCS carries the
+    // supervisor PL0 and interrupt-table fields across each VMX transition.
+    // Active user or supervisor enforcement still remains outside this build.
     if ((userCet & IA32_CET_ENABLE_MASK) != 0 || pl3Ssp != 0) {
         return RejectVmx("active user CET state is outside the safe VMX contract");
     }
     if ((supervisorCet & IA32_CET_ENABLE_MASK) != 0 ||
-        pl0Ssp != 0 || pl1Ssp != 0 ||
-        pl2Ssp != 0 || interruptSspTable != 0) {
-        return RejectVmx("active supervisor CET state is outside the safe VMX contract");
+        pl1Ssp != 0 || pl2Ssp != 0) {
+        return RejectVmx(
+            "active or unpreserved supervisor CET state is outside the safe VMX contract");
+    }
+    const bool hasSupervisorVmcsState =
+        supervisorCet != 0 || pl0Ssp != 0 || interruptSspTable != 0;
+    if (hasSupervisorVmcsState && !IsCETVmcsEnabled()) {
+        return RejectVmx(
+            "supervisor CET state requires paired VMCS CET controls");
+    }
+    if (hasSupervisorVmcsState) {
+        HV_PASSIVE_PRINT(
+            "[HV] CET: inactive supervisor VMCS state will be preserved: "
+            "S_CET=0x%llX PL0=0x%llX IST=0x%llX\n",
+            supervisorCet, pl0Ssp, interruptSspTable);
     }
     if ((userCet & IA32_CET_ENABLE_MASK) != 0 &&
         (xss & IA32_XSS_CET_U) == 0) {

@@ -1173,8 +1173,8 @@ restoreGuestFxsave:
     fxrstor64 [r10]
 
 restoreGuestStateDone:
-    ; The CET VMCS path is disabled for the current contract. Keep the writes
-    ; conditional so a future CET implementation cannot fault on old Intel.
+    ; restore the guest CET fields selected by the VMCS contract before the
+    ; native handoff. the fields are valid only on CET-capable processors
     cmp byte ptr [g_CetVmcsEnabled], 0
     je restoreGuestCetDone
     mov ecx, MSR_IA32_S_CET
