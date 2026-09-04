@@ -342,12 +342,13 @@ static constexpr u64 kDebugctlArchitecturalMask =
     IA32_DEBUGCTL_ARCHITECTURAL_MASK;
 static constexpr u64 kCr0WriteProtect = 1ULL << 16;
 
-// Full-core mode keeps the proven single-CPU contract, but commits it one
-// diagnostic isolation launches exactly one logical processor. CPU0 and the
-// remaining processors stay native so a CPU8 descriptor or long-run XSTATE
-// failure cannot force a multi-CPU rollback before KD evidence is collected.
-static constexpr bool kDebugSingleCpu = true;
-static constexpr u32  kDebugCpuIndex = 8;
+// V54 promotes the V53 contract to all logical processors. Keep the staged
+// launch path: each target must return from VMLAUNCH, complete the first-exit
+// probe, return from its launch DPC, and pass a scheduler-context CPUID canary
+// before the next logical processor is allowed to enter VMX. CPU0 stays native
+// until every other processor is verified, then it is launched last.
+static constexpr bool kDebugSingleCpu = false;
+static constexpr u32  kDebugCpuIndex = 8; // retained for single-CPU diagnostics
 
 // Keep the startup coordinator native during the staged pass. Unlike V44, this
 // does not permanently exclude CPU0 from VMX; full-core mode migrates the
@@ -8506,6 +8507,13 @@ extern "C" NTSTATUS StartHypervisor() {
                                     &coordinatorBound);
         return STATUS_SUCCESS;
     }
+
+    HV_PASSIVE_PRINT(
+        "[HV] ALLCPU staged bring-up: processors=%u coordinator=%u "
+        "launch=target-dpc first_exit_probe=%u post_dpc_canary=1 "
+        "final_canary_sweep=1\n",
+        g_ProcessorCount, kCoordinatorCpuIndex,
+        kEnableLaunchFirstExitProbe ? 1U : 0U);
 
     for (u32 i = 0; i < g_ProcessorCount; ++i) {
         const NTSTATUS queueStatus =
