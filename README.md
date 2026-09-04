@@ -238,14 +238,6 @@ Only on the isolated test installation, from an elevated PowerShell:
 Secure Boot, enterprise policy, or firmware settings may reject TESTSIGNING.
 Do not change it on a production machine.
 
-## Release checklist
-
-1. Configure and build both Debug and Release with the matching SDK/WDK.
-2. Run the source-only and artifact contract tests.
-3. On the isolated validation target, run hardware, signature, and runtime
-   checks separately and preserve the KD log and matching PDB.
-4. Keep unsigned artifacts as the default; sign only through the approved
-   test or production process.
 
 ## Acknowledgements
 
