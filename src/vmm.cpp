@@ -220,6 +220,8 @@ static constexpr LONGLONG kRuntimeWatchdogPoll100ns = 100000LL; // 10 ms
 static constexpr LONG kRuntimeWatchdogPrintEveryTicks = 50;     // 500 ms
 static constexpr u64 kTargetOperationTimeout100ns = 50000000ULL;
 static constexpr LONGLONG kTargetCancelGrace100ns = 10000000LL;
+static constexpr u32 kStopRetryLimit = 32;
+static constexpr LONGLONG kStopRetryDelay100ns = -10000LL; // 1 ms
 static u64 g_VmxBasic = 0;
 // VMX host CR3 must always reference the kernel/system address space.  A
 // A future caller may invoke the launch path from an arbitrary process, so the
@@ -2268,6 +2270,18 @@ static __forceinline void RequestAuthenticatedUnload(GuestContext* c,
         guestStateValid) {
         c->AbortVm = 1;
         c->HaltVm = 0;
+    } else if (c && authenticatedUnload) {
+        constexpr u32 kFatalTeardownRejectBits =
+            static_cast<u32>(HvNativeTeardownRejectVmcsRead) |
+            static_cast<u32>(HvNativeTeardownRejectGuestState) |
+            static_cast<u32>(HvNativeTeardownRejectCpl) |
+            static_cast<u32>(HvNativeTeardownRejectParameters);
+        // A normal stop request can arrive while the guest has a transient
+        // interruptibility, event-delivery, or descriptor state that cannot be
+        // reproduced by the native IRET handoff. Resume and retry those cases.
+        // A failed VMCS read or malformed guest state remains a fatal boundary.
+        c->AbortVm = 0;
+        c->HaltVm = (rejectMask & kFatalTeardownRejectBits) != 0 ? 1 : 0;
     } else if (c) {
         c->AbortVm = 0;
         c->HaltVm = 1;
@@ -3499,7 +3513,10 @@ bool HandleVmCall(GuestContext* Ctx) {
         // The assembly epilogue then VMXOFFs and returns through a real IRET
         // frame, allowing StopHvCallback's normal C++ epilogue to run.
         RequestAuthenticatedUnload(Ctx, VM_EXIT_REASON_VMCALL);
-        return Ctx->AbortVm != 0;
+        // Both a successful native teardown and a graceful teardown deferral
+        // consume this VMCALL instruction. A fatal handler path leaves HaltVm
+        // set and must not advance RIP.
+        return Ctx->HaltVm == 0;
     }
     // The unload token is a ring-0 service call.  A guest CPL3 attempt must
     // not be allowed to select the native teardown path.
@@ -7162,8 +7179,34 @@ ULONG_PTR StopHvCallback(ULONG_PTR Context) {
         // with a normal C++ epilogue only after the guest CR4 has VMXE clear.
         HvCall(HYPERVISOR_MAGIC, VMCALL_UNLOAD, 0, 0);
         if ((__readcr4() & CR4_VMXE) != 0) {
-            HV_VERBOSE_PRINT("[HV] CPU %u stop returned with CR4.VMXE set; "
-                             "retaining VMX state\n", id);
+            const u32 rejectMask = static_cast<u32>(
+                InterlockedCompareExchange(&vcpu->NativeTeardownRejectMask,
+                                           0, 0));
+            const u64 entryInfo = vcpu->LastVmEntryIntrInfo;
+            const u64 exitInfo = vcpu->LastVmExitIntrInfo;
+            const u64 vectoringInfo = vcpu->LastIdtVectoringInfo;
+            const u64 interruptibility = vcpu->LastGuestInterruptibility;
+            const u64 pendingDebug = vcpu->LastGuestPendingDbgExceptions;
+
+            // The VM-exit handler deliberately resumed the guest because this
+            // stop attempt was not yet safe to convert into native execution.
+            // Restore the launched ownership state so a later target worker can
+            // retry the rendezvous on the same logical processor.
+            InterlockedExchange(&vcpu->TeardownRequest, 0);
+            MemoryBarrier();
+            (void)InterlockedCompareExchange(&vcpu->LaunchStage,
+                                              LaunchStageGuestActive,
+                                              LaunchStageTeardown);
+            (void)InterlockedCompareExchange(&vcpu->State, VcpuLaunched,
+                                              VcpuTearingDown);
+            MemoryBarrier();
+
+            HV_VERBOSE_PRINT(
+                "[HV] CPU %u stop deferred: reject=0x%08X "
+                "intr=0x%llX entry=0x%llX exit=0x%llX vectoring=0x%llX "
+                "pending_dbg=0x%llX\n",
+                id, rejectMask, interruptibility, entryInfo, exitInfo,
+                vectoringInfo, pendingDebug);
             return 0;
         }
         if (InterlockedCompareExchange(&vcpu->TeardownRequest, 0, 0) != 0) {
@@ -7814,6 +7857,68 @@ static NTSTATUS WaitTargetOperation(u32 processorIndex,
     return waitStatus == STATUS_TIMEOUT ? STATUS_IO_TIMEOUT : waitStatus;
 }
 
+
+static NTSTATUS StopTargetProcessorWithRetries(u32 processorIndex,
+                                                bool* unresolved) {
+    if (!g_VcpuData || !unresolved || processorIndex >= g_ProcessorCount) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    LARGE_INTEGER retryDelay{};
+    retryDelay.QuadPart = kStopRetryDelay100ns;
+
+    for (u32 attempt = 1; attempt <= kStopRetryLimit; ++attempt) {
+        const long state = InterlockedCompareExchange(
+            &g_VcpuData[processorIndex].State, 0, 0);
+        if (IsVcpuStopTerminal(state)) {
+            return STATUS_SUCCESS;
+        }
+        if (state != VcpuLaunched && state != VcpuVmxOn) {
+            return STATUS_INVALID_DEVICE_STATE;
+        }
+
+        NTSTATUS status =
+            QueueTargetOperation(processorIndex, TargetOperationStop);
+        if (NT_SUCCESS(status)) {
+            const u64 deadline =
+                KeQueryInterruptTime() + kTargetOperationTimeout100ns;
+            status = WaitTargetOperation(processorIndex, deadline, unresolved);
+        }
+
+        if (*unresolved || NT_SUCCESS(status)) {
+            return status;
+        }
+
+        VcpuContext* vcpu = &g_VcpuData[processorIndex];
+        const long retryState =
+            InterlockedCompareExchange(&vcpu->State, 0, 0);
+        const long retryStage =
+            InterlockedCompareExchange(&vcpu->LaunchStage, 0, 0);
+        const u32 rejectMask = static_cast<u32>(
+            InterlockedCompareExchange(&vcpu->NativeTeardownRejectMask, 0, 0));
+
+        HV_PASSIVE_PRINT(
+            "[HV] CPU %u stop retry: attempt=%u/%u status=0x%08X "
+            "state=%ld stage=%ld reject=0x%08X intr=0x%llX "
+            "entry=0x%llX exit=0x%llX vectoring=0x%llX pending_dbg=0x%llX\n",
+            processorIndex, attempt, kStopRetryLimit,
+            static_cast<ULONG>(status), retryState, retryStage, rejectMask,
+            vcpu->LastGuestInterruptibility, vcpu->LastVmEntryIntrInfo,
+            vcpu->LastVmExitIntrInfo, vcpu->LastIdtVectoringInfo,
+            vcpu->LastGuestPendingDbgExceptions);
+
+        if (retryState != VcpuLaunched ||
+            retryStage != LaunchStageGuestActive) {
+            return status;
+        }
+
+        if (attempt != kStopRetryLimit) {
+            (void)KeDelayExecutionThread(KernelMode, FALSE, &retryDelay);
+        }
+    }
+
+    return STATUS_UNSUCCESSFUL;
+}
 
 static NTSTATUS RunRuntimeCanary(u32 processorIndex,
                                  const char* phase,
@@ -9122,26 +9227,21 @@ static void StopHypervisorInternal(bool startRollback) {
     bool stopFailed = !coordinatorBound;
 
     if (coordinatorBound) {
+        // Stop one logical processor at a time. Each successful VMXOFF creates
+        // another native processor before the next rendezvous begins, while a
+        // transient teardown rejection is resumed and retried instead of
+        // parking many processors concurrently.
         for (u32 i = 0; i < g_ProcessorCount; ++i) {
             if (i == reservedProcessor) continue;
             const long state =
                 InterlockedCompareExchange(&g_VcpuData[i].State, 0, 0);
             if (state != VcpuLaunched && state != VcpuVmxOn) continue;
-            if (!NT_SUCCESS(QueueTargetOperation(i, TargetOperationStop))) {
-                stopFailed = true;
-            }
-        }
 
-        const u64 deadline =
-            KeQueryInterruptTime() + kTargetOperationTimeout100ns;
-        for (u32 i = 0; i < g_ProcessorCount; ++i) {
-            if (i == reservedProcessor ||
-                !g_HvTargetCpuWork ||
-                g_HvTargetCpuWork[i].ThreadHandle == nullptr) {
-                continue;
-            }
-            if (!NT_SUCCESS(WaitTargetOperation(i, deadline, &unresolved))) {
+            const NTSTATUS status =
+                StopTargetProcessorWithRetries(i, &unresolved);
+            if (!NT_SUCCESS(status)) {
                 stopFailed = true;
+                break;
             }
         }
         KeRevertToUserGroupAffinityThread(&coordinatorAffinity);
@@ -9150,7 +9250,7 @@ static void StopHypervisorInternal(bool startRollback) {
 
     const long reservedState = InterlockedCompareExchange(
         &g_VcpuData[reservedProcessor].State, 0, 0);
-    if (!unresolved &&
+    if (!unresolved && !stopFailed &&
         (reservedState == VcpuLaunched || reservedState == VcpuVmxOn)) {
         u32 nativeProcessor = MAXULONG;
         for (u32 i = 0; i < g_ProcessorCount; ++i) {
@@ -9168,15 +9268,8 @@ static void StopHypervisorInternal(bool startRollback) {
             stopFailed = true;
         } else {
             coordinatorBound = true;
-            NTSTATUS status = QueueTargetOperation(reservedProcessor,
-                                                   TargetOperationStop);
-            if (NT_SUCCESS(status)) {
-                const u64 deadline =
-                    KeQueryInterruptTime() + kTargetOperationTimeout100ns;
-                status = WaitTargetOperation(reservedProcessor,
-                                             deadline,
-                                             &unresolved);
-            }
+            const NTSTATUS status =
+                StopTargetProcessorWithRetries(reservedProcessor, &unresolved);
             if (!NT_SUCCESS(status)) stopFailed = true;
             KeRevertToUserGroupAffinityThread(&finalAffinity);
             coordinatorBound = false;
