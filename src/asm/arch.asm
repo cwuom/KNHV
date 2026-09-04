@@ -29,6 +29,7 @@ extern HandleVmResumeFailure:proc
 extern HvFatalBugCheck:proc
 extern HvHostExceptionBugCheck:proc
 extern g_HvHostFaultRecord:byte
+extern g_HvRootNmiCount:qword
 extern g_LinearAddressBits:byte
 extern g_CetVmcsEnabled:byte
 extern g_XsavesEnabled:byte
@@ -124,7 +125,7 @@ HOST_DR7_FRAME_SLOT   equ 01158h
 HOST_DEBUGCTL_FRAME_SLOT equ 01160h
 
 ; HvRestoreStateAndReturn stages state in a 100h-byte spill below the
-; three-qword ring-0 IRETQ frame so it cannot overlap the active guest stack
+; five-qword 64-bit IRETQ frame so it cannot overlap the active guest stack.
 ; The stack pointer itself remains the only address used after loading guest
 ; CR3, so the host VM-exit stack is never dereferenced there
 RST_RAX         equ 000h
@@ -194,6 +195,19 @@ HOST_FAULT_TSC    equ 040h
 ; the interrupted RSP is therefore the address immediately above RFLAGS.
 ; Debug and breakpoint vectors deliberately keep the Windows handlers so KD
 ; remains usable while the VMX-root diagnostic IDT is active.
+
+; VMX-root NMI isolation stub.  Guest NMIs still execute natively because
+; pin-based NMI exiting is disabled.  This handler runs only when an NMI lands
+; during the short VMX-root window.  Do not call C/C++, touch VMCS state, or
+; use a scratch GPR here: a locked memory increment plus IRETQ keeps the
+; interrupted root context byte-for-byte intact while proving whether the
+; Windows NMI entry path is the reset trigger.
+PUBLIC HvHostNmi2
+HvHostNmi2 proc
+    lock inc qword ptr [g_HvRootNmiCount]
+    iretq
+HvHostNmi2 endp
+
 HvHostException0 proc
     push 0
     push 0
@@ -877,12 +891,10 @@ teardownMarkerAuthorized:
     mov r14, [r10 + CTX_GUEST_RIP]
     mov r15, [r10 + CTX_RFLAGS]
 
-    ; Null CS/SS or a null RIP cannot form an interrupt-return frame.  Reject
-    ; them before any guest-stack stores so malformed VMCS state cannot turn
-    ; into a #GP/#DF cascade after VMXOFF.
+    ; CS and RIP must be valid. In 64-bit mode IRETQ always pops
+    ; SS:RSP, even for a CPL0-to-CPL0 return, and Intel permits a null SS when
+    ; the target is 64-bit and CPL is not 3. Keep the captured SS verbatim.
     test r12, r12
-    jz restoreInvalid
-    test r13, r13
     jz restoreInvalid
     test r14, r14
     jz restoreInvalid
@@ -934,12 +946,11 @@ restoreRipCanonicalCompare:
     ; than manufacturing an IRET frame that could fault under KPTI.
     jmp restoreInvalid
 
-    ; In 64-bit mode a same-CPL IRETQ consumes only RIP, CS, and RFLAGS. The
-    ; RSP and SS slots are consumed only when the return changes privilege.
-    ; This path is restricted to ring 0, so keep exactly three slots; adding
-    ; the outer-privilege slots would leave the caller stack 10h bytes low.
+    ; Intel 64-bit IRETQ unconditionally pops RIP, CS, RFLAGS, RSP
+    ; and SS, even when returning to CPL0. Build the complete five-qword frame
+    ; so the native VMCALL continuation receives its original stack pointer.
 restoreRing0:
-    lea r8, [r11 - 18h]                   ; ring-0 IRETQ frame
+    lea r8, [r11 - 28h]                   ; complete 64-bit IRETQ frame
     lea r9, [r8 - 100h]                   ; guest stack spill area
 
     ; Subtracting from a canonical RSP can cross the sign boundary or wrap.
@@ -980,9 +991,11 @@ restoreSpillCanonicalCompare:
     ja restoreInvalid
 
 restoreFrameReady:
-    mov [r8 + 00h], r14
-    mov [r8 + 08h], r12
-    mov [r8 + 10h], r15
+    mov [r8 + 00h], r14                   ; RIP
+    mov [r8 + 08h], r12                   ; CS
+    mov [r8 + 10h], r15                   ; RFLAGS
+    mov [r8 + 18h], r11                   ; RSP
+    mov [r8 + 20h], r13                   ; SS (may be null at CPL0)
 
     mov rax, [r10 + CTX_RAX]
     mov [r9 + RST_RAX], rax

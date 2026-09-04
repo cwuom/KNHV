@@ -86,6 +86,7 @@
 // CPUID feature bits hidden from a guest when their VMX state is not exposed.
 #define CPUID_7_EBX_INTEL_PT                 (1U << 25)
 #define CPUID_7_EBX_MPX                      (1U << 14)
+#define CPUID_7_ECX_WAITPKG                  (1U << 5)
 #define CPUID_7_ECX_CET_SHSTK                (1U << 7)
 #define CPUID_7_ECX_PKU                      (1U << 3)
 #define CPUID_7_ECX_OSPKE                    (1U << 4)
@@ -174,6 +175,7 @@
 #define SECONDARY_ENABLE_RDTSCP                  (1UL << 3)
 #define SECONDARY_ENABLE_INVPCID                 (1UL << 12)
 #define SECONDARY_ENABLE_XSAVES                  (1UL << 20)
+#define SECONDARY_ENABLE_USER_WAIT_PAUSE          (1UL << 26)
 // CPUID.(0D,1).EAX feature bits. Bit 3 advertises the paired XSAVES and
 // XRSTORS instructions; bit 4 is XFD, not a separate XRSTORS capability.
 #define CPUID_D1_XSAVEOPT                        (1U << 0)

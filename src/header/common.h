@@ -73,6 +73,9 @@ enum HvTraceEvent : u32 {
     HvTraceEventHostIdtReady = 34,
     HvTraceEventVmexitHostStateReady = 35,
     HvTraceEventPostDpcCanary = 36,
+    HvTraceEventDescriptorReject = 37,
+    HvTraceEventXsetbv = 38,
+    HvTraceEventXssWrite = 39,
 };
 
 // first-wins VMX-root exception evidence. The assembly exception stubs fill
@@ -219,6 +222,43 @@ enum HvVmcsFailureCommitState : long {
     HvVmcsFailureWriting = 1,
     HvVmcsFailureCommitted = 2,
 };
+
+// Bit-level diagnostics for the combined descriptor/CR3 VMCS preflight.
+// Each predicate is published independently so a process CR3 is not blamed
+// for a selector or descriptor-table failure on another logical processor.
+enum HvLaunchDescriptorReject : u32 {
+    HvLaunchDescriptorRejectNone = 0,
+    HvLaunchDescriptorRejectGdtBase = 1U << 0,
+    HvLaunchDescriptorRejectIdtBase = 1U << 1,
+    HvLaunchDescriptorRejectCs = 1U << 2,
+    HvLaunchDescriptorRejectSs = 1U << 3,
+    HvLaunchDescriptorRejectDs = 1U << 4,
+    HvLaunchDescriptorRejectEs = 1U << 5,
+    HvLaunchDescriptorRejectFs = 1U << 6,
+    HvLaunchDescriptorRejectGs = 1U << 7,
+    HvLaunchDescriptorRejectLdtr = 1U << 8,
+    HvLaunchDescriptorRejectHostCr3 = 1U << 9,
+    HvLaunchDescriptorRejectGuestCr3 = 1U << 10,
+    HvLaunchDescriptorRejectTssBase = 1U << 11,
+};
+
+// first fatal debugger stop is published in a fixed global record so KD can
+// inspect it without depending on optimized local variables or the C++ stack.
+struct HvKdFatalRecord {
+    volatile long CommitState;
+    u32 Cpu;
+    u32 Status;
+    u32 Reserved;
+    u64 Arg0;
+    u64 Arg1;
+    u64 GuestRip;
+    u64 GuestRsp;
+    u64 GuestXcr0;
+    u64 GuestXss;
+    u64 Tsc;
+};
+
+extern "C" HvKdFatalRecord g_HvKdFatalRecord;
 
 // Intel exposes a hybrid core type through CPUID leaf 1A. Keep the branch
 // explicit so a VMX profile selected on a P-core is never silently reused as
@@ -600,6 +640,25 @@ struct VcpuContext {
     u64   FirstVmcsMismatchExpected;
     u64   FirstVmcsMismatchActual;
     u64   FirstVmcsMismatchMask;
+
+    // These diagnostics are outside GuestContext, so extending them cannot
+    // change the assembly-visible VM-exit frame.
+    volatile long LaunchDescriptorRejectMask;
+    u32 LaunchDescriptorReserved;
+    u64 LaunchDescriptorSelectorsLow;
+    u64 LaunchDescriptorSelectorsHigh;
+    u64 LaunchDescriptorGdtBase;
+    u64 LaunchDescriptorIdtBase;
+    u64 LaunchDescriptorTssBase;
+
+    volatile long XsetbvExitCount;
+    volatile long XssWriteExitCount;
+    volatile long XssWriteRejectCount;
+    u32 XstateDiagnosticReserved;
+    u64 LastXsetbvPrevious;
+    u64 LastXsetbvRequested;
+    u64 LastXssWritePrevious;
+    u64 LastXssWriteRequested;
 };
 
 static_assert((offsetof(VcpuContext, FatalSnapshotCommitState) % alignof(long)) == 0,
@@ -620,5 +679,13 @@ static_assert((offsetof(VcpuContext, VmcsFailureArg0) % alignof(u64)) == 0,
               "vmcs failure argument zero must be naturally aligned");
 static_assert((offsetof(VcpuContext, VmcsFailureArg1) % alignof(u64)) == 0,
               "vmcs failure argument one must be naturally aligned");
+static_assert((offsetof(VcpuContext, LaunchDescriptorRejectMask) % alignof(long)) == 0,
+              "launch descriptor reject mask must be naturally aligned");
+static_assert((offsetof(VcpuContext, LaunchDescriptorSelectorsLow) % alignof(u64)) == 0,
+              "launch selector diagnostics must be naturally aligned");
+static_assert((offsetof(VcpuContext, XsetbvExitCount) % alignof(long)) == 0,
+              "xsetbv counter must be naturally aligned");
+static_assert((offsetof(VcpuContext, LastXssWriteRequested) % alignof(u64)) == 0,
+              "xss diagnostic value must be naturally aligned");
 static_assert((offsetof(VcpuContext, VmcsDiagnosticValidity) % alignof(u64)) == 0,
               "vmcs diagnostic validity must be naturally aligned");

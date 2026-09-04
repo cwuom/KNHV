@@ -19,7 +19,7 @@ extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
     } while (0)
 
 static constexpr const char* kDriverContractTag =
-    "V45-TRUE-SINGLECPU-DIAG-CPU1-HYPERDBG-RFLAGS-POSTRETURN-CANARY-NATIVE-CPUID-MSR-BITMAP-ZERO-CR-MASKS-ZERO-XSS-CET-KGS-ROOT-IDT-FIRSTFAULT";
+    "V53-CPU8-IRETQ-5WORD-UNLOAD-INTEL-WAITPKG-NATIVE-CPU0-WATCHDOG";
 static constexpr ULONG kHvFatalBugCheck = 0x48564D58UL;
 static constexpr ULONG_PTR kHvFatalUnloadIncomplete = 0x554E4C44ULL;
 static constexpr ULONG_PTR kHvFatalUnloadCallbackState = 0x43425354ULL;
