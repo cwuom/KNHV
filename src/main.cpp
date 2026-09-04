@@ -19,7 +19,7 @@ extern "C" PDRIVER_OBJECT g_HvDriverObject = nullptr;
     } while (0)
 
 static constexpr const char* kDriverContractTag =
-    "V54-ALLCPU-STAGED-CANARY-COORDINATOR-LAST-INTEL-WAITPKG-IRETQ-5WORD-UNLOAD-HYPERDBG";
+    "V55-ALLCPU-USER-CPUID-PROBE-STAGED-INTEL-WAITPKG-IRETQ-5WORD-UNLOAD-HYPERDBG";
 static constexpr ULONG kHvFatalBugCheck = 0x48564D58UL;
 static constexpr ULONG_PTR kHvFatalUnloadIncomplete = 0x554E4C44ULL;
 static constexpr ULONG_PTR kHvFatalUnloadCallbackState = 0x43425354ULL;

@@ -336,6 +336,15 @@ static constexpr u32 kFirstExitProbeEbx = 0xDEADC0DEU;
 static constexpr u32 kFirstExitProbeEcx = 0x00C0FFEEU;
 static constexpr u32 kFirstExitProbeEdx = 0x48564856U;
 
+// user-mode self-test probe. CPUID is unconditional-exit in VMX non-root,
+// so this response is emitted only after the instruction reaches our VM-exit
+// handler on the logical processor where the caller is pinned.
+static constexpr bool kEnableUserCpuidProbe = true;
+static constexpr u32 kUserProbeLeaf = static_cast<u32>(HYPERVISOR_MAGIC);
+static constexpr u32 kUserProbeSubleaf = 0x56455249U;
+static constexpr u32 kUserProbeSignatureEax = 0x48565031U;
+static constexpr u32 kUserProbeSignatureEdx = 0x564D5831U;
+
 // IA32_DEBUGCTL has model-specific extensions. Keep the guest contract to the
 // architectural bits until a per-model capability probe is available.
 static constexpr u64 kDebugctlArchitecturalMask =
@@ -4597,6 +4606,18 @@ extern "C" void VmExitHandler(GuestContext* Ctx) {
         {
             const u32 leaf = static_cast<u32>(Ctx->Rax);
             const u32 subleaf = static_cast<u32>(Ctx->Rcx);
+            const bool userProbeRequest =
+                kEnableUserCpuidProbe && leaf == kUserProbeLeaf &&
+                subleaf == kUserProbeSubleaf;
+            if (userProbeRequest) {
+                Ctx->Rax = kUserProbeSignatureEax;
+                Ctx->Rbx = cpuId;
+                Ctx->Rcx = static_cast<u32>(InterlockedCompareExchange(
+                    &vcpu->VmExitCount, 0, 0));
+                Ctx->Rdx = kUserProbeSignatureEdx;
+                break;
+            }
+
             const bool firstExitProbeRequest =
                 leaf == kFirstExitProbeLeaf && subleaf == 0;
             if (firstExitProbeRequest) {
