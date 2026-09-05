@@ -15,6 +15,7 @@ int wmain(int argc, wchar_t** argv) {
 
     TestState state;
     RunSourceContract(options.root, state);
+    RunProviderV2Contract(state);
     if (options.hardware) RunHardwareContract(state);
     if (options.signature || options.runtime || options.driver_explicit) {
         RunArtifactContract(options.root, options.driver, state);

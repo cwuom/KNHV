@@ -136,6 +136,15 @@ a production image manifest/signature or provide a production broker identity.
 Do not deploy these auxiliary images as a production hypervisor or as a
 security boundary.
 
+The control device also exposes an additive ABI v2 capability and lease
+contract. `IOCTL_KNHV_QUERY_CAPS_V2` is read-only; the acquire and release
+lease calls require a versioned session key, a matching generation, and known
+feature and policy bits. A hardware lease is returned only for a verified KNHV
+Boot L0 owner. The nested test image can return a lease marked
+`kLeaseFlagSynthetic`; that lease is a laboratory model and never authorizes
+physical VMX, EPT, IOMMU, or DMA work. Unknown versions, truncated buffers,
+stale generations, and unknown flags are rejected.
+
 The CMake Tools integration exports `compile_commands.json` with the project
 headers and WDK `km` include directory. After changing the WDK or toolchain,
 run `CMake: Delete Cache and Reconfigure`. If IntelliSense still reports a

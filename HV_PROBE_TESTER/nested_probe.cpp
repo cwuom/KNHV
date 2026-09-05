@@ -72,6 +72,27 @@ bool QueryCaps(HANDLE device, knhv::u64 request_id,
            response->request_id == request_id;
 }
 
+bool QueryCapsV2(HANDLE device, knhv::u64 request_id,
+                 knhv::HvQueryCapsV2Out* response) {
+    if (response == nullptr) return false;
+    knhv::HvQueryCapsV2In request = {};
+    request.size = static_cast<knhv::u32>(sizeof(request));
+    request.version = knhv::kAbiV2Version;
+    request.request_id = request_id;
+    DWORD returned = 0;
+    if (DeviceIoControl(device, IOCTL_KNHV_QUERY_CAPS_V2, &request,
+                        static_cast<DWORD>(sizeof(request)), response,
+                        static_cast<DWORD>(sizeof(*response)), &returned,
+                        nullptr) == FALSE) {
+        PrintWin32Failure("IOCTL_KNHV_QUERY_CAPS_V2");
+        return false;
+    }
+    return returned == sizeof(*response) &&
+           response->version == knhv::kAbiV2Version &&
+           response->size == sizeof(*response) &&
+           response->request_id == request_id;
+}
+
 bool RegisterClient(HANDLE device, knhv::u64 request_id,
                     knhv::HvRegisterClientOut* response) {
     if (response == nullptr) return false;
@@ -143,6 +164,62 @@ bool ReleaseSession(HANDLE device, knhv::u64 request_id,
         return false;
     }
     return returned == 0;
+}
+
+bool AcquireSyntheticLease(HANDLE device, knhv::u64 request_id,
+                           const knhv::HvSessionKey& session,
+                           knhv::HvAcquireLeaseV2Out* response) {
+    if (response == nullptr) return false;
+    knhv::HvAcquireLeaseV2In request = {};
+    request.size = static_cast<knhv::u32>(sizeof(request));
+    request.version = knhv::kAbiV2Version;
+    request.request.size = static_cast<knhv::u32>(sizeof(request.request));
+    request.request.version = knhv::kAbiV2Version;
+    request.request.request_id = request_id;
+    request.request.session = session;
+    request.request.required_provider_features = knhv::kCapNestedVmx;
+    request.request.mode = static_cast<knhv::u32>(
+        knhv::HvLeaseModeV2::SyntheticLab);
+    request.request.flags = knhv::kRequestFlagReadOnly;
+    DWORD returned = 0;
+    if (DeviceIoControl(device, IOCTL_KNHV_ACQUIRE_LEASE_V2, &request,
+                        static_cast<DWORD>(sizeof(request)), response,
+                        static_cast<DWORD>(sizeof(*response)), &returned,
+                        nullptr) == FALSE) {
+        PrintWin32Failure("IOCTL_KNHV_ACQUIRE_LEASE_V2");
+        return false;
+    }
+    return returned == sizeof(*response) &&
+           response->version == knhv::kAbiV2Version &&
+           response->size == sizeof(*response) &&
+           response->response.version == knhv::kAbiV2Version &&
+           response->response.size == sizeof(response->response) &&
+           response->response.request_id == request_id;
+}
+
+bool ReleaseLeaseV2(HANDLE device, knhv::u64 request_id,
+                    const knhv::HvSessionKey& session,
+                    const knhv::HvOwnerLeaseV2& lease) {
+    knhv::HvReleaseLeaseV2In request = {};
+    request.size = static_cast<knhv::u32>(sizeof(request));
+    request.version = knhv::kAbiV2Version;
+    request.request_id = request_id;
+    request.session = session;
+    request.lease = lease;
+    knhv::HvReleaseLeaseV2Out response = {};
+    DWORD returned = 0;
+    if (DeviceIoControl(device, IOCTL_KNHV_RELEASE_LEASE_V2, &request,
+                        static_cast<DWORD>(sizeof(request)), &response,
+                        static_cast<DWORD>(sizeof(response)), &returned,
+                        nullptr) == FALSE) {
+        PrintWin32Failure("IOCTL_KNHV_RELEASE_LEASE_V2");
+        return false;
+    }
+    return returned == sizeof(response) &&
+           response.version == knhv::kAbiV2Version &&
+           response.size == sizeof(response) &&
+           response.request_id == request_id &&
+           response.status == knhv::HvStatus::Success;
 }
 
 knhv::VmxInstruction MakeInstruction(knhv::VmxOpcode opcode) {
@@ -408,6 +485,8 @@ int wmain(int argc, wchar_t** argv) {
     knhv::u64 request_id = 1U;
     knhv::HvSessionKey session = {};
     bool session_registered = false;
+    bool lease_acquired = false;
+    knhv::HvOwnerLeaseV2 lease = {};
     bool sequence_completed = false;
 
     do {
@@ -424,6 +503,17 @@ int wmain(int argc, wchar_t** argv) {
         Check(&state, "nested VMX capability is advertised", nested_capability);
         Check(&state, "synthetic model is explicitly labeled",
               (caps.snapshot.status_flags & knhv::kFlagSyntheticSnapshot) != 0);
+        knhv::HvQueryCapsV2Out caps_v2 = {};
+        if (!QueryCapsV2(device, request_id++, &caps_v2)) {
+            Check(&state, "query v2 nested capabilities", false);
+            break;
+        }
+        Check(&state, "query v2 nested capabilities",
+              caps_v2.status == knhv::HvStatus::Success &&
+                  caps_v2.capabilities.owner_kind == static_cast<knhv::u32>(
+                      knhv::HvOwnerKindV2::SyntheticLab) &&
+                  caps_v2.capabilities.state == static_cast<knhv::u32>(
+                      knhv::HvProviderStateV2::Available));
         std::printf("caps: features=0x%llX flags=0x%X evmcs=%u\n",
                     static_cast<unsigned long long>(caps.snapshot.feature_bits),
                     caps.snapshot.status_flags, caps.snapshot.e_vmcs_version);
@@ -468,10 +558,30 @@ int wmain(int argc, wchar_t** argv) {
                   session_status.registration_ready != 0 &&
                   session_status.virtualization_ready == 0);
 
+        knhv::HvAcquireLeaseV2Out lease_response = {};
+        if (!AcquireSyntheticLease(device, request_id++, session,
+                                   &lease_response)) {
+            Check(&state, "acquire synthetic v2 lease", false);
+            break;
+        }
+        Check(&state, "acquire synthetic v2 lease",
+              lease_response.response.status == knhv::HvStatus::Success &&
+                  lease_response.response.provider ==
+                      knhv::HvProviderKind::CooperativeL1 &&
+                  (lease_response.response.lease.flags &
+                   knhv::kLeaseFlagSynthetic) != 0);
+        if (lease_response.response.status != knhv::HvStatus::Success) break;
+        lease = lease_response.response.lease;
+        lease_acquired = true;
+
         sequence_completed =
             RunNestedSequence(device, &request_id, session, &state);
     } while (false);
 
+    if (lease_acquired) {
+        Check(&state, "release synthetic v2 lease",
+              ReleaseLeaseV2(device, request_id++, session, lease));
+    }
     if (session_registered) {
         Check(&state, "release nested session",
               ReleaseSession(device, request_id++, session));

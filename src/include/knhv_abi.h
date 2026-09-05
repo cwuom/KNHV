@@ -12,6 +12,12 @@ using u64 = unsigned __int64;
 
 constexpr u32 kAbiVersion = 1U;
 constexpr u32 kAbiMinVersion = 1U;
+// v1 remains the wire format used by existing clients. v2 is additive and
+// is negotiated explicitly so an old client never interprets a lease as a
+// v1 session response
+constexpr u32 kAbiV2Version = 2U;
+constexpr u32 kAbiV2MinVersion = 2U;
+constexpr u32 kAbiV2MaxStructSize = 4096U;
 
 enum class HvStatus : u32 {
     Success = 0,
@@ -78,6 +84,49 @@ constexpr u32 kFlagNestedVmx = 1U << 4;
 constexpr u32 kFlagWhpPartition = 1U << 5;
 constexpr u32 kFlagSyntheticSnapshot = 1U << 6;
 
+// v2 separates hardware capability, provider capability and policy. A bit
+// in one group must not be silently promoted into another group
+constexpr u64 kPolicyExclusiveOwner = 1ULL << 0;
+constexpr u64 kPolicyWindowsHandoff = 1ULL << 1;
+constexpr u64 kPolicyNoPhysicalDma = 1ULL << 2;
+constexpr u64 kPolicySyntheticOnly = 1ULL << 3;
+constexpr u64 kKnownPolicyFeatureMask = (1ULL << 4) - 1ULL;
+
+constexpr u32 kRequestFlagRequireExclusive = 1U << 0;
+constexpr u32 kRequestFlagReadOnly = 1U << 1;
+constexpr u32 kKnownV2RequestFlagMask =
+    kRequestFlagRequireExclusive | kRequestFlagReadOnly;
+
+constexpr u32 kLeaseFlagExclusive = 1U << 0;
+constexpr u32 kLeaseFlagSynthetic = 1U << 1;
+constexpr u32 kLeaseFlagReadOnly = 1U << 2;
+constexpr u32 kKnownV2LeaseFlagMask =
+    kLeaseFlagExclusive | kLeaseFlagSynthetic | kLeaseFlagReadOnly;
+
+enum class HvOwnerKindV2 : u32 {
+    Unknown = 0,
+    ExternalL0 = 1,
+    KnhvBootL0 = 2,
+    WhpManaged = 3,
+    SyntheticLab = 4,
+};
+
+enum class HvProviderStateV2 : u32 {
+    Unknown = 0,
+    Available = 1,
+    Active = 2,
+    Conflict = 3,
+    Blocked = 4,
+    Quarantined = 5,
+};
+
+enum class HvLeaseModeV2 : u32 {
+    None = 0,
+    HardwareL0 = 1,
+    WhpManaged = 2,
+    SyntheticLab = 3,
+};
+
 #pragma pack(push, 8)
 
 struct HvCapabilitySnapshot {
@@ -128,6 +177,95 @@ struct HvQueryCapsIn {
 struct HvSessionKey {
     u64 client_id;
     u32 generation;
+    u32 reserved;
+};
+
+// v2 structures use size first to make the extension boundary obvious in a
+// debugger and keep the generation attached to every capability or lease
+struct HvCapabilitySnapshotV2 {
+    u32 size;
+    u32 version;
+    u64 hardware_features;
+    u64 provider_features;
+    u64 policy_features;
+    u32 owner_kind;
+    u32 state;
+    u64 generation;
+};
+
+struct HvOwnerLeaseV2 {
+    u32 size;
+    u32 version;
+    u64 owner_id;
+    u64 generation;
+    u32 mode;
+    u32 flags;
+};
+
+struct HvProviderRequestV2 {
+    u32 size;
+    u32 version;
+    u64 request_id;
+    HvSessionKey session;
+    u64 required_hardware_features;
+    u64 required_provider_features;
+    u64 required_policy_features;
+    u32 mode;
+    u32 flags;
+};
+
+struct HvProviderResponseV2 {
+    u32 size;
+    u32 version;
+    u64 request_id;
+    HvStatus status;
+    u32 reserved;
+    HvProviderKind provider;
+    u32 reserved2;
+    HvCapabilitySnapshotV2 capabilities;
+    HvOwnerLeaseV2 lease;
+};
+
+struct HvQueryCapsV2In {
+    u32 size;
+    u32 version;
+    u64 request_id;
+};
+
+struct HvQueryCapsV2Out {
+    u32 size;
+    u32 version;
+    u64 request_id;
+    HvStatus status;
+    u32 reserved;
+    HvCapabilitySnapshotV2 capabilities;
+};
+
+struct HvAcquireLeaseV2In {
+    u32 size;
+    u32 version;
+    HvProviderRequestV2 request;
+};
+
+struct HvAcquireLeaseV2Out {
+    u32 size;
+    u32 version;
+    HvProviderResponseV2 response;
+};
+
+struct HvReleaseLeaseV2In {
+    u32 size;
+    u32 version;
+    u64 request_id;
+    HvSessionKey session;
+    HvOwnerLeaseV2 lease;
+};
+
+struct HvReleaseLeaseV2Out {
+    u32 size;
+    u32 version;
+    u64 request_id;
+    HvStatus status;
     u32 reserved;
 };
 
@@ -188,6 +326,12 @@ constexpr bool IsVersionedBufferValid(u32 version, u32 size,
            size >= required_size;
 }
 
+constexpr bool IsAbiV2BufferValid(u32 version, u32 size,
+                                  u32 required_size) {
+    return version >= kAbiV2MinVersion && version <= kAbiV2Version &&
+           size >= required_size && size <= kAbiV2MaxStructSize;
+}
+
 }  // namespace knhv
 
 #ifdef __cplusplus
@@ -211,4 +355,24 @@ static_assert(sizeof(knhv::HvRegisterClientIn) == 96,
               "register input ABI changed");
 static_assert(sizeof(knhv::HvRegisterClientOut) == 56,
               "register output ABI changed");
+static_assert(sizeof(knhv::HvCapabilitySnapshotV2) == 48,
+              "v2 capability snapshot ABI changed");
+static_assert(sizeof(knhv::HvOwnerLeaseV2) == 32,
+              "v2 owner lease ABI changed");
+static_assert(sizeof(knhv::HvProviderRequestV2) == 64,
+              "v2 provider request ABI changed");
+static_assert(sizeof(knhv::HvProviderResponseV2) == 112,
+              "v2 provider response ABI changed");
+static_assert(sizeof(knhv::HvQueryCapsV2In) == 16,
+              "v2 query input ABI changed");
+static_assert(sizeof(knhv::HvQueryCapsV2Out) == 72,
+              "v2 query output ABI changed");
+static_assert(sizeof(knhv::HvAcquireLeaseV2In) == 72,
+              "v2 acquire input ABI changed");
+static_assert(sizeof(knhv::HvAcquireLeaseV2Out) == 120,
+              "v2 acquire output ABI changed");
+static_assert(sizeof(knhv::HvReleaseLeaseV2In) == 64,
+              "v2 release input ABI changed");
+static_assert(sizeof(knhv::HvReleaseLeaseV2Out) == 24,
+              "v2 release output ABI changed");
 #endif

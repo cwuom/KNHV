@@ -311,6 +311,7 @@ endif()
 
 set(KNHV_NESTED_MODEL_SOURCES
         src/provider/provider_selection.cpp
+        src/provider/provider_v2.cpp
         src/nested/nested_vmcs.cpp
         src/nested/nested_memory.cpp
         src/nested/nested_instructions.cpp
@@ -404,7 +405,9 @@ if(KNHV_BUILD_TESTS)
             tests/source_contract_test.cpp
             tests/runtime_contract_test.cpp
             tests/nested_model_test.cpp
+            tests/provider_v2_test.cpp
             src/provider/provider_selection.cpp
+            src/provider/provider_v2.cpp
             src/nested/nested_vmcs.cpp
             src/nested/nested_memory.cpp
             src/nested/nested_instructions.cpp

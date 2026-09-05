@@ -61,6 +61,14 @@ bool VersionedInputFits(u32 version, u32 declared_size, u32 required_size,
            IsVersionedBufferValid(version, declared_size, required_size);
 }
 
+bool VersionedV2InputFits(u32 version, u32 declared_size, u32 required_size,
+                          ULONG supplied_length) {
+    return supplied_length >= required_size &&
+           declared_size >= required_size &&
+           declared_size <= supplied_length &&
+           IsAbiV2BufferValid(version, declared_size, required_size);
+}
+
 KnHvClientSession* FindSession(KnHvDeviceExtension* extension,
                                const HvSessionKey& key,
                                PFILE_OBJECT owner_file) {
@@ -331,6 +339,140 @@ NTSTATUS HandleQueryCaps(KnHvDeviceExtension* extension, PIRP irp,
     output->request_id = request_id;
     output->status = HvStatus::Success;
     output->snapshot = extension->capabilities;
+    KeReleaseSpinLock(&extension->state_lock, old_irql);
+    return SetIrpResult(irp, STATUS_SUCCESS, sizeof(*output));
+}
+
+NTSTATUS HandleQueryCapsV2(KnHvDeviceExtension* extension, PIRP irp,
+                           ULONG input_length, ULONG output_length) {
+    if (input_length < sizeof(HvQueryCapsV2In) ||
+        output_length < sizeof(HvQueryCapsV2Out)) {
+        return SetIrpResult(irp, STATUS_BUFFER_TOO_SMALL, 0);
+    }
+    const HvQueryCapsV2In* input =
+        static_cast<const HvQueryCapsV2In*>(irp->AssociatedIrp.SystemBuffer);
+    HvQueryCapsV2Out* output =
+        static_cast<HvQueryCapsV2Out*>(irp->AssociatedIrp.SystemBuffer);
+    if (input == nullptr || output == nullptr ||
+        !VersionedV2InputFits(input->version, input->size,
+                              sizeof(HvQueryCapsV2In), input_length)) {
+        return SetIrpResult(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    const u64 request_id = input->request_id;
+    KIRQL old_irql = PASSIVE_LEVEL;
+    KeAcquireSpinLock(&extension->state_lock, &old_irql);
+    *output = {};
+    output->size = sizeof(*output);
+    output->version = kAbiV2Version;
+    output->request_id = request_id;
+    output->status = HvStatus::Success;
+    output->capabilities = MakeCapabilitySnapshotV2(&extension->capabilities);
+    KeReleaseSpinLock(&extension->state_lock, old_irql);
+    return SetIrpResult(irp, STATUS_SUCCESS, sizeof(*output));
+}
+
+NTSTATUS HandleAcquireLeaseV2(KnHvDeviceExtension* extension,
+                              PFILE_OBJECT owner_file, PIRP irp,
+                              ULONG input_length, ULONG output_length) {
+    if (input_length < sizeof(HvAcquireLeaseV2In) ||
+        output_length < sizeof(HvAcquireLeaseV2Out)) {
+        return SetIrpResult(irp, STATUS_BUFFER_TOO_SMALL, 0);
+    }
+    const HvAcquireLeaseV2In* input = static_cast<const HvAcquireLeaseV2In*>(
+        irp->AssociatedIrp.SystemBuffer);
+    HvAcquireLeaseV2Out* output = static_cast<HvAcquireLeaseV2Out*>(
+        irp->AssociatedIrp.SystemBuffer);
+    if (input == nullptr || output == nullptr ||
+        !VersionedV2InputFits(input->version, input->size,
+                              sizeof(HvAcquireLeaseV2In), input_length) ||
+        input->size < FIELD_OFFSET(HvAcquireLeaseV2In, request) +
+                          sizeof(HvProviderRequestV2) ||
+        input->request.size >
+            input->size - FIELD_OFFSET(HvAcquireLeaseV2In, request) ||
+        !VersionedV2InputFits(input->request.version, input->request.size,
+                              sizeof(HvProviderRequestV2), input_length -
+                                  FIELD_OFFSET(HvAcquireLeaseV2In, request))) {
+        return SetIrpResult(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    const HvProviderRequestV2 request = input->request;
+    KIRQL old_irql = PASSIVE_LEVEL;
+    KeAcquireSpinLock(&extension->state_lock, &old_irql);
+    *output = {};
+    output->size = sizeof(*output);
+    output->version = kAbiV2Version;
+    output->response.size = sizeof(output->response);
+    output->response.version = kAbiV2Version;
+    output->response.request_id = request.request_id;
+    KnHvClientSession* session =
+        FindSession(extension, request.session, owner_file);
+    if (session == nullptr) {
+        KeReleaseSpinLock(&extension->state_lock, old_irql);
+        return SetIrpResult(irp, STATUS_INVALID_HANDLE, 0);
+    }
+    if (session->lease_active != 0) {
+        output->response.status = HvStatus::Busy;
+        KeReleaseSpinLock(&extension->state_lock, old_irql);
+        return SetIrpResult(irp, STATUS_SUCCESS, sizeof(*output));
+    }
+    const HvCapabilitySnapshotV2 capabilities =
+        MakeCapabilitySnapshotV2(&extension->capabilities);
+    output->response.status = SelectProviderV2(
+        &request, &capabilities, &output->response);
+    if (output->response.status == HvStatus::Success &&
+        request.mode == static_cast<u32>(HvLeaseModeV2::SyntheticLab) &&
+        session->nested_ready == 0) {
+        output->response.status = HvStatus::NestedUnavailable;
+        output->response.provider = HvProviderKind::None;
+        output->response.lease = {};
+    }
+    if (output->response.status == HvStatus::Success) {
+        session->lease = output->response.lease;
+        session->lease_active = 1U;
+    } else {
+        output->response.lease = {};
+    }
+    KeReleaseSpinLock(&extension->state_lock, old_irql);
+    return SetIrpResult(irp, STATUS_SUCCESS, sizeof(*output));
+}
+
+NTSTATUS HandleReleaseLeaseV2(KnHvDeviceExtension* extension,
+                              PFILE_OBJECT owner_file, PIRP irp,
+                              ULONG input_length, ULONG output_length) {
+    if (input_length < sizeof(HvReleaseLeaseV2In) ||
+        output_length < sizeof(HvReleaseLeaseV2Out)) {
+        return SetIrpResult(irp, STATUS_BUFFER_TOO_SMALL, 0);
+    }
+    const HvReleaseLeaseV2In* input = static_cast<const HvReleaseLeaseV2In*>(
+        irp->AssociatedIrp.SystemBuffer);
+    HvReleaseLeaseV2Out* output = static_cast<HvReleaseLeaseV2Out*>(
+        irp->AssociatedIrp.SystemBuffer);
+    if (input == nullptr || output == nullptr ||
+        !VersionedV2InputFits(input->version, input->size,
+                              sizeof(HvReleaseLeaseV2In), input_length) ||
+        !IsOwnerLeaseV2Valid(&input->lease) ||
+        input->lease.mode == static_cast<u32>(HvLeaseModeV2::None) ||
+        input->session.reserved != 0) {
+        return SetIrpResult(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    KIRQL old_irql = PASSIVE_LEVEL;
+    KeAcquireSpinLock(&extension->state_lock, &old_irql);
+    KnHvClientSession* session =
+        FindSession(extension, input->session, owner_file);
+    if (session == nullptr || session->lease_active == 0 ||
+        session->lease.owner_id != input->lease.owner_id ||
+        session->lease.generation != input->lease.generation ||
+        session->lease.mode != input->lease.mode ||
+        session->lease.flags != input->lease.flags) {
+        KeReleaseSpinLock(&extension->state_lock, old_irql);
+        return SetIrpResult(irp, STATUS_INVALID_HANDLE, 0);
+    }
+    RtlZeroMemory(&session->lease, sizeof(session->lease));
+    session->lease_active = 0;
+    *output = {};
+    output->size = sizeof(*output);
+    output->version = kAbiV2Version;
+    output->request_id = input->request_id;
+    output->status = HvStatus::Success;
     KeReleaseSpinLock(&extension->state_lock, old_irql);
     return SetIrpResult(irp, STATUS_SUCCESS, sizeof(*output));
 }
@@ -738,6 +880,10 @@ extern "C" NTSTATUS KnHvDispatchDeviceControl(PDEVICE_OBJECT device_object,
         case IOCTL_KNHV_QUERY_CAPS:
             result = HandleQueryCaps(extension, irp, input_length, output_length);
             break;
+        case IOCTL_KNHV_QUERY_CAPS_V2:
+            result = HandleQueryCapsV2(extension, irp, input_length,
+                                        output_length);
+            break;
         case IOCTL_KNHV_REGISTER_CLIENT:
             result = HandleRegisterClient(extension, owner_file, irp,
                                           input_length, output_length);
@@ -749,6 +895,14 @@ extern "C" NTSTATUS KnHvDispatchDeviceControl(PDEVICE_OBJECT device_object,
         case IOCTL_KNHV_RELEASE_SESSION:
             result = HandleReleaseSession(extension, owner_file, irp,
                                           input_length);
+            break;
+        case IOCTL_KNHV_ACQUIRE_LEASE_V2:
+            result = HandleAcquireLeaseV2(extension, owner_file, irp,
+                                          input_length, output_length);
+            break;
+        case IOCTL_KNHV_RELEASE_LEASE_V2:
+            result = HandleReleaseLeaseV2(extension, owner_file, irp,
+                                          input_length, output_length);
             break;
         case IOCTL_KNHV_NESTED_INSTRUCTION:
             result = HandleNestedInstruction(extension, owner_file, irp,

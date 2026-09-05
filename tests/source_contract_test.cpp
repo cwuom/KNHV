@@ -508,6 +508,51 @@ void CheckPreflightContract(const fs::path& root, TestState& state) {
               !Contains(common, "__vmx") && !Contains(common, "__writemsr"));
 }
 
+void CheckAbiV2Contract(const fs::path& root, TestState& state) {
+    const std::string abi = Source(root, "src/include/knhv_abi.h", state);
+    const std::string ioctl =
+        Source(root, "src/include/knhv_control_ioctl.h", state);
+    const std::string provider =
+        Source(root, "src/include/knhv_provider.h", state);
+    const std::string implementation =
+        Source(root, "src/provider/provider_v2.cpp", state);
+    const std::string control =
+        Source(root, "src/control/control_device.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string probe =
+        Source(root, "HV_PROBE_TESTER/nested_probe.cpp", state);
+    Check(state, "ABI v2 exposes bounded capability and lease structures",
+          Contains(abi, "kAbiV2Version") &&
+              Contains(abi, "HvCapabilitySnapshotV2") &&
+              Contains(abi, "HvOwnerLeaseV2") &&
+              Contains(abi, "IsAbiV2BufferValid") &&
+              Contains(abi, "kAbiV2MaxStructSize"));
+    Check(state, "ABI v2 IOCTLs are explicitly versioned",
+          Contains(ioctl, "IOCTL_KNHV_QUERY_CAPS_V2") &&
+              Contains(ioctl, "IOCTL_KNHV_ACQUIRE_LEASE_V2") &&
+              Contains(ioctl, "IOCTL_KNHV_RELEASE_LEASE_V2"));
+    Check(state, "provider v2 selection is shared and fail-closed",
+          Contains(provider, "SelectProviderV2") &&
+              Contains(provider, "LeaseMatchesCapabilityV2") &&
+              Contains(implementation, "RequiredFeaturesKnown") &&
+              Contains(implementation, "HardwareOwnerConflict") &&
+              Contains(implementation, "kLeaseFlagSynthetic") &&
+              !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__writemsr"));
+    Check(state, "control v2 paths validate length and bind the file owner",
+          Contains(cmake, "src/provider/provider_v2.cpp") &&
+              Contains(control, "VersionedV2InputFits") &&
+              Contains(control, "HandleAcquireLeaseV2") &&
+              Contains(control, "HandleReleaseLeaseV2") &&
+              Contains(control, "FindSession(extension, request.session,") &&
+              Contains(control, "IOCTL_KNHV_QUERY_CAPS_V2"));
+    Check(state, "nested probe exercises the v2 lease lifecycle",
+          Contains(probe, "QueryCapsV2") &&
+              Contains(probe, "AcquireSyntheticLease") &&
+              Contains(probe, "ReleaseLeaseV2") &&
+              Contains(probe, "IOCTL_KNHV_ACQUIRE_LEASE_V2"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -580,6 +625,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckFaultInjectionContract(root, state);
     CheckBenchmarkContract(root, state);
     CheckPreflightContract(root, state);
+    CheckAbiV2Contract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }

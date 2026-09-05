@@ -15,6 +15,9 @@ struct KnHvClientSession {
     u16 reserved;
     PFILE_OBJECT owner_file;
     HvSessionStatusOut status;
+    HvOwnerLeaseV2 lease;
+    u8 lease_active;
+    u8 lease_reserved[7];
     NestedVcpu nested_vcpu;
     u8 guest_memory[kNestedGuestMemoryBytes];
 };
