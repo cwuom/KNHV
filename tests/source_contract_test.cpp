@@ -13,9 +13,9 @@ std::string Source(const fs::path& root, std::string_view relative,
 }
 
 void CheckLineLimits(const fs::path& root, TestState& state) {
-    const std::array<fs::path, 5> roots = {
+    const std::array<fs::path, 6> roots = {
         root / "src", root / "tests", root / "tools",
-        root / "HV_PROBE_TESTER", root / "benchmarks"};
+        root / "HV_PROBE_TESTER", root / "benchmarks", root / "preflight"};
     for (const fs::path& directory : roots) {
         if (!fs::exists(directory)) continue;
         for (const fs::directory_entry& entry :
@@ -483,6 +483,31 @@ void CheckBenchmarkContract(const fs::path& root, TestState& state) {
               Contains(run_script, "SkipNativeGate"));
 }
 
+void CheckPreflightContract(const fs::path& root, TestState& state) {
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string build_script =
+        Source(root, "tools/Build-Driver.ps1", state);
+    const std::string readme = Source(root, "README.md", state);
+    const std::string common =
+        Source(root, "preflight/preflight_common.cpp", state);
+    const std::string header = Source(root, "preflight/preflight.h", state);
+    Check(state, "preflight target and artifact are explicit",
+          Contains(cmake, "KNHV_BUILD_PREFLIGHT") &&
+              Contains(cmake, "KNHV_Preflight") &&
+              Contains(cmake, "preflight/preflight_common.cpp") &&
+              Contains(build_script, "KNHV_Preflight.exe") &&
+              Contains(readme, "KNHV_Preflight.exe"));
+    Check(state, "preflight is read-only and fail-closed",
+          Contains(header, "GateState") &&
+              Contains(common, "knhv-preflight-1") &&
+              Contains(common, "EnumSystemFirmwareTables") &&
+              Contains(common, "0x52414D44U") &&
+              Contains(common, "DeviceIoControl") &&
+              Contains(common, "IA32_FEATURE_CONTROL") &&
+              Contains(common, "kExitBlocked") &&
+              !Contains(common, "__vmx") && !Contains(common, "__writemsr"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -554,6 +579,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckTeardownContract(root, state);
     CheckFaultInjectionContract(root, state);
     CheckBenchmarkContract(root, state);
+    CheckPreflightContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }

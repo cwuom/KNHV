@@ -208,6 +208,7 @@ $configureArgs += @(
     "-DKNHV_BUILD_TESTS=ON",
     "-DKNHV_BUILD_NESTED_DRIVERS=ON",
     "-DKNHV_BUILD_BENCHMARKS=ON",
+    "-DKNHV_BUILD_PREFLIGHT=ON",
     "-DKNHV_ARTIFACT_ROOT=$BuildDirectory",
     "-DWDK_WINVER=0x0A00"
 )
@@ -255,7 +256,8 @@ $expectedPrograms = @(
     "KNHV_VmxExitBench.exe",
     "KNHV_TscQpcBench.exe",
     "KNHV_EptHookBench.exe",
-    "KNHV_DeviceIoBench.exe"
+    "KNHV_DeviceIoBench.exe",
+    "KNHV_Preflight.exe"
 )
 foreach ($expectedProgram in $expectedPrograms) {
     $programPath = Join-Path $programOutputDirectory $expectedProgram

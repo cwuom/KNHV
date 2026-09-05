@@ -110,6 +110,7 @@ configuration root:
 - `bin/KNHV_TscQpcBench.exe`
 - `bin/KNHV_EptHookBench.exe`
 - `bin/KNHV_DeviceIoBench.exe`
+- `bin/KNHV_Preflight.exe`
 - `sys/KNHV.sys`
 - `sys/KNHV-Control.sys`
 - `sys/KNHV-NestedTest.sys`
@@ -203,6 +204,12 @@ The device-I/O tool accepts only its explicit virtual profile; it never
 detaches, resets, or transfers data to a physical device. Comparison mode
 requires matching workload, scope, configuration, and host provenance before
 reporting a result.
+
+`KNHV_Preflight.exe` is the read-only gate for a future Native L0 target. It
+reports CPUID, topology, firmware-table, Secure Boot, DeviceGuard, WHP, service,
+and provider observations in `knhv-preflight-1` JSON. Unknown privileged state
+is retained as `unknown` and blocks a `native-l0` profile; the tool never changes
+boot policy, loads a driver, or executes VMX instructions.
 
 To validate a built SYS and its matching PDB:
 

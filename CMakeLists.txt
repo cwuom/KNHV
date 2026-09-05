@@ -117,6 +117,8 @@ option(KNHV_BUILD_NESTED_DRIVERS
        "Build the provider control and nested contract-test drivers" ON)
 option(KNHV_BUILD_BENCHMARKS
        "Build host-only benchmark executables with explicit hardware gates" ON)
+option(KNHV_BUILD_PREFLIGHT
+       "Build the read-only capability and ownership preflight executable" ON)
 option(KNHV_FAULT_INJECTION
        "Enable deterministic launch fault injection for isolated tests" OFF)
 set(KNHV_TEST_FAIL_CPU "-1" CACHE STRING
@@ -557,4 +559,44 @@ if(KNHV_BUILD_BENCHMARKS)
     knhv_add_benchmark(KNHV_TscQpcBench tsc_qpc_bench.cpp)
     knhv_add_benchmark(KNHV_EptHookBench ept_hook_bench.cpp)
     knhv_add_benchmark(KNHV_DeviceIoBench device_io_bench.cpp)
+endif()
+
+# Preflight is a read-only user-mode executable. It reports unknown privileged
+# state instead of attempting to provision VMX, change boot policy, or load a
+# driver.
+if(KNHV_BUILD_PREFLIGHT)
+    add_executable(KNHV_Preflight
+            preflight/preflight_main.cpp
+            preflight/preflight_common.cpp
+            preflight/preflight.h)
+    knhv_set_artifact_layout(KNHV_Preflight program)
+    if(_knhv_toolchain_includes)
+        target_include_directories(KNHV_Preflight SYSTEM BEFORE PRIVATE
+                                   ${_knhv_toolchain_includes})
+    endif()
+    target_include_directories(KNHV_Preflight PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/preflight")
+    if(_knhv_user_toolchain_libdirs)
+        target_link_directories(KNHV_Preflight PRIVATE
+                                ${_knhv_user_toolchain_libdirs})
+    endif()
+    target_compile_options(KNHV_Preflight PRIVATE
+            /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    if(MSVC)
+        set_property(TARGET KNHV_Preflight PROPERTY
+                     MSVC_RUNTIME_LIBRARY
+                     "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET KNHV_Preflight APPEND_STRING PROPERTY
+                     LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+    endif()
+    target_link_libraries(KNHV_Preflight PRIVATE advapi32)
+    if(_knhv_saved_cxx_standard_libraries)
+        set(_knhv_preflight_standard_libraries
+            "${_knhv_saved_cxx_standard_libraries}")
+        separate_arguments(_knhv_preflight_standard_libraries WINDOWS_COMMAND
+                           "${_knhv_preflight_standard_libraries}")
+        target_link_libraries(KNHV_Preflight PRIVATE
+                              ${_knhv_preflight_standard_libraries})
+    endif()
 endif()
