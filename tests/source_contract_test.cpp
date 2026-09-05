@@ -13,8 +13,9 @@ std::string Source(const fs::path& root, std::string_view relative,
 }
 
 void CheckLineLimits(const fs::path& root, TestState& state) {
-    const std::array<fs::path, 3> roots = {root / "src", root / "tests",
-                                           root / "tools"};
+    const std::array<fs::path, 4> roots = {
+        root / "src", root / "tests", root / "tools",
+        root / "HV_PROBE_TESTER"};
     for (const fs::path& directory : roots) {
         if (!fs::exists(directory)) continue;
         for (const fs::directory_entry& entry :
@@ -23,7 +24,7 @@ void CheckLineLimits(const fs::path& root, TestState& state) {
             const std::string extension = entry.path().extension().string();
             if (extension != ".cpp" && extension != ".h" &&
                 extension != ".asm" && extension != ".inc" &&
-                extension != ".ps1") {
+                extension != ".ps1" && extension != ".bat") {
                 continue;
             }
             std::ifstream file(entry.path());
@@ -67,6 +68,10 @@ void CheckProjectIdentity(const fs::path& root, TestState& state) {
     const std::string presets = Source(root, "CMakePresets.json", state);
     const std::string settings = Source(root, ".vscode/settings.json", state);
     const std::string readme = Source(root, "README.md", state);
+    const std::string build_script =
+        Source(root, "tools/Build-Driver.ps1", state);
+    const std::string standalone_script =
+        Source(root, "HV_PROBE_TESTER/build_msvc.bat", state);
 
     Check(state, "build targets use the KNHV identity",
           Contains(cmake, "project(KNHV") &&
@@ -89,6 +94,37 @@ void CheckProjectIdentity(const fs::path& root, TestState& state) {
               Contains(cmake, "KNHV_NestedTest") &&
               Contains(cmake, "KNHV-Control") &&
               Contains(cmake, "KNHV-NestedTest"));
+    const std::string nested_probe =
+        Source(root, "HV_PROBE_TESTER/nested_probe.cpp", state);
+    Check(state, "nested probe uses the public device ABI",
+          Contains(cmake, "KNHV_NestedProbe") &&
+              Contains(presets, "KNHV_NestedProbe") &&
+              Contains(nested_probe, "CreateFileW") &&
+              Contains(nested_probe, "IOCTL_KNHV_NESTED_INSTRUCTION") &&
+              Contains(nested_probe, "IOCTL_KNHV_REFLECT_EXIT"));
+    const std::string native_probe =
+        Source(root, "HV_PROBE_TESTER/native_vmx_probe.cpp", state);
+    Check(state, "native probe is named and classified by the build",
+          !fs::exists(root / "HV_PROBE_TESTER/hv_probe.cpp") &&
+              Contains(native_probe, "kProbeLeaf") &&
+              Contains(cmake, "KNHV_NativeVmxProbe") &&
+              Contains(presets, "KNHV_NativeVmxProbe") &&
+              Contains(cmake, "KNHV_ARTIFACT_ROOT") &&
+              Contains(cmake, "RUNTIME_OUTPUT_DIRECTORY") &&
+              Contains(cmake, "PDB_OUTPUT_DIRECTORY") &&
+              Contains(cmake, "/INCREMENTAL:NO") &&
+              Contains(readme, "bin/KNHV_NativeVmxProbe.exe") &&
+              Contains(readme, "sys/KNHV.sys"));
+    Check(state, "build helpers preserve the artifact layout",
+          Contains(build_script, "KNHV_ARTIFACT_ROOT") &&
+              Contains(build_script, "Join-Path $BuildDirectory \"sys\"") &&
+              Contains(build_script, "Join-Path $BuildDirectory \"bin\"") &&
+              Contains(build_script, "KNHV_NativeVmxProbe.exe") &&
+              Contains(standalone_script, "native_vmx_probe.cpp") &&
+              Contains(standalone_script, "build\\standalone") &&
+              Contains(standalone_script, "/Fo:") &&
+              Contains(standalone_script, "/INCREMENTAL:NO") &&
+              Contains(standalone_script, "KNHV_NativeVmxProbe.exe"));
     Check(state, "kernel targets enforce W4 and warnings as errors",
           Contains(cmake, ":/W4>") && Contains(cmake, ":/WX>"));
 }

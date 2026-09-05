@@ -97,7 +97,7 @@
         {
             "label": "Run C++ Driver Contract Tests (Debug)",
             "type": "process",
-            "command": "${workspaceFolder}\\build\\vscode\\Debug\\KNHV_ContractTests.exe",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\bin\\KNHV_ContractTests.exe",
             "args": [
                 "--root",
                 "${workspaceFolder}"
@@ -112,7 +112,7 @@
         {
             "label": "Run C++ Driver Contract Tests (Release)",
             "type": "process",
-            "command": "${workspaceFolder}\\build\\vscode\\Release\\KNHV_ContractTests.exe",
+            "command": "${workspaceFolder}\\build\\vscode\\Release\\bin\\KNHV_ContractTests.exe",
             "args": [
                 "--root",
                 "${workspaceFolder}"
@@ -127,7 +127,7 @@
         {
             "label": "Run C++ Hardware Probe (isolated target)",
             "type": "process",
-            "command": "${workspaceFolder}\\build\\vscode\\Debug\\KNHV_ContractTests.exe",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\bin\\KNHV_ContractTests.exe",
             "args": [
                 "--root",
                 "${workspaceFolder}",
@@ -143,12 +143,12 @@
         {
             "label": "Run C++ Runtime Smoke Test (isolated target)",
             "type": "process",
-            "command": "${workspaceFolder}\\build\\vscode\\Debug\\KNHV_ContractTests.exe",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\bin\\KNHV_ContractTests.exe",
             "args": [
                 "--root",
                 "${workspaceFolder}",
                 "--driver",
-                "${workspaceFolder}\\build\\vscode\\Debug\\KNHV.sys",
+                "${workspaceFolder}\\build\\vscode\\Debug\\sys\\KNHV.sys",
                 "--runtime",
                 "--start",
                 "--stop"
@@ -163,12 +163,12 @@
         {
             "label": "Run C++ Signature Test (Debug)",
             "type": "process",
-            "command": "${workspaceFolder}\\build\\vscode\\Debug\\KNHV_ContractTests.exe",
+            "command": "${workspaceFolder}\\build\\vscode\\Debug\\bin\\KNHV_ContractTests.exe",
             "args": [
                 "--root",
                 "${workspaceFolder}",
                 "--driver",
-                "${workspaceFolder}\\build\\vscode\\Debug\\KNHV.sys",
+                "${workspaceFolder}\\build\\vscode\\Debug\\sys\\KNHV.sys",
                 "--signature",
                 "--allow-test-root"
             ],
@@ -247,7 +247,7 @@
                 "-File",
                 "${workspaceFolder}\\tools\\Sign-Driver.ps1",
                 "-DriverPath",
-                "${workspaceFolder}\\build\\vscode\\${input:configuration}\\KNHV.sys",
+                "${workspaceFolder}\\build\\vscode\\${input:configuration}\\sys\\KNHV.sys",
                 "-Certificate",
                 "${input:certificate}",
                 "-Password",

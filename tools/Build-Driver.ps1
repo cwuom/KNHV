@@ -207,6 +207,7 @@ $configureArgs += @(
     "-DKNHV_SIGN=OFF",
     "-DKNHV_BUILD_TESTS=ON",
     "-DKNHV_BUILD_NESTED_DRIVERS=ON",
+    "-DKNHV_ARTIFACT_ROOT=$BuildDirectory",
     "-DWDK_WINVER=0x0A00"
 )
 if ($WdkRoot) { $configureArgs += "-DWDK_CONTENT_ROOT=$WdkRoot" }
@@ -223,23 +224,46 @@ if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCOD
 
 # Report every independent artifact explicitly. A kernel driver is not
 # launched by VS Code; the SYS is loaded by the service manager and the
-# matching PDB is used by WinDbg/symbol tooling. Keep the check recursive for
-# Visual Studio's multi-configuration generator.
+# matching PDB is used by WinDbg/symbol tooling. The artifact root is fixed by
+# the configure option above, so category paths stay stable across generators.
+$driverOutputDirectory = Join-Path $BuildDirectory "sys"
+$programOutputDirectory = Join-Path $BuildDirectory "bin"
 $expectedDrivers = @("KNHV.sys", "KNHV-Control.sys", "KNHV-NestedTest.sys")
 foreach ($expectedDriver in $expectedDrivers) {
-    $sysArtifacts = @(Get-ChildItem -LiteralPath $BuildDirectory -Filter $expectedDriver -File -Recurse -ErrorAction SilentlyContinue)
-    if ($sysArtifacts.Count -eq 0) {
-        throw "Build completed but $expectedDriver was not found below $BuildDirectory."
+    $sysPath = Join-Path $driverOutputDirectory $expectedDriver
+    if (-not (Test-Path -LiteralPath $sysPath -PathType Leaf)) {
+        throw "Build completed but the driver artifact was not found: $sysPath"
     }
-    foreach ($sysArtifact in $sysArtifacts) {
-        Write-Host "SYS: $($sysArtifact.FullName) [$($sysArtifact.Length) bytes]"
-        $pdbName = [IO.Path]::GetFileNameWithoutExtension($expectedDriver) + ".pdb"
-        $pdbPath = Join-Path $sysArtifact.DirectoryName $pdbName
-        if (Test-Path -LiteralPath $pdbPath) {
-            $pdb = Get-Item -LiteralPath $pdbPath
-            Write-Host "PDB: $($pdb.FullName) [$($pdb.Length) bytes]"
-        } else {
-            throw "$expectedDriver was produced without its matching $pdbName`: $($sysArtifact.FullName)"
-        }
+    $sysArtifact = Get-Item -LiteralPath $sysPath
+    Write-Host "SYS: $($sysArtifact.FullName) [$($sysArtifact.Length) bytes]"
+    $pdbName = [IO.Path]::GetFileNameWithoutExtension($expectedDriver) + ".pdb"
+    $pdbPath = Join-Path $BuildDirectory $pdbName
+    if (Test-Path -LiteralPath $pdbPath -PathType Leaf) {
+        $pdb = Get-Item -LiteralPath $pdbPath
+        Write-Host "PDB: $($pdb.FullName) [$($pdb.Length) bytes]"
+    } else {
+        throw "$expectedDriver was produced without its matching $pdbName`: $pdbPath"
+    }
+}
+
+$expectedPrograms = @(
+    "KNHV_ContractTests.exe",
+    "KNHV_NestedProbe.exe",
+    "KNHV_NativeVmxProbe.exe"
+)
+foreach ($expectedProgram in $expectedPrograms) {
+    $programPath = Join-Path $programOutputDirectory $expectedProgram
+    if (-not (Test-Path -LiteralPath $programPath -PathType Leaf)) {
+        throw "Build completed but the user-mode artifact was not found: $programPath"
+    }
+    $programArtifact = Get-Item -LiteralPath $programPath
+    Write-Host "EXE: $($programArtifact.FullName) [$($programArtifact.Length) bytes]"
+    $pdbName = [IO.Path]::GetFileNameWithoutExtension($expectedProgram) + ".pdb"
+    $pdbPath = Join-Path $BuildDirectory $pdbName
+    if (Test-Path -LiteralPath $pdbPath -PathType Leaf) {
+        $pdb = Get-Item -LiteralPath $pdbPath
+        Write-Host "PDB: $($pdb.FullName) [$($pdb.Length) bytes]"
+    } else {
+        throw "$expectedProgram was produced without its matching $pdbName`: $pdbPath"
     }
 }

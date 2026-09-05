@@ -15,9 +15,8 @@ $ErrorActionPreference = "Stop"
 
 $driverItem = Get-Item -LiteralPath $DriverPath -ErrorAction SilentlyContinue
 if (-not $driverItem) {
-    # Visual Studio generators place multi-config outputs one level deeper
-    # (build\<config>\<config>\KNHV.sys). Keep the task generator
-    # agnostic while restricting discovery to the requested build directory.
+    # keep discovery limited to the requested artifact category when a caller
+    # supplies a stale or generator-specific path
     $driverParent = Split-Path -Parent ([IO.Path]::GetFullPath($DriverPath))
     $matches = @(Get-ChildItem -LiteralPath $driverParent -Filter ([IO.Path]::GetFileName($DriverPath)) -File -Recurse -ErrorAction SilentlyContinue)
     if ($matches.Count -eq 1) { $driverItem = $matches[0] }

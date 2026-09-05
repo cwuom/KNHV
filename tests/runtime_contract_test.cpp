@@ -122,6 +122,15 @@ bool RvaToFileOffset(const std::vector<std::uint8_t>& bytes,
     return false;
 }
 
+fs::path MatchingPdbPath(const fs::path& artifact) {
+    const fs::path category = artifact.parent_path().filename();
+    const bool classified = category == fs::path(L"sys") ||
+                            category == fs::path(L"bin");
+    const fs::path root = classified ? artifact.parent_path().parent_path()
+                                     : artifact.parent_path();
+    return root / (artifact.stem().wstring() + L".pdb");
+}
+
 void CheckPeImage(const fs::path& driver, TestState& state) {
     const std::vector<std::uint8_t> bytes = ReadBinary(driver, state);
     if (bytes.empty()) {
@@ -250,8 +259,7 @@ void CheckPeImage(const fs::path& driver, TestState& state) {
               !has_vmxon && !has_vmx_entry,
               "auxiliary images must use the software contract only");
     }
-    const fs::path expected_pdb = driver.parent_path() /
-                                  (driver.stem().wstring() + L".pdb");
+    const fs::path expected_pdb = MatchingPdbPath(driver);
     Check(state, "matching PDB is present",
           fs::exists(expected_pdb) && fs::file_size(expected_pdb) > 0,
           expected_pdb.generic_string());

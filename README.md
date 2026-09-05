@@ -94,13 +94,20 @@ cmake --build --preset vscode-release --parallel 4
 installed; CMake also detects the compiler's `/showIncludes` prefix. It does
 not change the language of the driver or the test binaries.
 
-The output directory is `build/vscode/<Configuration>/` and contains:
+The output directory is `build/vscode/<Configuration>/`. Generated runtime
+images are classified by kind, while linker PDB files stay in the
+configuration root:
 
-- `KNHV.sys`
-- `KNHV.pdb`
-- `KNHV-Control.sys` and `KNHV-Control.pdb`
-- `KNHV-NestedTest.sys` and `KNHV-NestedTest.pdb`
-- `KNHV_ContractTests.exe`
+- `bin/KNHV_ContractTests.exe`
+- `bin/KNHV_NestedProbe.exe`
+- `bin/KNHV_NativeVmxProbe.exe`
+- `sys/KNHV.sys`
+- `sys/KNHV-Control.sys`
+- `sys/KNHV-NestedTest.sys`
+- `KNHV*.pdb`
+
+`CMakeFiles/` and `Testing/` remain CMake's internal build directories. The
+native self-test source is `HV_PROBE_TESTER/native_vmx_probe.cpp`.
 
 The two auxiliary SYS files expose only the versioned control contract. They do
 not execute physical `VMXON`; the current `KNHV.sys` remains the native,
@@ -130,7 +137,7 @@ The default suite is host-only. It does not execute VMX instructions, load a
 driver, change TESTSIGNING, or start a service:
 
 ```powershell
-.\build\vscode\Debug\KNHV_ContractTests.exe --root .
+.\build\vscode\Debug\bin\KNHV_ContractTests.exe --root .
 ctest --test-dir build\vscode\Debug --output-on-failure
 ```
 
@@ -138,29 +145,54 @@ The host-only suite includes provider-selection, BootL0 ownership-state, and
 VMCS12/nested-instruction model tests. It does not load either auxiliary
 driver, change TESTSIGNING, or execute VMX instructions.
 
+After the signed `KNHV-NestedTest.sys` test driver is running on an isolated
+x64 Windows target, the dedicated probe can validate its public synthetic
+nested-model device contract:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_NestedProbe.exe --caps-only
+.\build\vscode\Release\bin\KNHV_NestedProbe.exe
+```
+
+The full probe opens `\\.\KNHVNestedTest`, registers the known laboratory
+provider, and exercises VMXON, VMCS12 setup, VMLAUNCH, reflected L2 exits,
+VMRESUME, VMXOFF, and session release. It does not execute physical VMX
+instructions or verify a physical BootL0/VMCS02/EPT02 implementation.
+
+On an isolated target where `KNHV.sys` is already running, the native VMX
+self-test is available as:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_NativeVmxProbe.exe
+```
+
+The native probe must not be used as a nested or coexistence test. It checks
+only the existing KNHV VM-exit path and is intentionally separate from the
+synthetic nested-model probe.
+
 To validate a built SYS and its matching PDB:
 
 ```powershell
-.\build\vscode\Debug\KNHV_ContractTests.exe `
+.\build\vscode\Debug\bin\KNHV_ContractTests.exe `
   --root . `
-  --driver .\build\vscode\Debug\KNHV.sys
+  --driver .\build\vscode\Debug\sys\KNHV.sys
 ```
 
 The following checks are explicit opt-ins and belong only on the isolated
 Windows 11 25H2 / i7-14700KF target:
 
 ```powershell
-.\build\vscode\Debug\KNHV_ContractTests.exe --root . --hardware
+.\build\vscode\Debug\bin\KNHV_ContractTests.exe --root . --hardware
 
-.\build\vscode\Debug\KNHV_ContractTests.exe `
+.\build\vscode\Debug\bin\KNHV_ContractTests.exe `
   --root . `
-  --driver .\build\vscode\Debug\KNHV.sys `
+  --driver .\build\vscode\Debug\sys\KNHV.sys `
   --signature `
   --allow-test-root
 
-.\build\vscode\Debug\KNHV_ContractTests.exe `
+.\build\vscode\Debug\bin\KNHV_ContractTests.exe `
   --root . `
-  --driver .\build\vscode\Debug\KNHV.sys `
+  --driver .\build\vscode\Debug\sys\KNHV.sys `
   --runtime --start --stop
 ```
 
@@ -182,11 +214,12 @@ cmake -S . -B build\vscode\FaultDebug -G Ninja `
   -DKNHV_BUILD_TESTS=ON `
   -DKNHV_FAULT_INJECTION=ON `
   -DKNHV_TEST_FAIL_CPU=0 `
-  -DKNHV_TEST_FAIL_STAGE=8
+  -DKNHV_TEST_FAIL_STAGE=8 `
+  -DKNHV_ARTIFACT_ROOT=build\vscode\FaultDebug
 cmake --build build\vscode\FaultDebug --parallel 4
-.\build\vscode\FaultDebug\KNHV_ContractTests.exe `
+.\build\vscode\FaultDebug\bin\KNHV_ContractTests.exe `
   --root . `
-  --driver .\build\vscode\FaultDebug\KNHV.sys
+  --driver .\build\vscode\FaultDebug\sys\KNHV.sys
 ```
 
 This command validates the fault-injection build and its artifact contract; it
@@ -207,7 +240,7 @@ installed Visual Studio and WDK rather than hard-coded compiler paths.
 
 | Script | Purpose | State changes |
 | --- | --- | --- |
-| `tools/Build-Driver.ps1` | Discover VS/WDK, configure, and build an unsigned SYS/PDB | Writes only the selected build directory |
+| `tools/Build-Driver.ps1` | Discover VS/WDK, configure, and build unsigned SYS/EXE/PDB artifacts | Writes only the selected build directory using `sys/`, `bin/`, and the root for linker PDBs |
 | `tools/Build-And-Sign-Driver.ps1` | Build, create or reuse a local test certificate, then sign the SYS | Writes `certs/`, may install test certificates, and changes the SYS |
 | `tools/Generate-Test-Certificate.ps1` | Create a private Root CA and kernel-code-signing leaf certificate | Writes `certs/` and may update certificate stores |
 | `tools/Sign-Driver.ps1` | Sign an existing SYS and verify Authenticode plus kernel policy | Changes the specified SYS; requires `signtool.exe` and a certificate |
@@ -223,6 +256,17 @@ installed Visual Studio and WDK rather than hard-coded compiler paths.
 
 Use `-WdkRoot 'C:\Program Files (x86)\Windows Kits\10'` when automatic WDK
 selection is not appropriate.
+
+The legacy standalone probe entry point remains available from an x64 Native
+Tools Command Prompt:
+
+```bat
+cd HV_PROBE_TESTER
+build_msvc.bat
+```
+
+It writes `build\standalone\bin\KNHV_NativeVmxProbe.exe` and its PDB instead
+of placing a binary beside the source file.
 
 ### Test certificate and signing
 
@@ -241,7 +285,7 @@ For an existing certificate and SYS, the lower-level command is:
 
 ```powershell
 .\tools\Sign-Driver.ps1 `
-  -DriverPath .\build\vscode\Debug\KNHV.sys `
+  -DriverPath .\build\vscode\Debug\sys\KNHV.sys `
   -Certificate .\certs\KNHV_test.pfx `
   -Password '<test-password>' `
   -AllowUntrustedTestCertificate

@@ -114,7 +114,7 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options) {
     }
 
     if (options.driver.empty()) {
-        options.driver = options.root / L"build/vscode/Debug/KNHV.sys";
+        options.driver = options.root / L"build/vscode/Debug/sys/KNHV.sys";
     }
     return true;
 }

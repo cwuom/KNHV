@@ -19,4 +19,4 @@
 *.cab
 *.obj
 *.pdb
-HV_PROBE_TESTER/hv_probe.exe
+/HV_PROBE_TESTER/*.exe

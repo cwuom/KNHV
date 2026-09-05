@@ -15,6 +15,7 @@
                 "KNHV_SIGN": "OFF",
                 "KNHV_BUILD_TESTS": "ON",
                 "KNHV_BUILD_NESTED_DRIVERS": "ON",
+                "KNHV_ARTIFACT_ROOT": "${sourceDir}/build/vscode/Debug",
                 "WDK_WINVER": "0x0A00"
             }
         },
@@ -32,6 +33,7 @@
                 "KNHV_SIGN": "OFF",
                 "KNHV_BUILD_TESTS": "ON",
                 "KNHV_BUILD_NESTED_DRIVERS": "ON",
+                "KNHV_ARTIFACT_ROOT": "${sourceDir}/build/vscode/Release",
                 "WDK_WINVER": "0x0A00"
             }
         },
@@ -59,7 +61,9 @@
                 "KNHV",
                 "KNHV_Control",
                 "KNHV_NestedTest",
-                "KNHV_ContractTests"
+                "KNHV_ContractTests",
+                "KNHV_NestedProbe",
+                "KNHV_NativeVmxProbe"
             ]
         },
         {
@@ -70,7 +74,9 @@
                 "KNHV",
                 "KNHV_Control",
                 "KNHV_NestedTest",
-                "KNHV_ContractTests"
+                "KNHV_ContractTests",
+                "KNHV_NestedProbe",
+                "KNHV_NativeVmxProbe"
             ]
         },
         {
@@ -82,7 +88,9 @@
                 "KNHV",
                 "KNHV_Control",
                 "KNHV_NestedTest",
-                "KNHV_ContractTests"
+                "KNHV_ContractTests",
+                "KNHV_NestedProbe",
+                "KNHV_NativeVmxProbe"
             ]
         },
         {
@@ -94,7 +102,9 @@
                 "KNHV",
                 "KNHV_Control",
                 "KNHV_NestedTest",
-                "KNHV_ContractTests"
+                "KNHV_ContractTests",
+                "KNHV_NestedProbe",
+                "KNHV_NativeVmxProbe"
             ]
         }
     ]

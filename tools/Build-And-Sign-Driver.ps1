@@ -44,15 +44,17 @@ if (-not (Test-Path -LiteralPath $Certificate)) {
 $buildArgs = @{ Configuration = $Configuration }
 if ($WdkRoot) { $buildArgs.WdkRoot = $WdkRoot }
 
-Write-Host "Building SYS and PDB ($Configuration)"
+Write-Host "Building classified SYS/EXE/PDB artifacts ($Configuration)"
 & $buildScript @buildArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Driver build failed with exit code $LASTEXITCODE."
 }
 
 $driverNames = @("KNHV.sys", "KNHV-Control.sys", "KNHV-NestedTest.sys")
+$artifactRoot = Join-Path $repoRoot (Join-Path "build\vscode" $Configuration)
+$driverOutputDirectory = Join-Path $artifactRoot "sys"
 foreach ($driverName in $driverNames) {
-    $driverPath = Join-Path $repoRoot (Join-Path "build\vscode" (Join-Path $Configuration $driverName))
+    $driverPath = Join-Path $driverOutputDirectory $driverName
     $signArgs = @{
         DriverPath = $driverPath
         Certificate = $Certificate

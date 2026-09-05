@@ -128,6 +128,37 @@ set(KNHV_SIGN_CERT "" CACHE FILEPATH "PFX containing the signing private key (re
 set(KNHV_SIGN_PASSWORD "" CACHE STRING "PFX password (optional; avoid storing secrets in CMake cache)")
 set(KNHV_SIGN_TIMESTAMP_URL "" CACHE STRING "RFC3161 timestamp URL (optional for test certificates)")
 
+# keep generated images separate from CMake's internal files so a build tree
+# can be copied to a test target without collecting intermediate objects
+set(KNHV_ARTIFACT_ROOT "" CACHE PATH
+    "Root directory for classified build artifacts")
+if(KNHV_ARTIFACT_ROOT)
+    file(TO_CMAKE_PATH "${KNHV_ARTIFACT_ROOT}" _knhv_artifact_root)
+    # the empty generator expression prevents multi-config CMake from adding
+    # another configuration directory to an explicitly selected root
+    set(_knhv_artifact_root "${_knhv_artifact_root}/$<0:>")
+elseif(CMAKE_CONFIGURATION_TYPES)
+    set(_knhv_artifact_root "${CMAKE_BINARY_DIR}/$<CONFIG>")
+else()
+    set(_knhv_artifact_root "${CMAKE_BINARY_DIR}")
+endif()
+set(_knhv_program_output_directory "${_knhv_artifact_root}/bin")
+set(_knhv_driver_output_directory "${_knhv_artifact_root}/sys")
+set(_knhv_symbol_output_directory "${_knhv_artifact_root}")
+
+function(knhv_set_artifact_layout target artifact_kind)
+    if(artifact_kind STREQUAL "driver")
+        set(_knhv_runtime_output "${_knhv_driver_output_directory}")
+    elseif(artifact_kind STREQUAL "program")
+        set(_knhv_runtime_output "${_knhv_program_output_directory}")
+    else()
+        message(FATAL_ERROR "unknown KNHV artifact kind: ${artifact_kind}")
+    endif()
+    set_target_properties(${target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${_knhv_runtime_output}"
+            PDB_OUTPUT_DIRECTORY "${_knhv_symbol_output_directory}")
+endfunction()
+
 # sources
 set(SOURCES
         src/core/main.cpp
@@ -171,6 +202,7 @@ set(_knhv_saved_cxx_standard_libraries "${CMAKE_CXX_STANDARD_LIBRARIES}")
 set(CMAKE_C_STANDARD_LIBRARIES "")
 set(CMAKE_CXX_STANDARD_LIBRARIES "")
 wdk_add_driver(KNHV ${SOURCES})
+knhv_set_artifact_layout(KNHV driver)
 if(_knhv_toolchain_includes)
     target_include_directories(KNHV SYSTEM BEFORE PRIVATE
                                ${_knhv_toolchain_includes})
@@ -286,6 +318,7 @@ if(KNHV_BUILD_NESTED_DRIVERS)
     set_target_properties(KNHV_Control PROPERTIES OUTPUT_NAME "KNHV-Control")
     set_target_properties(KNHV_NestedTest PROPERTIES OUTPUT_NAME "KNHV-NestedTest")
     foreach(_knhv_aux_target IN ITEMS KNHV_Control KNHV_NestedTest)
+        knhv_set_artifact_layout(${_knhv_aux_target} driver)
         target_include_directories(${_knhv_aux_target} PRIVATE
                                    "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
                                    "${CMAKE_CURRENT_SOURCE_DIR}/src/control"
@@ -350,6 +383,7 @@ if(KNHV_BUILD_TESTS)
             src/nested/nested_memory.cpp
             src/nested/nested_instructions.cpp
             src/boot/boot_contract.cpp)
+    knhv_set_artifact_layout(KNHV_ContractTests program)
     if(_knhv_toolchain_includes)
         target_include_directories(KNHV_ContractTests SYSTEM BEFORE PRIVATE
                                    ${_knhv_toolchain_includes})
@@ -366,6 +400,14 @@ if(KNHV_BUILD_TESTS)
             KNHV_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
     target_compile_options(KNHV_ContractTests PRIVATE
             /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    if(MSVC)
+        # keep the host test independent of machine-installed CRT DLLs
+        set_property(TARGET KNHV_ContractTests PROPERTY
+                     MSVC_RUNTIME_LIBRARY
+                     "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET KNHV_ContractTests APPEND_STRING PROPERTY
+                     LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+    endif()
     target_link_libraries(KNHV_ContractTests PRIVATE advapi32 wintrust)
     if(_knhv_saved_cxx_standard_libraries)
         set(_knhv_test_standard_libraries
@@ -377,4 +419,66 @@ if(KNHV_BUILD_TESTS)
     endif()
     add_test(NAME KNHV_ContractTests
             COMMAND KNHV_ContractTests --root "${CMAKE_CURRENT_SOURCE_DIR}")
+
+    add_executable(KNHV_NestedProbe
+            HV_PROBE_TESTER/nested_probe.cpp)
+    knhv_set_artifact_layout(KNHV_NestedProbe program)
+    if(_knhv_toolchain_includes)
+        target_include_directories(KNHV_NestedProbe SYSTEM BEFORE PRIVATE
+                                   ${_knhv_toolchain_includes})
+    endif()
+    target_include_directories(KNHV_NestedProbe PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/include")
+    if(_knhv_user_toolchain_libdirs)
+        target_link_directories(KNHV_NestedProbe PRIVATE
+                                ${_knhv_user_toolchain_libdirs})
+    endif()
+    target_compile_options(KNHV_NestedProbe PRIVATE
+            /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    if(MSVC)
+        # keep the probe independent of machine-installed CRT DLLs
+        set_property(TARGET KNHV_NestedProbe PROPERTY
+                     MSVC_RUNTIME_LIBRARY
+                     "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET KNHV_NestedProbe APPEND_STRING PROPERTY
+                     LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+    endif()
+    if(_knhv_saved_cxx_standard_libraries)
+        set(_knhv_nested_probe_standard_libraries
+            "${_knhv_saved_cxx_standard_libraries}")
+        separate_arguments(_knhv_nested_probe_standard_libraries WINDOWS_COMMAND
+                           "${_knhv_nested_probe_standard_libraries}")
+        target_link_libraries(KNHV_NestedProbe PRIVATE
+                              ${_knhv_nested_probe_standard_libraries})
+    endif()
+
+    add_executable(KNHV_NativeVmxProbe
+            HV_PROBE_TESTER/native_vmx_probe.cpp)
+    knhv_set_artifact_layout(KNHV_NativeVmxProbe program)
+    if(_knhv_toolchain_includes)
+        target_include_directories(KNHV_NativeVmxProbe SYSTEM BEFORE PRIVATE
+                                   ${_knhv_toolchain_includes})
+    endif()
+    if(_knhv_user_toolchain_libdirs)
+        target_link_directories(KNHV_NativeVmxProbe PRIVATE
+                                ${_knhv_user_toolchain_libdirs})
+    endif()
+    target_compile_options(KNHV_NativeVmxProbe PRIVATE
+            /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    if(MSVC)
+        # keep the native probe independent of machine-installed CRT DLLs
+        set_property(TARGET KNHV_NativeVmxProbe PROPERTY
+                     MSVC_RUNTIME_LIBRARY
+                     "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET KNHV_NativeVmxProbe APPEND_STRING PROPERTY
+                     LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+    endif()
+    if(_knhv_saved_cxx_standard_libraries)
+        set(_knhv_native_probe_standard_libraries
+            "${_knhv_saved_cxx_standard_libraries}")
+        separate_arguments(_knhv_native_probe_standard_libraries WINDOWS_COMMAND
+                           "${_knhv_native_probe_standard_libraries}")
+        target_link_libraries(KNHV_NativeVmxProbe PRIVATE
+                              ${_knhv_native_probe_standard_libraries})
+    endif()
 endif()
