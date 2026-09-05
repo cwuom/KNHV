@@ -24,8 +24,7 @@ u64 AdjustCr4(u64 Cr4) {
     return (Cr4 & fixed1) | fixed0;
 }
 
-// passive level memory allocator
-// replaced ExAllocatePool2 with ExAllocatePoolWithTag for broader compatibility
+// passive level contiguous allocator used by VMX regions and bitmaps
 void* AllocContiguous(SIZE_T Size, u64* Phys) {
     PHYSICAL_ADDRESS low = {};
     PHYSICAL_ADDRESS high = {};

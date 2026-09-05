@@ -142,26 +142,24 @@ extern "C" NTSTATUS StartHypervisor() {
              "vmx_basic=0x%llX xsave_frame=%lu\n", g_ProcessorCount,
              g_HostCr3, g_VmxBasic, static_cast<ULONG>(g_XsaveStateSize));
 
-    g_VcpuData = static_cast<VcpuContext*>(
-        ExAllocatePoolWithTag(NonPagedPoolNx, sizeof(VcpuContext) * g_ProcessorCount, TAG_HV00)
-    );
+    g_VcpuData = static_cast<VcpuContext*>(ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(VcpuContext) * g_ProcessorCount,
+        TAG_HV00));
 
     if (!g_VcpuData) return rejectStart(STATUS_INSUFFICIENT_RESOURCES);
     RtlZeroMemory(g_VcpuData, sizeof(VcpuContext) * g_ProcessorCount);
-    g_HvTargetCpuWork = static_cast<TargetCpuWork*>(
-        ExAllocatePoolWithTag(NonPagedPoolNx,
-                              sizeof(TargetCpuWork) * g_ProcessorCount,
-                              TAG_HV00));
+    g_HvTargetCpuWork = static_cast<TargetCpuWork*>(ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(TargetCpuWork) * g_ProcessorCount,
+        TAG_HV00));
     if (!g_HvTargetCpuWork) {
         StopHypervisorInternal(true);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(g_HvTargetCpuWork,
                   sizeof(TargetCpuWork) * g_ProcessorCount);
-    g_HvTargetLaunchDpcWork = static_cast<TargetLaunchDpcWork*>(
-        ExAllocatePoolWithTag(NonPagedPoolNx,
-                              sizeof(TargetLaunchDpcWork) * g_ProcessorCount,
-                              TAG_HV00));
+    g_HvTargetLaunchDpcWork = static_cast<TargetLaunchDpcWork*>(ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(TargetLaunchDpcWork) * g_ProcessorCount, TAG_HV00));
     if (!g_HvTargetLaunchDpcWork) {
         StopHypervisorInternal(true);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -175,8 +173,8 @@ extern "C" NTSTATUS StartHypervisor() {
         g_VcpuData[i].MsrBitmapVirt = AllocContiguous(PAGE_SIZE, &g_VcpuData[i].MsrBitmapPhys);
         if (g_VcpuData[i].MsrBitmapVirt) RtlZeroMemory(g_VcpuData[i].MsrBitmapVirt, PAGE_SIZE);
 
-        g_VcpuData[i].HostStack = ExAllocatePoolWithTag(
-            NonPagedPoolNx, kVmxHostStackSize, TAG_HVST);
+        g_VcpuData[i].HostStack = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, kVmxHostStackSize, TAG_HVST);
         if (g_VcpuData[i].HostStack) {
             RtlZeroMemory(g_VcpuData[i].HostStack, kVmxHostStackSize);
             const u64 stackLastByte =
@@ -185,19 +183,17 @@ extern "C" NTSTATUS StartHypervisor() {
             g_VcpuData[i].HostStackTop =
                 stackLastByte & ~(kVmxHostStackAlignment - 1);
         }
-        g_VcpuData[i].VmxHostIdt = ExAllocatePoolWithTag(
-            NonPagedPoolNx, PAGE_SIZE, TAG_HVID);
+        g_VcpuData[i].VmxHostIdt = ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, PAGE_SIZE, TAG_HVID);
         if (g_VcpuData[i].VmxHostIdt) {
             RtlZeroMemory(g_VcpuData[i].VmxHostIdt, PAGE_SIZE);
             g_VcpuData[i].VmxHostIdtBase =
                 reinterpret_cast<u64>(g_VcpuData[i].VmxHostIdt);
         }
         g_VcpuData[i].TraceCapacity = HV_TRACE_RECORDS_PER_CPU;
-        g_VcpuData[i].TraceRing = static_cast<HvTraceRecord*>(
-            ExAllocatePoolWithTag(NonPagedPoolNx,
-                                   sizeof(HvTraceRecord) *
-                                       HV_TRACE_RECORDS_PER_CPU,
-                                   TAG_HVTR));
+        g_VcpuData[i].TraceRing = static_cast<HvTraceRecord*>(ExAllocatePool2(
+            POOL_FLAG_NON_PAGED,
+            sizeof(HvTraceRecord) * HV_TRACE_RECORDS_PER_CPU, TAG_HVTR));
         if (g_VcpuData[i].TraceRing) {
             RtlZeroMemory(g_VcpuData[i].TraceRing,
                           sizeof(HvTraceRecord) * HV_TRACE_RECORDS_PER_CPU);

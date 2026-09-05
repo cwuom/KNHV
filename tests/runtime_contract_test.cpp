@@ -88,6 +88,18 @@ bool ContainsBytes(const std::vector<std::uint8_t>& bytes,
     return false;
 }
 
+bool ContainsVmxonEncoding(const std::vector<std::uint8_t>& bytes) {
+    for (std::size_t offset = 0; offset + 4 <= bytes.size(); ++offset) {
+        if (bytes[offset] != 0xF3 || bytes[offset + 1] != 0x0F ||
+            bytes[offset + 2] != 0xC7) {
+            continue;
+        }
+        const std::uint8_t modrm = bytes[offset + 3];
+        if (((modrm >> 3U) & 7U) == 6U) return true;
+    }
+    return false;
+}
+
 bool RvaToFileOffset(const std::vector<std::uint8_t>& bytes,
                      const IMAGE_SECTION_HEADER* sections,
                      WORD section_count, DWORD rva, std::size_t& offset) {
@@ -219,13 +231,25 @@ void CheckPeImage(const fs::path& driver, TestState& state) {
     }
     Check(state, "SYS carries CodeView debug metadata", debug_present,
           driver.string());
-    const bool has_field_value_vmwrite =
-        ContainsBytes(bytes, {0x0F, 0x79, 0xCA, 0x9C, 0x58, 0xC3});
-    const bool has_value_field_vmwrite =
-        ContainsBytes(bytes, {0x0F, 0x79, 0xD1, 0x9C, 0x58, 0xC3});
-    Check(state, "SYS contains the field-value VMWRITE ABI",
-          has_field_value_vmwrite && !has_value_field_vmwrite,
-          "expected vmwrite rcx, rdx encoding");
+    const bool native_vmx_image =
+        _wcsicmp(driver.filename().c_str(), L"KNHV.sys") == 0;
+    if (native_vmx_image) {
+        const bool has_field_value_vmwrite =
+            ContainsBytes(bytes, {0x0F, 0x79, 0xCA, 0x9C, 0x58, 0xC3});
+        const bool has_value_field_vmwrite =
+            ContainsBytes(bytes, {0x0F, 0x79, 0xD1, 0x9C, 0x58, 0xC3});
+        Check(state, "native SYS contains the field-value VMWRITE ABI",
+              has_field_value_vmwrite && !has_value_field_vmwrite,
+              "expected vmwrite rcx, rdx encoding");
+    } else {
+        const bool has_vmxon = ContainsVmxonEncoding(bytes);
+        const bool has_vmx_entry =
+            ContainsBytes(bytes, {0x0F, 0x01, 0xC2}) ||
+            ContainsBytes(bytes, {0x0F, 0x01, 0xC3});
+        Check(state, "auxiliary SYS excludes physical VMX entry opcodes",
+              !has_vmxon && !has_vmx_entry,
+              "auxiliary images must use the software contract only");
+    }
     const fs::path expected_pdb = driver.parent_path() /
                                   (driver.stem().wstring() + L".pdb");
     Check(state, "matching PDB is present",

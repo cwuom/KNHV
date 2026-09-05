@@ -1,0 +1,46 @@
+; isolated nested virtualization contract test driver
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+CatalogFile=KNHV-NestedTest.cat
+DriverVer=09/04/2026,1.0.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DriverCopyFiles=13
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverCopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService=KNHV-NestedTest,0x00000002,NestedService
+
+[DefaultUninstall.NTamd64]
+LegacyUninstall=1
+
+[DefaultUninstall.NTamd64.Services]
+DelService=KNHV-NestedTest,0x00000200
+
+[DriverCopyFiles]
+KNHV-NestedTest.sys
+
+[NestedService]
+DisplayName=%NestedServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\KNHV-NestedTest.sys
+Security="D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[SourceDisksNames]
+1=%DiskName%,,
+
+[SourceDisksFiles]
+KNHV-NestedTest.sys=1
+
+[Strings]
+ProviderName="KNHV Research"
+NestedServiceDesc="KNHV nested virtualization contract test"
+DiskName="KNHV nested test package"

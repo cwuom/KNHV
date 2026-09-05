@@ -206,6 +206,7 @@ $configureArgs += @(
     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     "-DKNHV_SIGN=OFF",
     "-DKNHV_BUILD_TESTS=ON",
+    "-DKNHV_BUILD_NESTED_DRIVERS=ON",
     "-DWDK_WINVER=0x0A00"
 )
 if ($WdkRoot) { $configureArgs += "-DWDK_CONTENT_ROOT=$WdkRoot" }
@@ -220,21 +221,25 @@ Write-Host "Building KNHV ($Configuration)"
 & $cmake @buildArgs
 if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCODE." }
 
-# Report both artifacts explicitly.  A kernel driver is not launched by VS
-# Code; the SYS is loaded by the service manager and the matching PDB is used
-# by WinDbg/symbol tooling.  Keep the check recursive for Visual Studio's
-# multi-configuration generator, which may place outputs below <Config>\Debug.
-$sysArtifacts = @(Get-ChildItem -LiteralPath $BuildDirectory -Filter "KNHV.sys" -File -Recurse -ErrorAction SilentlyContinue)
-if ($sysArtifacts.Count -eq 0) {
-    throw "Build completed but KNHV.sys was not found below $BuildDirectory."
-}
-foreach ($sysArtifact in $sysArtifacts) {
-    Write-Host "SYS: $($sysArtifact.FullName) [$($sysArtifact.Length) bytes]"
-    $pdbPath = Join-Path $sysArtifact.DirectoryName "KNHV.pdb"
-    if (Test-Path -LiteralPath $pdbPath) {
-        $pdb = Get-Item -LiteralPath $pdbPath
-        Write-Host "PDB: $($pdb.FullName) [$($pdb.Length) bytes]"
-    } else {
-        throw "KNHV.sys was produced without its matching KNHV.pdb: $($sysArtifact.FullName)"
+# Report every independent artifact explicitly. A kernel driver is not
+# launched by VS Code; the SYS is loaded by the service manager and the
+# matching PDB is used by WinDbg/symbol tooling. Keep the check recursive for
+# Visual Studio's multi-configuration generator.
+$expectedDrivers = @("KNHV.sys", "KNHV-Control.sys", "KNHV-NestedTest.sys")
+foreach ($expectedDriver in $expectedDrivers) {
+    $sysArtifacts = @(Get-ChildItem -LiteralPath $BuildDirectory -Filter $expectedDriver -File -Recurse -ErrorAction SilentlyContinue)
+    if ($sysArtifacts.Count -eq 0) {
+        throw "Build completed but $expectedDriver was not found below $BuildDirectory."
+    }
+    foreach ($sysArtifact in $sysArtifacts) {
+        Write-Host "SYS: $($sysArtifact.FullName) [$($sysArtifact.Length) bytes]"
+        $pdbName = [IO.Path]::GetFileNameWithoutExtension($expectedDriver) + ".pdb"
+        $pdbPath = Join-Path $sysArtifact.DirectoryName $pdbName
+        if (Test-Path -LiteralPath $pdbPath) {
+            $pdb = Get-Item -LiteralPath $pdbPath
+            Write-Host "PDB: $($pdb.FullName) [$($pdb.Length) bytes]"
+        } else {
+            throw "$expectedDriver was produced without its matching $pdbName`: $($sysArtifact.FullName)"
+        }
     }
 }

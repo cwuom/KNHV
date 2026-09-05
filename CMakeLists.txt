@@ -113,6 +113,8 @@ endif()
 
 option(KNHV_SIGN "Sign the driver as a post-build step" OFF)
 option(KNHV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
+option(KNHV_BUILD_NESTED_DRIVERS
+       "Build the provider control and nested contract-test drivers" ON)
 option(KNHV_FAULT_INJECTION
        "Enable deterministic launch fault injection for isolated tests" OFF)
 set(KNHV_TEST_FAIL_CPU "-1" CACHE STRING
@@ -188,6 +190,7 @@ endif()
 # still protected by the language-qualified expressions below.
 target_compile_options(KNHV PRIVATE
         "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/W4>"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/EHs-c->"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/GS->"
@@ -248,6 +251,87 @@ if(KNHV_SIGN)
     )
 endif()
 
+set(KNHV_NESTED_MODEL_SOURCES
+        src/provider/provider_selection.cpp
+        src/nested/nested_vmcs.cpp
+        src/nested/nested_memory.cpp
+        src/nested/nested_instructions.cpp
+        src/boot/boot_contract.cpp
+        src/include/knhv_boot_contract.h
+        src/include/knhv_abi.h
+        src/include/knhv_provider.h
+        src/include/knhv_nested.h
+        src/include/knhv_control_ioctl.h
+)
+
+# The control and contract-test images are independent WDM services. They
+# share only the versioned ABI and pure nested model; neither image owns the
+# physical VMX root state used by the existing research baseline.
+if(KNHV_BUILD_NESTED_DRIVERS)
+    set(KNHV_CONTROL_SOURCES
+            src/control/control_driver.cpp
+            src/control/control_device.cpp
+            ${KNHV_NESTED_MODEL_SOURCES}
+            src/control/knhv_control_device.h
+    )
+    set(KNHV_NESTED_TEST_SOURCES
+            src/test_driver/nested_test_driver.cpp
+            src/control/control_device.cpp
+            ${KNHV_NESTED_MODEL_SOURCES}
+            src/control/knhv_control_device.h
+    )
+
+    wdk_add_driver(KNHV_Control ${KNHV_CONTROL_SOURCES})
+    wdk_add_driver(KNHV_NestedTest ${KNHV_NESTED_TEST_SOURCES})
+    set_target_properties(KNHV_Control PROPERTIES OUTPUT_NAME "KNHV-Control")
+    set_target_properties(KNHV_NestedTest PROPERTIES OUTPUT_NAME "KNHV-NestedTest")
+    foreach(_knhv_aux_target IN ITEMS KNHV_Control KNHV_NestedTest)
+        target_include_directories(${_knhv_aux_target} PRIVATE
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/src/control"
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/src/nested")
+        target_compile_options(${_knhv_aux_target} PRIVATE
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/W4>"
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>"
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/EHs-c->"
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/GS->"
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:wchar_t->"
+                "$<$<COMPILE_LANGUAGE:C,CXX>:/std:c++17>")
+        target_compile_definitions(${_knhv_aux_target} PRIVATE
+                KNHV_KERNEL_BUILD=1)
+        if(MSVC)
+            set_property(TARGET ${_knhv_aux_target}
+                         PROPERTY MSVC_RUNTIME_LIBRARY "")
+        endif()
+        set_property(TARGET ${_knhv_aux_target} APPEND_STRING PROPERTY
+                     LINK_FLAGS " /INTEGRITYCHECK /DEBUG")
+        if(TARGET WDK::WDMSEC)
+            target_link_libraries(${_knhv_aux_target} WDK::WDMSEC)
+        endif()
+    endforeach()
+    if(KNHV_SIGN)
+        set(_knhv_aux_sign_args sign /v /fd SHA256 /f "${KNHV_SIGN_CERT}")
+        if(KNHV_SIGN_PASSWORD)
+            list(APPEND _knhv_aux_sign_args /p "${KNHV_SIGN_PASSWORD}")
+        endif()
+        if(KNHV_SIGN_TIMESTAMP_URL)
+            list(APPEND _knhv_aux_sign_args /tr "${KNHV_SIGN_TIMESTAMP_URL}"
+                 /td SHA256)
+        endif()
+        foreach(_knhv_aux_target IN ITEMS KNHV_Control KNHV_NestedTest)
+            add_custom_command(
+                    TARGET ${_knhv_aux_target}
+                    POST_BUILD
+                    COMMAND "${KNHV_SIGNTOOL}" ${_knhv_aux_sign_args}
+                            "$<TARGET_FILE:${_knhv_aux_target}>"
+                    COMMENT "Signing $<TARGET_FILE_NAME:${_knhv_aux_target}>"
+                    VERBATIM
+            )
+        endforeach()
+    endif()
+endif()
+
 # The contract test is a normal user-mode executable.  It intentionally does
 # not include WDK headers or execute VMX instructions; it validates the
 # kernel/assembly ABI and can optionally exercise the installed service on an
@@ -259,11 +343,21 @@ if(KNHV_BUILD_TESTS)
             tests/vmx_contract_test.cpp
             tests/test_support.cpp
             tests/source_contract_test.cpp
-            tests/runtime_contract_test.cpp)
+            tests/runtime_contract_test.cpp
+            tests/nested_model_test.cpp
+            src/provider/provider_selection.cpp
+            src/nested/nested_vmcs.cpp
+            src/nested/nested_memory.cpp
+            src/nested/nested_instructions.cpp
+            src/boot/boot_contract.cpp)
     if(_knhv_toolchain_includes)
         target_include_directories(KNHV_ContractTests SYSTEM BEFORE PRIVATE
                                    ${_knhv_toolchain_includes})
     endif()
+    target_include_directories(KNHV_ContractTests PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/nested"
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/boot")
     if(_knhv_user_toolchain_libdirs)
         target_link_directories(KNHV_ContractTests PRIVATE
                                 ${_knhv_user_toolchain_libdirs})

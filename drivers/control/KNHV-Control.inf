@@ -1,0 +1,46 @@
+; control-plane driver for the KNHV provider contract
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+CatalogFile=KNHV-Control.cat
+DriverVer=09/04/2026,1.0.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DriverCopyFiles=13
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverCopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService=KNHV-Control,0x00000002,ControlService
+
+[DefaultUninstall.NTamd64]
+LegacyUninstall=1
+
+[DefaultUninstall.NTamd64.Services]
+DelService=KNHV-Control,0x00000200
+
+[DriverCopyFiles]
+KNHV-Control.sys
+
+[ControlService]
+DisplayName=%ControlServiceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\KNHV-Control.sys
+Security="D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[SourceDisksNames]
+1=%DiskName%,,
+
+[SourceDisksFiles]
+KNHV-Control.sys=1
+
+[Strings]
+ProviderName="KNHV Research"
+ControlServiceDesc="KNHV provider control"
+DiskName="KNHV control package"

@@ -50,20 +50,22 @@ if ($LASTEXITCODE -ne 0) {
     throw "Driver build failed with exit code $LASTEXITCODE."
 }
 
-$driverPath = Join-Path $repoRoot (Join-Path "build\vscode" (Join-Path $Configuration "KNHV.sys"))
-$signArgs = @{
-    DriverPath = $driverPath
-    Certificate = $Certificate
-}
-if ($Password) { $signArgs.Password = $Password }
-if ($TimestampUrl) { $signArgs.TimestampUrl = $TimestampUrl }
-if ($SignTool) { $signArgs.SignTool = $SignTool }
-if ($usingGeneratedCertificate) { $signArgs.AllowUntrustedTestCertificate = $true }
+$driverNames = @("KNHV.sys", "KNHV-Control.sys", "KNHV-NestedTest.sys")
+foreach ($driverName in $driverNames) {
+    $driverPath = Join-Path $repoRoot (Join-Path "build\vscode" (Join-Path $Configuration $driverName))
+    $signArgs = @{
+        DriverPath = $driverPath
+        Certificate = $Certificate
+    }
+    if ($Password) { $signArgs.Password = $Password }
+    if ($TimestampUrl) { $signArgs.TimestampUrl = $TimestampUrl }
+    if ($SignTool) { $signArgs.SignTool = $SignTool }
+    if ($usingGeneratedCertificate) { $signArgs.AllowUntrustedTestCertificate = $true }
 
-Write-Host "Signing KNHV.sys"
-& $signScript @signArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "Driver signing failed with exit code $LASTEXITCODE."
+    Write-Host "Signing $driverName"
+    & $signScript @signArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Driver signing failed for $driverName with exit code $LASTEXITCODE."
+    }
+    Write-Host "Signed SYS: $driverPath"
 }
-
-Write-Host "Signed SYS: $driverPath"

@@ -83,6 +83,99 @@ void CheckProjectIdentity(const fs::path& root, TestState& state) {
     Check(state, "README documents the current project name and layout",
           Contains(readme, "# KNHV") && Contains(readme, "src/core") &&
               Contains(readme, "src/vmx") && Contains(readme, "KNHV.sys"));
+    Check(state, "nested driver targets remain independently buildable",
+          Contains(cmake, "KNHV_BUILD_NESTED_DRIVERS") &&
+              Contains(cmake, "KNHV_Control") &&
+              Contains(cmake, "KNHV_NestedTest") &&
+              Contains(cmake, "KNHV-Control") &&
+              Contains(cmake, "KNHV-NestedTest"));
+    Check(state, "kernel targets enforce W4 and warnings as errors",
+          Contains(cmake, ":/W4>") && Contains(cmake, ":/WX>"));
+}
+
+void CheckNestedImplementation(const fs::path& root, TestState& state) {
+    const std::string abi = Source(root, "src/include/knhv_abi.h", state);
+    const std::string nested = Source(root, "src/include/knhv_nested.h", state);
+    const std::string vmcs = Source(root, "src/nested/nested_vmcs.cpp", state);
+    const std::string instructions =
+        Source(root, "src/nested/nested_instructions.cpp", state);
+    const std::string boot = Source(root, "src/boot/boot_contract.cpp", state);
+    const std::string control =
+        Source(root, "src/control/control_device.cpp", state);
+    const std::string ioctl =
+        Source(root, "src/include/knhv_control_ioctl.h", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "nested ABI is versioned and size checked",
+          Contains(abi, "kAbiVersion") &&
+              Contains(abi, "IsVersionedBufferValid") &&
+              Contains(abi, "kFlagSyntheticSnapshot") &&
+              Contains(abi, "struct HvSessionKey") &&
+              Contains(nested, "struct NestedVcpu"));
+    Check(state, "VMCS12 field rules enforce control masks",
+          Contains(vmcs, "reserved_zero_mask") &&
+              Contains(vmcs, "(requested | allowed0) & allowed1") &&
+              Contains(vmcs, "ValidateEntryState"));
+    Check(state, "nested instruction dispatch separates VMfail and #UD",
+          Contains(instructions, "Vmxon") &&
+              Contains(instructions, "InjectUndefinedInstruction") &&
+              Contains(instructions, "ReflectNestedExit"));
+    Check(state, "BootL0 contract records owner uniqueness and recovery",
+          Contains(boot, "owner_count") && Contains(boot, "Recovery") &&
+              Contains(boot, "HandoffWindows"));
+    Check(state, "control device uses buffered IO and a restricted ACL",
+          Contains(ioctl, "METHOD_BUFFERED") &&
+              Contains(control, "SDDL_DEVOBJ_SYS_ALL_ADM_ALL") &&
+              Contains(control, "IoAcquireRemoveLock") &&
+              Contains(control, "VersionedInputFits") &&
+              Contains(ioctl, "IOCTL_KNHV_RELEASE_SESSION") &&
+              Contains(control, "KnHvDispatchUnsupported") &&
+              Contains(control, "owner_file") &&
+              Contains(control, "ReleaseSessionsForFile") &&
+              Contains(control, "owner_file->FsContext != owner_file"));
+    const std::size_t handler_begin = control.find("NTSTATUS HandleQueryCaps");
+    const std::size_t dispatch_begin =
+        control.find("extern \"C\" NTSTATUS KnHvDispatchCreate");
+    const bool handlers_defer_completion =
+        handler_begin != std::string::npos &&
+        dispatch_begin != std::string::npos && dispatch_begin > handler_begin &&
+        control.substr(handler_begin, dispatch_begin - handler_begin)
+                .find("CompleteIrp") == std::string::npos;
+    Check(state, "remove lock is released before IRP completion",
+          handlers_defer_completion &&
+              ContainsInOrder(control,
+                              {"const ULONG_PTR information = irp->IoStatus.Information;",
+                               "IoReleaseRemoveLock(&extension->remove_lock, irp);",
+                               "return CompleteIrp(irp, result, information);"}));
+
+    const std::string control_inf =
+        Source(root, "drivers/control/KNHV-Control.inf", state);
+    const std::string nested_inf =
+        Source(root, "drivers/nested_test/KNHV-NestedTest.inf", state);
+    Check(state, "the two driver packages have separate services",
+          Contains(control_inf, "AddService=KNHV-Control") &&
+              Contains(nested_inf, "AddService=KNHV-NestedTest") &&
+              Contains(control_inf, "KNHV-Control.cat") &&
+              Contains(nested_inf, "KNHV-NestedTest.cat"));
+    Check(state, "auxiliary driver packages run from the Driver Store",
+          Contains(control_inf, "PnpLockdown=1") &&
+              Contains(control_inf, "DriverCopyFiles=13") &&
+              Contains(control_inf, "ServiceBinary=%13%\\KNHV-Control.sys") &&
+              Contains(nested_inf, "PnpLockdown=1") &&
+              Contains(nested_inf, "DriverCopyFiles=13") &&
+              Contains(nested_inf,
+                       "ServiceBinary=%13%\\KNHV-NestedTest.sys"));
+    Check(state, "auxiliary drivers do not execute physical VMXON",
+          Contains(control, "MakeFallbackCapabilitySnapshot") &&
+              !Contains(control, "__vmx_on") &&
+              !Contains(control, "__writemsr"));
+    Check(state, "synthetic nested capability is laboratory-only",
+          Contains(readme, "kFlagSyntheticSnapshot") &&
+              Contains(readme, "laboratory-only") &&
+              Contains(readme, "file-object binding") &&
+              Contains(readme, "does not verify") &&
+              Contains(control, "synthetic_model") &&
+              Contains(control, "virtualization_ready") &&
+              Contains(control, "!synthetic_model"));
 }
 
 void CheckModuleBoundaries(const fs::path& root, TestState& state) {
@@ -263,6 +356,7 @@ void CheckTeardownContract(const fs::path& root, TestState& state) {
     const std::string stop = Source(root, "src/vmx/vmx_stop.cpp", state);
     const std::string teardown =
         Source(root, "src/vmx/vmx_teardown_state.cpp", state);
+    const std::string crash = Source(root, "src/vmx/vmx_crash.cpp", state);
     const std::string assembly = AssemblySources(root, state);
 
     Check(state, "start claims the lifecycle with an atomic transition",
@@ -285,6 +379,11 @@ void CheckTeardownContract(const fs::path& root, TestState& state) {
     Check(state, "fatal assembly path records before VMXOFF",
           ContainsInOrder(assembly, {"HvCaptureFatalSnapshotPreVmxoff",
                                      "MarkCurrentVcpuParked", "vmxoff"}));
+    Check(state, "native allocations use the current WDK pool API",
+          Contains(lifecycle, "ExAllocatePool2") &&
+              !Contains(lifecycle, "ExAllocatePoolWithTag") &&
+              Contains(crash, "ExAllocatePool2") &&
+              !Contains(crash, "ExAllocatePoolWithTag"));
 }
 
 void CheckFaultInjectionContract(const fs::path& root, TestState& state) {
@@ -364,6 +463,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckLineLimits(root, state);
     CheckNoStaleReferenceNames(root, state);
     CheckProjectIdentity(root, state);
+    CheckNestedImplementation(root, state);
     CheckModuleBoundaries(root, state);
     CheckPublicInterface(root, state);
     CheckAssemblyContract(root, state);
@@ -371,6 +471,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckTeardownContract(root, state);
     CheckFaultInjectionContract(root, state);
     CheckPureModels(state);
+    RunNestedModelContract(root, state);
 }
 
 }  // namespace knhv_tests

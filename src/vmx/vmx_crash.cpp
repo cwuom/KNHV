@@ -69,7 +69,7 @@ bool InitializeHvCrashBlob(u32 cpuCount) {
     // later bugcheck callback dereference freed or unreachable evidence.
     if (g_HvCrashBlob) return false;
 
-    void* memory = ExAllocatePoolWithTag(NonPagedPoolNx, size, TAG_HVCB);
+    void* memory = ExAllocatePool2(POOL_FLAG_NON_PAGED, size, TAG_HVCB);
     if (!memory) return false;
 
     g_HvCrashBlob = static_cast<HvCrashBlob*>(memory);

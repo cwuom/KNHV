@@ -26,7 +26,11 @@ service, and signature results must be collected on the isolated target.
 - fail-closed capability checks
 - orderly multi-processor teardown with bounded retries
 - quarantine when VMX ownership cannot be proven to be released
-- no EPT, nested virtualization, device passthrough, or production support
+- versioned provider and session ABI for a future BootL0 interposer
+- a pure software VMCS12/nested-VMX contract model
+- an isolated `KNHV-NestedTest.sys` contract-test driver
+- no physical BootL0 handoff, EPT/VMCS02 acceleration, device passthrough, or
+  production support
 
 ## Repository layout
 
@@ -36,6 +40,11 @@ service, and signature results must be collected on the isolated target.
 | `src/vmx` | Feature gates, VMCS setup, launch, exits, diagnostics, and stop paths |
 | `src/include` | Public, private, and logging contracts |
 | `src/asm` | VMX entry, instruction wrappers, launch, and restore routines |
+| `src/nested` | Pure VMCS12, VMX instruction, address, and exit model |
+| `src/provider` | Capability-gated provider selection |
+| `src/control` | Shared secure WDM control-device implementation |
+| `src/test_driver` | Independent nested contract-test driver entry point |
+| `drivers` | Separate INF packages for the two control services |
 | `tests` | Source, ABI, artifact, and opt-in runtime checks |
 | `tools` | Build, signing, certificate, and TESTSIGNING helpers |
 
@@ -89,7 +98,25 @@ The output directory is `build/vscode/<Configuration>/` and contains:
 
 - `KNHV.sys`
 - `KNHV.pdb`
+- `KNHV-Control.sys` and `KNHV-Control.pdb`
+- `KNHV-NestedTest.sys` and `KNHV-NestedTest.pdb`
 - `KNHV_ContractTests.exe`
+
+The two auxiliary SYS files expose only the versioned control contract. They do
+not execute physical `VMXON`; the current `KNHV.sys` remains the native,
+late-launch research baseline. A physical top-level KNHV L0 still requires the
+separate UEFI/boot-time handoff described in `.report/嵌套虚拟化.md`.
+
+`KNHV-NestedTest.sys` advertises a deliberately marked
+`kFlagSyntheticSnapshot` so the host-only nested model can be exercised. That
+flag is laboratory-only: it is not evidence of a BootL0 handoff, VMCS02/EPT
+hardware, WHP integration, or transparent passthrough. The current control
+contract keeps `VirtualizationReady=false` for that synthetic path while still
+allowing the model IOCTLs to run. It also uses a bounded session table, a
+generation key, and the creating file-object binding. It still does not verify
+a production image manifest/signature or provide a production broker identity.
+Do not deploy these auxiliary images as a production hypervisor or as a
+security boundary.
 
 The CMake Tools integration exports `compile_commands.json` with the project
 headers and WDK `km` include directory. After changing the WDK or toolchain,
@@ -106,6 +133,10 @@ driver, change TESTSIGNING, or start a service:
 .\build\vscode\Debug\KNHV_ContractTests.exe --root .
 ctest --test-dir build\vscode\Debug --output-on-failure
 ```
+
+The host-only suite includes provider-selection, BootL0 ownership-state, and
+VMCS12/nested-instruction model tests. It does not load either auxiliary
+driver, change TESTSIGNING, or execute VMX instructions.
 
 To validate a built SYS and its matching PDB:
 
