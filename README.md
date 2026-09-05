@@ -31,7 +31,7 @@ compatibility.
 - orderly multi-processor teardown with bounded retries
 - quarantine when VMX ownership cannot be proven to be released
 - versioned provider and session ABI for a future BootL0 interposer
-- a pure software VMCS12/nested-VMX contract model
+- pure software VMCS12/nested-VMX, EPT policy, and TSC/QPC contract models
 - an isolated `KNHV-NestedTest.sys` contract-test driver
 - no physical BootL0 handoff, EPT/VMCS02 acceleration, device passthrough, or
   production support
@@ -45,6 +45,8 @@ compatibility.
 | `src/include` | Public, private, and logging contracts |
 | `src/asm` | VMX entry, instruction wrappers, launch, and restore routines |
 | `src/nested` | Pure VMCS12, VMX instruction, address, and exit model |
+| `src/ept` | Pure EPTP, nested mapping, generation, and debug-lease policy model |
+| `src/time` | Fixed-point TSC transform, calibration, and drift contract model |
 | `src/provider` | Capability-gated provider selection |
 | `src/control` | Shared secure WDM control-device implementation |
 | `src/test_driver` | Independent nested contract-test driver entry point |
@@ -161,9 +163,10 @@ driver, change TESTSIGNING, or start a service:
 ctest --test-dir build\vscode\Debug --output-on-failure
 ```
 
-The host-only suite includes provider-selection, BootL0 ownership-state, and
-VMCS12/nested-instruction model tests. It does not load either auxiliary
-driver, change TESTSIGNING, or execute VMX instructions.
+The host-only suite includes provider-selection, BootL0 ownership-state,
+VMCS12/nested-instruction, EPT mapping/generation, debug-lease, and fixed-point
+TSC/QPC model tests. It does not load either auxiliary driver, change
+TESTSIGNING, or execute VMX instructions.
 
 After the signed `KNHV-NestedTest.sys` test driver is running on an isolated
 x64 Windows target, the dedicated probe can validate its public synthetic

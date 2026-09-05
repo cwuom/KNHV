@@ -312,6 +312,8 @@ endif()
 set(KNHV_NESTED_MODEL_SOURCES
         src/provider/provider_selection.cpp
         src/provider/provider_v2.cpp
+        src/ept/ept_model.cpp
+        src/time/time_contract.cpp
         src/nested/nested_vmcs.cpp
         src/nested/nested_memory.cpp
         src/nested/nested_instructions.cpp
@@ -320,6 +322,8 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/include/knhv_abi.h
         src/include/knhv_provider.h
         src/include/knhv_nested.h
+        src/include/knhv_ept.h
+        src/include/knhv_time.h
         src/include/knhv_control_ioctl.h
 )
 
@@ -406,8 +410,11 @@ if(KNHV_BUILD_TESTS)
             tests/runtime_contract_test.cpp
             tests/nested_model_test.cpp
             tests/provider_v2_test.cpp
+            tests/ept_time_model_test.cpp
             src/provider/provider_selection.cpp
             src/provider/provider_v2.cpp
+            src/ept/ept_model.cpp
+            src/time/time_contract.cpp
             src/nested/nested_vmcs.cpp
             src/nested/nested_memory.cpp
             src/nested/nested_instructions.cpp

@@ -508,6 +508,38 @@ void CheckPreflightContract(const fs::path& root, TestState& state) {
               !Contains(common, "__vmx") && !Contains(common, "__writemsr"));
 }
 
+void CheckEptTimeContract(const fs::path& root, TestState& state) {
+    const std::string ept_header = Source(root, "src/include/knhv_ept.h", state);
+    const std::string ept_source = Source(root, "src/ept/ept_model.cpp", state);
+    const std::string time_header = Source(root, "src/include/knhv_time.h", state);
+    const std::string time_source = Source(root, "src/time/time_contract.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "EPT model exposes bounded pointer and mapping contracts",
+          Contains(ept_header, "EptpConfig") &&
+              Contains(ept_header, "ResolveNestedEpt") &&
+              Contains(ept_header, "CanPublishEptHook") &&
+              Contains(ept_source, "kEptPhysicalAddressMask") &&
+              Contains(ept_source, "kEptMappingFlagHostOwned"));
+    Check(state, "EPT model publishes generations only after acknowledgements",
+          Contains(ept_source, "BeginEptGeneration") &&
+              Contains(ept_source, "AcknowledgeEptGeneration") &&
+              Contains(ept_source, "PublishEptGeneration"));
+    Check(state, "time model uses fixed-point transforms and monotonic gates",
+          Contains(time_header, "TscTransform") &&
+              Contains(time_header, "ComposeTscTransforms") &&
+              Contains(time_source, "_umul128") &&
+              Contains(time_source, "DriftExceeded") &&
+              Contains(time_source, "kTimeFlagMonotonicClamp"));
+    Check(state, "EPT and time models are shared by the build graph",
+          Contains(cmake, "src/ept/ept_model.cpp") &&
+              Contains(cmake, "src/time/time_contract.cpp") &&
+              Contains(cmake, "tests/ept_time_model_test.cpp"));
+    Check(state, "pure EPT and time models contain no physical VMX instructions",
+          !Contains(ept_source, "__vmx") && !Contains(ept_source, "__writemsr") &&
+              !Contains(time_source, "__vmx") &&
+              !Contains(time_source, "__writemsr"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -626,6 +658,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckBenchmarkContract(root, state);
     CheckPreflightContract(root, state);
     CheckAbiV2Contract(root, state);
+    CheckEptTimeContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }
