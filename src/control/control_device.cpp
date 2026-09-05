@@ -139,7 +139,8 @@ void InitializeNestedSession(KnHvClientSession* session) {
 void ReleaseAllSessions(KnHvDeviceExtension* extension) {
     if (extension == nullptr) return;
     for (u32 index = 0; index < kMaxClientSessions; ++index) {
-        extension->sessions[index] = {};
+        KnHvClientSession* session = &extension->sessions[index];
+        RtlZeroMemory(session, sizeof(*session));
     }
     extension->active_sessions = 0;
 }
@@ -150,7 +151,7 @@ void ReleaseSessionsForFile(KnHvDeviceExtension* extension,
     for (u32 index = 0; index < kMaxClientSessions; ++index) {
         KnHvClientSession* session = &extension->sessions[index];
         if (session->active != 0 && session->owner_file == owner_file) {
-            *session = {};
+            RtlZeroMemory(session, sizeof(*session));
             if (extension->active_sessions != 0) --extension->active_sessions;
         }
     }
@@ -455,7 +456,7 @@ NTSTATUS HandleReleaseSession(KnHvDeviceExtension* extension,
         KeReleaseSpinLock(&extension->state_lock, old_irql);
         return SetIrpResult(irp, STATUS_INVALID_HANDLE, 0);
     }
-    *session = {};
+    RtlZeroMemory(session, sizeof(*session));
     if (extension->active_sessions != 0) --extension->active_sessions;
     KeReleaseSpinLock(&extension->state_lock, old_irql);
     return SetIrpResult(irp, STATUS_SUCCESS, 0);

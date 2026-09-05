@@ -455,7 +455,10 @@ void InitializeNestedVcpu(NestedVcpu* vcpu,
                           const NestedCapabilities* capabilities,
                           const NestedMemory* memory) {
     if (vcpu == nullptr) return;
-    *vcpu = {};
+    u8* bytes = reinterpret_cast<u8*>(vcpu);
+    for (u64 index = 0; index < sizeof(*vcpu); ++index) {
+        bytes[index] = 0;
+    }
     vcpu->version = kNestedModelVersion;
     vcpu->size = sizeof(NestedVcpu);
     if (capabilities != nullptr &&

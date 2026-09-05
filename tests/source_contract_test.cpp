@@ -132,6 +132,13 @@ void CheckNestedImplementation(const fs::path& root, TestState& state) {
               Contains(control, "owner_file") &&
               Contains(control, "ReleaseSessionsForFile") &&
               Contains(control, "owner_file->FsContext != owner_file"));
+    Check(state, "large session cleanup avoids stack temporaries",
+          Contains(control, "RtlZeroMemory(session, sizeof(*session));") &&
+              !Contains(control, "extension->sessions[index] = {};") &&
+              !Contains(control, "*session = {};"));
+    Check(state, "nested vcpu initialization avoids stack temporaries",
+          Contains(vmcs, "bytes[index] = 0;") &&
+              !Contains(vmcs, "*vcpu = {};"));
     const std::size_t handler_begin = control.find("NTSTATUS HandleQueryCaps");
     const std::size_t dispatch_begin =
         control.find("extern \"C\" NTSTATUS KnHvDispatchCreate");
