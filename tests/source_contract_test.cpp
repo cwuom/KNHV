@@ -13,9 +13,9 @@ std::string Source(const fs::path& root, std::string_view relative,
 }
 
 void CheckLineLimits(const fs::path& root, TestState& state) {
-    const std::array<fs::path, 4> roots = {
+    const std::array<fs::path, 5> roots = {
         root / "src", root / "tests", root / "tools",
-        root / "HV_PROBE_TESTER"};
+        root / "HV_PROBE_TESTER", root / "benchmarks"};
     for (const fs::path& directory : roots) {
         if (!fs::exists(directory)) continue;
         for (const fs::directory_entry& entry :
@@ -443,6 +443,46 @@ void CheckFaultInjectionContract(const fs::path& root, TestState& state) {
               Contains(state_source, "ShouldInjectFault"));
 }
 
+void CheckBenchmarkContract(const fs::path& root, TestState& state) {
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string build_script =
+        Source(root, "tools/Build-Driver.ps1", state);
+    const std::string run_script =
+        Source(root, "tools/Run-Benchmarks.ps1", state);
+    const std::string readme = Source(root, "README.md", state);
+    const std::string common = Source(root, "benchmarks/bench_common.cpp", state);
+    const std::array<std::string_view, 5> names = {
+        "KNHV_NativeLikeBench", "KNHV_VmxExitBench", "KNHV_TscQpcBench",
+        "KNHV_EptHookBench", "KNHV_DeviceIoBench"};
+    bool targets_present = Contains(cmake, "KNHV_BUILD_BENCHMARKS") &&
+                           Contains(cmake, "bcrypt") &&
+                           Contains(cmake, "KNHV_BENCH_GIT");
+    bool artifacts_documented = true;
+    for (const std::string_view name : names) {
+        targets_present = targets_present && Contains(cmake, name);
+        artifacts_documented =
+            artifacts_documented && Contains(build_script, std::string(name) + ".exe") &&
+            Contains(readme, std::string(name) + ".exe");
+    }
+    Check(state, "benchmark targets and artifact layout are explicit",
+          targets_present && artifacts_documented);
+    Check(state, "benchmark sources are present and user-mode only",
+          fs::exists(root / "benchmarks/bench_common.h") &&
+              fs::exists(root / "benchmarks/bench_common.cpp") &&
+              !Contains(common, "__vmx") && !Contains(common, "__writemsr") &&
+              Contains(common, "knhv-bench-1"));
+    Check(state, "benchmark candidate mode fails closed",
+          Contains(common, "KNHVControl") &&
+              Contains(common, "KNHV_BOOT_L0") &&
+              Contains(common, "not-comparable") &&
+              Contains(common, "kExitBlocked"));
+    Check(state, "benchmark runner records reproducible provenance",
+          Contains(run_script, "knhv-bench-run-1") &&
+              Contains(run_script, "expected_exit_code") &&
+              Contains(run_script, "physical_dma_enabled") &&
+              Contains(run_script, "SkipNativeGate"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -513,6 +553,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckFeatureGates(root, state);
     CheckTeardownContract(root, state);
     CheckFaultInjectionContract(root, state);
+    CheckBenchmarkContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }

@@ -7,10 +7,11 @@
 
 **KanoHypervisor** is a Windows x64 kernel driver for Intel VT-x research and bring-up.
 It is intended for an isolated test installation with a kernel debugger.
+Current status: research and bring-up; it is not a production hypervisor.
 
 ## Validation profile
 
-The primary validation target for this release is:
+The primary validation profile is an isolated reference target:
 
 - Windows 11 25H2, x64
 - Intel Core i7-14700KF
@@ -19,6 +20,9 @@ The primary validation target for this release is:
 
 Host-only contract tests can run on other supported Windows x64 systems. VMX,
 service, and signature results must be collected on the isolated target.
+The compile host is not a runtime validation target; building an artifact there
+does not establish driver, HyperDbg, nested-VMX, passthrough, or performance
+compatibility.
 
 ## Scope
 
@@ -101,6 +105,11 @@ configuration root:
 - `bin/KNHV_ContractTests.exe`
 - `bin/KNHV_NestedProbe.exe`
 - `bin/KNHV_NativeVmxProbe.exe`
+- `bin/KNHV_NativeLikeBench.exe`
+- `bin/KNHV_VmxExitBench.exe`
+- `bin/KNHV_TscQpcBench.exe`
+- `bin/KNHV_EptHookBench.exe`
+- `bin/KNHV_DeviceIoBench.exe`
 - `sys/KNHV.sys`
 - `sys/KNHV-Control.sys`
 - `sys/KNHV-NestedTest.sys`
@@ -111,8 +120,9 @@ native self-test source is `HV_PROBE_TESTER/native_vmx_probe.cpp`.
 
 The two auxiliary SYS files expose only the versioned control contract. They do
 not execute physical `VMXON`; the current `KNHV.sys` remains the native,
-late-launch research baseline. A physical top-level KNHV L0 still requires the
-separate UEFI/boot-time handoff described in `.report/嵌套虚拟化.md`.
+late-launch research baseline. A physical top-level KNHV L0 requires a
+separately validated boot-time handoff and is outside the current release
+profile.
 
 `KNHV-NestedTest.sys` advertises a deliberately marked
 `kFlagSyntheticSnapshot` so the host-only nested model can be exercised. That
@@ -169,6 +179,30 @@ self-test is available as:
 The native probe must not be used as a nested or coexistence test. It checks
 only the existing KNHV VM-exit path and is intentionally separate from the
 synthetic nested-model probe.
+
+The benchmark executables are host-only diagnostic tools. They use the common
+`knhv-bench-1` JSON schema; a `.csv` output contains sample columns only. The
+five tools cover native-like CPU and memory work, TSC/QPC clock sampling,
+synthetic VM-exit accounting, synthetic EPT-hook accounting, and a virtual
+device-I/O queue. They do not execute physical VMX instructions, access PCI
+devices, or enable DMA.
+
+For a local baseline, write results to a directory owned by the caller:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_NativeLikeBench.exe `
+  --mode baseline --workload cpu,mem --duration-ms 1000 --repeat 3 `
+  --out results\native_like.json
+```
+
+`tools/Run-Benchmarks.ps1` runs the host-only suite and records commands,
+provenance, hashes, and result files in the output directory supplied by the
+caller. The `native-l0` and `nested-l1` modes are capability-gated and fail
+closed when a verified provider, owner, or nested capability is unavailable.
+The device-I/O tool accepts only its explicit virtual profile; it never
+detaches, resets, or transfers data to a physical device. Comparison mode
+requires matching workload, scope, configuration, and host provenance before
+reporting a result.
 
 To validate a built SYS and its matching PDB:
 
@@ -245,6 +279,7 @@ installed Visual Studio and WDK rather than hard-coded compiler paths.
 | `tools/Generate-Test-Certificate.ps1` | Create a private Root CA and kernel-code-signing leaf certificate | Writes `certs/` and may update certificate stores |
 | `tools/Sign-Driver.ps1` | Sign an existing SYS and verify Authenticode plus kernel policy | Changes the specified SYS; requires `signtool.exe` and a certificate |
 | `tools/Set-TestSigning.ps1` | Read or change Windows TESTSIGNING state | `-Status` is read-only; `-Enable` and `-Disable` change BCD and require a reboot |
+| `tools/Run-Benchmarks.ps1` | Run the host-only benchmark suite and write a reproducibility manifest | Writes only the caller-selected output directory |
 
 ### Build helper
 

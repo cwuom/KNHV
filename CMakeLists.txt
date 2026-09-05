@@ -115,6 +115,8 @@ option(KNHV_SIGN "Sign the driver as a post-build step" OFF)
 option(KNHV_BUILD_TESTS "Build the user-mode C++ contract/smoke test" ON)
 option(KNHV_BUILD_NESTED_DRIVERS
        "Build the provider control and nested contract-test drivers" ON)
+option(KNHV_BUILD_BENCHMARKS
+       "Build host-only benchmark executables with explicit hardware gates" ON)
 option(KNHV_FAULT_INJECTION
        "Enable deterministic launch fault injection for isolated tests" OFF)
 set(KNHV_TEST_FAIL_CPU "-1" CACHE STRING
@@ -127,6 +129,28 @@ set(KNHV_SIGNTOOL "" CACHE FILEPATH "Path to signtool.exe (required when KNHV_SI
 set(KNHV_SIGN_CERT "" CACHE FILEPATH "PFX containing the signing private key (required when KNHV_SIGN=ON)")
 set(KNHV_SIGN_PASSWORD "" CACHE STRING "PFX password (optional; avoid storing secrets in CMake cache)")
 set(KNHV_SIGN_TIMESTAMP_URL "" CACHE STRING "RFC3161 timestamp URL (optional for test certificates)")
+
+# Embed provenance in benchmark output. A dirty or unknown source state is
+# reported by the executable and cannot be promoted to a release verdict.
+execute_process(
+        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse HEAD
+        OUTPUT_VARIABLE KNHV_BENCH_GIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+if(NOT KNHV_BENCH_GIT)
+    set(KNHV_BENCH_GIT "unknown")
+endif()
+execute_process(
+        COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" status --porcelain
+                           --untracked-files=all
+        OUTPUT_VARIABLE _knhv_git_status
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+if(_knhv_git_status)
+    set(KNHV_BENCH_SOURCE_DIRTY "true")
+else()
+    set(KNHV_BENCH_SOURCE_DIRTY "false")
+endif()
 
 # keep generated images separate from CMake's internal files so a build tree
 # can be copied to a test target without collecting intermediate objects
@@ -481,4 +505,56 @@ if(KNHV_BUILD_TESTS)
         target_link_libraries(KNHV_NativeVmxProbe PRIVATE
                               ${_knhv_native_probe_standard_libraries})
     endif()
+endif()
+
+# Benchmarks are user-mode programs. They measure host or synthetic work and
+# query the versioned control device before a candidate run; they never issue
+# VMX instructions or touch a physical device directly.
+if(KNHV_BUILD_BENCHMARKS)
+    function(knhv_add_benchmark target source_file)
+        add_executable(${target}
+                benchmarks/${source_file}
+                benchmarks/bench_common.cpp
+                benchmarks/bench_common.h)
+        knhv_set_artifact_layout(${target} program)
+        if(_knhv_toolchain_includes)
+            target_include_directories(${target} SYSTEM BEFORE PRIVATE
+                                       ${_knhv_toolchain_includes})
+        endif()
+        target_include_directories(${target} PRIVATE
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
+                                   "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")
+        if(_knhv_user_toolchain_libdirs)
+            target_link_directories(${target} PRIVATE
+                                    ${_knhv_user_toolchain_libdirs})
+        endif()
+        target_compile_definitions(${target} PRIVATE
+                KNHV_BENCH_GIT="${KNHV_BENCH_GIT}"
+                KNHV_BENCH_CONFIGURATION="$<CONFIG>"
+                KNHV_BENCH_SOURCE_DIRTY="${KNHV_BENCH_SOURCE_DIRTY}")
+        target_compile_options(${target} PRIVATE
+                /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+        if(MSVC)
+            set_property(TARGET ${target} PROPERTY
+                         MSVC_RUNTIME_LIBRARY
+                         "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+            set_property(TARGET ${target} APPEND_STRING PROPERTY
+                         LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+        endif()
+        target_link_libraries(${target} PRIVATE bcrypt advapi32)
+        if(_knhv_saved_cxx_standard_libraries)
+            set(_knhv_bench_standard_libraries
+                "${_knhv_saved_cxx_standard_libraries}")
+            separate_arguments(_knhv_bench_standard_libraries WINDOWS_COMMAND
+                               "${_knhv_bench_standard_libraries}")
+            target_link_libraries(${target} PRIVATE
+                                  ${_knhv_bench_standard_libraries})
+        endif()
+    endfunction()
+
+    knhv_add_benchmark(KNHV_NativeLikeBench native_like_bench.cpp)
+    knhv_add_benchmark(KNHV_VmxExitBench vmexit_bench.cpp)
+    knhv_add_benchmark(KNHV_TscQpcBench tsc_qpc_bench.cpp)
+    knhv_add_benchmark(KNHV_EptHookBench ept_hook_bench.cpp)
+    knhv_add_benchmark(KNHV_DeviceIoBench device_io_bench.cpp)
 endif()

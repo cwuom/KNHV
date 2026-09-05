@@ -207,6 +207,7 @@ $configureArgs += @(
     "-DKNHV_SIGN=OFF",
     "-DKNHV_BUILD_TESTS=ON",
     "-DKNHV_BUILD_NESTED_DRIVERS=ON",
+    "-DKNHV_BUILD_BENCHMARKS=ON",
     "-DKNHV_ARTIFACT_ROOT=$BuildDirectory",
     "-DWDK_WINVER=0x0A00"
 )
@@ -249,7 +250,12 @@ foreach ($expectedDriver in $expectedDrivers) {
 $expectedPrograms = @(
     "KNHV_ContractTests.exe",
     "KNHV_NestedProbe.exe",
-    "KNHV_NativeVmxProbe.exe"
+    "KNHV_NativeVmxProbe.exe",
+    "KNHV_NativeLikeBench.exe",
+    "KNHV_VmxExitBench.exe",
+    "KNHV_TscQpcBench.exe",
+    "KNHV_EptHookBench.exe",
+    "KNHV_DeviceIoBench.exe"
 )
 foreach ($expectedProgram in $expectedPrograms) {
     $programPath = Join-Path $programOutputDirectory $expectedProgram
