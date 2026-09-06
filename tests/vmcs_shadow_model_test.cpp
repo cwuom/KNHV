@@ -56,6 +56,12 @@ void CheckVmcsShadowValidation(TestState& state) {
           knhv::IsVmcsShadowConfigValid(
               &config, capabilities.physical_address_bits,
               capabilities.max_fields));
+    auto null_page_config = config;
+    null_page_config.link_pointer = 0;
+    Check(state, "VMCS shadow config rejects a null enabled link page",
+          !knhv::IsVmcsShadowConfigValid(
+              &null_page_config, capabilities.physical_address_bits,
+              capabilities.max_fields));
     config.flags &= ~knhv::kVmcsShadowEnableReadBitmap;
     config.read_bitmap_physical = knhv::kVmcsShadowNoLinkPointer;
     Check(state, "disabled VMCS shadow bitmap has no physical page",

@@ -11,7 +11,7 @@ bool IsVersionedSizeValid(u32 version, u32 size, u32 required) {
 }
 
 bool IsPhysicalPage(u64 address, u32 bits) {
-    return address != kVmcsShadowNoLinkPointer &&
+    return address != 0 && address != kVmcsShadowNoLinkPointer &&
            (address & (kVmcsShadowPageSize - 1ULL)) == 0 && bits >= 12U &&
            bits <= kVmcsShadowMaxPhysicalAddressBits && (address >> bits) == 0;
 }
