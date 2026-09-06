@@ -31,7 +31,8 @@ compatibility.
 - orderly multi-processor teardown with bounded retries
 - quarantine when VMX ownership cannot be proven to be released
 - versioned provider and session ABI for a future BootL0 interposer
-- pure software VMCS12/nested-VMX, EPT policy, and TSC/QPC contract models
+- pure software VMCS12/nested-VMX, VMCS shadow, EPT policy, and TSC/QPC contract
+  models
 - an isolated `KNHV-NestedTest.sys` contract-test driver
 - a read-only Windows Hypervisor Platform capability broker
 - no physical BootL0 handoff, EPT/VMCS02 acceleration, device passthrough, or
@@ -45,7 +46,7 @@ compatibility.
 | `src/vmx` | Feature gates, VMCS setup, launch, exits, diagnostics, and stop paths |
 | `src/include` | Public, private, and logging contracts |
 | `src/asm` | VMX entry, instruction wrappers, launch, and restore routines |
-| `src/nested` | Pure VMCS12, VMX instruction, address, and exit model |
+| `src/nested` | VMCS12, VMCS shadow, VMX instruction, address, and exit models |
 | `src/ept` | Pure EPTP, nested mapping, generation, and debug-lease policy model |
 | `src/time` | Fixed-point TSC transform, calibration, and drift contract model |
 | `src/iommu` | Device, DMA-domain, and quarantine contract model |

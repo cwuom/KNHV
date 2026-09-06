@@ -581,6 +581,39 @@ void CheckVmcs02Contract(const fs::path& root, TestState& state) {
               Contains(test, "pointer outside the vCPU table"));
 }
 
+void CheckVmcsShadowContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_vmcs_shadow.h", state);
+    const std::string source =
+        Source(root, "src/nested/vmcs_shadow_model.cpp", state);
+    const std::string test =
+        Source(root, "tests/vmcs_shadow_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "VMCS shadow exposes link and bitmap contracts",
+          Contains(header, "VmcsShadowCapabilities") &&
+              Contains(header, "VmcsShadowConfig") &&
+              Contains(header, "VmcsShadowImage") &&
+              Contains(source, "ConfigMatchesCapabilities"));
+    Check(state, "VMCS shadow routes bitmap misses to the shadow image",
+          Contains(source, "ClassifyVmcsShadowAccess") &&
+              Contains(source, "ApplyVmcsShadowAccess") &&
+              Contains(source, "ReflectExit") &&
+              Contains(source, "dirty_bitmap"));
+    Check(state, "VMCS shadow lifecycle gates clear, rebind, and quarantine",
+          Contains(source, "ClearVmcsShadow") &&
+              Contains(source, "RebindVmcsShadow") &&
+              Contains(source, "QuarantineVmcsShadow") &&
+              Contains(test, "CPU migration") &&
+              Contains(test, "quarantine blocks"));
+    Check(state, "VMCS shadow model is wired into drivers and host tests",
+          Contains(cmake, "src/nested/vmcs_shadow_model.cpp") &&
+              Contains(cmake, "tests/vmcs_shadow_model_test.cpp"));
+    Check(state, "VMCS shadow model performs no physical VMX operation",
+          !Contains(source, "__vmx") && !Contains(source, "__vmread") &&
+              !Contains(source, "__vmwrite") && !Contains(source, "VMWRITE") &&
+              !Contains(source, "VMLAUNCH"));
+}
+
 void CheckIommuContract(const fs::path& root, TestState& state) {
     const std::string header = Source(root, "src/include/knhv_iommu.h", state);
     const std::string source = Source(root, "src/iommu/iommu_model.cpp", state);
@@ -900,6 +933,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckAbiV2Contract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
+    CheckVmcsShadowContract(root, state);
     CheckIommuContract(root, state);
     CheckExitContract(root, state);
     CheckCpuPolicyContract(root, state);
