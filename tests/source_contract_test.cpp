@@ -592,6 +592,31 @@ void CheckIommuContract(const fs::path& root, TestState& state) {
               !Contains(source, "__vmx") && !Contains(source, "__writemsr"));
 }
 
+void CheckExitContract(const fs::path& root, TestState& state) {
+    const std::string header = Source(root, "src/include/knhv_exit.h", state);
+    const std::string source = Source(root, "src/exit/exit_model.cpp", state);
+    const std::string test = Source(root, "tests/exit_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "exit model separates policy, records, and decisions",
+          Contains(header, "ExitPolicy") && Contains(header, "ExitRecord") &&
+              Contains(header, "ExitDecision") &&
+              Contains(source, "EvaluateExit"));
+    Check(state, "exit model reflects approved VMX and EPT paths",
+          Contains(source, "kExitPolicyReflectVmx") &&
+              Contains(source, "kExitPolicyReflectEpt") &&
+              Contains(source, "ReflectToL1"));
+    Check(state, "exit model quarantines unknown and host-owned exits",
+          Contains(source, "ExitClass::Unknown") &&
+              Contains(source, "kExitRecordHostOwned") &&
+              Contains(test, "unknown exits never resume"));
+    Check(state, "exit model is included in driver and host test graphs",
+          Contains(cmake, "src/exit/exit_model.cpp") &&
+              Contains(cmake, "tests/exit_model_test.cpp"));
+    Check(state, "exit model executes no VMX or device operation",
+          !Contains(source, "__vmx") && !Contains(source, "__writemsr") &&
+              !Contains(source, "DeviceIoControl"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -713,6 +738,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckIommuContract(root, state);
+    CheckExitContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }
