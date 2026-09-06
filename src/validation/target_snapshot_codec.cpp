@@ -172,10 +172,10 @@ u32 GetTargetEvidenceSnapshotWireSize(u32 cpu_sample_count,
 TargetEvidenceSnapshotCodecStatus InspectTargetEvidenceSnapshotPackage(
     const u8* input, u32 input_size,
     TargetEvidenceSnapshotWireHeader* header) {
+    if (header != nullptr) *header = {};
     if (input == nullptr || header == nullptr) {
         return TargetEvidenceSnapshotCodecStatus::InvalidArgument;
     }
-    *header = {};
     if (input_size < kTargetEvidenceSnapshotWireHeaderSize ||
         input_size > kTargetEvidenceSnapshotWireMaxSize) {
         return TargetEvidenceSnapshotCodecStatus::InvalidLength;
@@ -246,12 +246,12 @@ TargetEvidenceSnapshotCodecStatus DecodeTargetEvidenceSnapshotPackage(
     CpuMatrixSample* cpu_samples, u32 cpu_capacity, u32* cpu_sample_count,
     VmxCapabilitySample* vmx_samples, u32 vmx_capacity,
     u32* vmx_sample_count) {
+    ClearDecodeOutputs(snapshot, cpu_samples, cpu_sample_count, vmx_samples,
+                      vmx_sample_count);
     if (snapshot == nullptr || cpu_sample_count == nullptr ||
         vmx_sample_count == nullptr) {
         return TargetEvidenceSnapshotCodecStatus::InvalidArgument;
     }
-    ClearDecodeOutputs(snapshot, cpu_samples, cpu_sample_count, vmx_samples,
-                      vmx_sample_count);
     TargetEvidenceSnapshotWireHeader header{};
     const TargetEvidenceSnapshotCodecStatus inspect_status =
         InspectTargetEvidenceSnapshotPackage(input, input_size, &header);

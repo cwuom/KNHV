@@ -119,6 +119,17 @@ knhv::TargetEvidenceSnapshot MakeNativeCapability(
     return snapshot;
 }
 
+knhv::TargetEvidenceSnapshotWireHeader ReadHeader(const knhv::u8* bytes) {
+    knhv::TargetEvidenceSnapshotWireHeader header{};
+    std::memcpy(&header, bytes, sizeof(header));
+    return header;
+}
+
+void WriteHeader(knhv::u8* bytes,
+                 const knhv::TargetEvidenceSnapshotWireHeader& header) {
+    std::memcpy(bytes, &header, sizeof(header));
+}
+
 void CheckAbiAndSizing(TestState& state) {
     Check(state, "snapshot codec header ABI is fixed",
           sizeof(knhv::TargetEvidenceSnapshotWireHeader) == 64U &&
@@ -229,6 +240,71 @@ void CheckMalformedPackages(TestState& state) {
               bad_version.data(), written, &version_header) ==
               knhv::TargetEvidenceSnapshotCodecStatus::UnsupportedVersion);
 
+    auto bad_magic = encoded;
+    auto magic_header = ReadHeader(bad_magic.data());
+    magic_header.magic[0] ^= 1U;
+    WriteHeader(bad_magic.data(), magic_header);
+    Check(state, "snapshot codec rejects an invalid magic",
+          knhv::InspectTargetEvidenceSnapshotPackage(
+              bad_magic.data(), written, &version_header) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidHeader);
+
+    auto bad_reserved = encoded;
+    auto reserved_header = ReadHeader(bad_reserved.data());
+    reserved_header.reserved2 = 1U;
+    WriteHeader(bad_reserved.data(), reserved_header);
+    Check(state, "snapshot codec rejects nonzero reserved fields",
+          knhv::InspectTargetEvidenceSnapshotPackage(
+              bad_reserved.data(), written, &version_header) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidHeader);
+
+    auto bad_count = encoded;
+    auto count_header = ReadHeader(bad_count.data());
+    count_header.cpu_sample_count = knhv::kCpuMatrixMaxProcessors + 1U;
+    WriteHeader(bad_count.data(), count_header);
+    Check(state, "snapshot codec rejects sample count overflow",
+          knhv::InspectTargetEvidenceSnapshotPackage(
+              bad_count.data(), written, &version_header) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidLength);
+
+    auto bad_payload = encoded;
+    auto payload_header = ReadHeader(bad_payload.data());
+    payload_header.payload_size += 1U;
+    WriteHeader(bad_payload.data(), payload_header);
+    Check(state, "snapshot codec rejects payload length mismatch",
+          knhv::InspectTargetEvidenceSnapshotPackage(
+              bad_payload.data(), written, &version_header) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidLength);
+
+    auto bad_envelope = encoded;
+    auto envelope_header = ReadHeader(bad_envelope.data());
+    envelope_header.envelope_size += 1U;
+    WriteHeader(bad_envelope.data(), envelope_header);
+    Check(state, "snapshot codec rejects envelope length mismatch",
+          knhv::InspectTargetEvidenceSnapshotPackage(
+              bad_envelope.data(), written, &version_header) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidLength);
+
+    knhv::TargetEvidenceSnapshotWireHeader cleared_header{};
+    cleared_header.version = 99U;
+    const auto inspect_argument_status =
+        knhv::InspectTargetEvidenceSnapshotPackage(
+            nullptr, 0U, &cleared_header);
+    bool header_cleared = true;
+    const auto zero_header = knhv::TargetEvidenceSnapshotWireHeader{};
+    header_cleared =
+        std::memcmp(&cleared_header, &zero_header, sizeof(zero_header)) == 0;
+    Check(state, "snapshot codec clears inspect output on invalid input",
+          inspect_argument_status ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidArgument &&
+              header_cleared);
+
+    Check(state, "snapshot codec rejects input above the package limit",
+          knhv::InspectTargetEvidenceSnapshotPackage(
+              encoded.data(), knhv::kTargetEvidenceSnapshotWireMaxSize + 1U,
+              &version_header) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidLength);
+
     Check(state, "snapshot codec rejects truncation",
           knhv::InspectTargetEvidenceSnapshotPackage(
               encoded.data(), written - 1U, &version_header) ==
@@ -269,7 +345,50 @@ void CheckDecodeCapacityAndArguments(TestState& state) {
           knhv::DecodeTargetEvidenceSnapshotPackage(
               encoded.data(), written, &decoded, nullptr, 0U, nullptr, nullptr,
               0U, &vmx_count) ==
-              knhv::TargetEvidenceSnapshotCodecStatus::InvalidArgument);
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidArgument &&
+              vmx_count == 0U);
+
+    const auto cpu_source = MakeCpuSample();
+    const auto vmx_source = MakeVmxSample();
+    const auto native_source = MakeNativeCapability(cpu_source, vmx_source);
+    const knhv::u32 native_size =
+        knhv::GetTargetEvidenceSnapshotWireSize(1U, 1U);
+    std::vector<knhv::u8> native_encoded(native_size);
+    knhv::u32 native_written = 0U;
+    const auto native_encode_status =
+        knhv::EncodeTargetEvidenceSnapshotPackage(
+            &native_source, &cpu_source, 1U, &vmx_source, 1U,
+            native_encoded.data(), native_size, &native_written);
+    knhv::CpuMatrixSample cpu_output{};
+    knhv::VmxCapabilitySample vmx_output{};
+    knhv::u32 native_cpu_count = 7U;
+    knhv::u32 native_vmx_count = 7U;
+    knhv::TargetEvidenceSnapshot native_decoded{};
+    std::memset(&native_decoded, 0xA5, sizeof(native_decoded));
+    const auto capacity_status =
+        knhv::DecodeTargetEvidenceSnapshotPackage(
+            native_encoded.data(), native_written, &native_decoded,
+            &cpu_output, 0U, &native_cpu_count, &vmx_output, 0U,
+            &native_vmx_count);
+    const auto zero_snapshot = knhv::TargetEvidenceSnapshot{};
+    Check(state, "snapshot codec fails closed on raw sample capacity",
+          native_encode_status ==
+              knhv::TargetEvidenceSnapshotCodecStatus::Success &&
+              capacity_status ==
+                  knhv::TargetEvidenceSnapshotCodecStatus::BufferTooSmall &&
+              native_cpu_count == 0U && native_vmx_count == 0U &&
+              std::memcmp(&native_decoded, &zero_snapshot,
+                          sizeof(zero_snapshot)) == 0);
+
+    knhv::u32 null_snapshot_cpu_count = 5U;
+    knhv::u32 null_snapshot_vmx_count = 6U;
+    Check(state, "snapshot codec clears counters with a null snapshot",
+          knhv::DecodeTargetEvidenceSnapshotPackage(
+              encoded.data(), written, nullptr, nullptr, 0U,
+              &null_snapshot_cpu_count, nullptr, 0U,
+              &null_snapshot_vmx_count) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::InvalidArgument &&
+              null_snapshot_cpu_count == 0U && null_snapshot_vmx_count == 0U);
 }
 
 }  // namespace
