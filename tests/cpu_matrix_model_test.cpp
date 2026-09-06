@@ -48,6 +48,10 @@ void CheckSampleValidation(TestState& state) {
     Check(state, "CPU matrix keeps affinity failures structurally valid",
           knhv::IsCpuMatrixSampleValid(&null_sample) &&
               !knhv::IsCpuMatrixSampleUsable(&null_sample));
+    auto contradictory_status = sample;
+    contradictory_status.status |= knhv::kCpuMatrixSampleMigrated;
+    Check(state, "CPU matrix rejects contradictory sample status flags",
+          !knhv::IsCpuMatrixSampleValid(&contradictory_status));
     auto unknown_feature = sample;
     unknown_feature.feature_flags |= 1ULL << 63;
     Check(state, "CPU matrix rejects unknown feature bits",
@@ -84,6 +88,10 @@ void CheckSummaryStates(TestState& state) {
               summary.state == static_cast<std::uint32_t>(
                   knhv::CpuMatrixState::Incomplete) &&
               summary.invalid_count == 1);
+    samples[1] = samples[0];
+    samples[1].logical_index = 1;
+    Check(state, "CPU matrix rejects duplicate processor coordinates",
+          !knhv::BuildCpuMatrixSummary(samples, 2, 2, &summary));
     Check(state, "CPU matrix reports an empty expected set",
           knhv::BuildCpuMatrixSummary(nullptr, 0, 0, &summary) &&
               summary.state == static_cast<std::uint32_t>(
@@ -103,6 +111,10 @@ void CheckSummaryGuards(TestState& state) {
     Check(state, "CPU matrix rejects a tampered summary",
           knhv::BuildCpuMatrixSummary(&sample, 1, 1, &summary) &&
               (summary.feature_union |= 1ULL << 63, true) &&
+              !knhv::IsCpuMatrixSummaryValid(&summary));
+    Check(state, "CPU matrix rejects a tampered summary flag",
+          knhv::BuildCpuMatrixSummary(&sample, 1, 1, &summary) &&
+              (summary.flags &= ~knhv::kCpuMatrixSummaryAllVmx, true) &&
               !knhv::IsCpuMatrixSummaryValid(&summary));
 }
 

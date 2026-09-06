@@ -119,6 +119,8 @@ option(KNHV_BUILD_BENCHMARKS
        "Build host-only benchmark executables with explicit hardware gates" ON)
 option(KNHV_BUILD_PREFLIGHT
        "Build the read-only capability and ownership preflight executable" ON)
+option(KNHV_BUILD_CPU_MATRIX
+       "Build the read-only per-processor capability matrix executable" ON)
 option(KNHV_BUILD_WHP_BROKER
        "Build the read-only WHP capability broker executable" ON)
 option(KNHV_FAULT_INJECTION
@@ -684,5 +686,43 @@ if(KNHV_BUILD_PREFLIGHT)
                            "${_knhv_preflight_standard_libraries}")
         target_link_libraries(KNHV_Preflight PRIVATE
                               ${_knhv_preflight_standard_libraries})
+    endif()
+endif()
+
+# The CPU matrix is a separate read-only artifact so a target machine can
+# collect per-processor CPUID evidence without invoking the broader preflight
+# checks or touching the driver service.
+if(KNHV_BUILD_CPU_MATRIX)
+    add_executable(KNHV_CpuMatrix
+            preflight/cpu_matrix_probe.cpp
+            src/vmx/cpu_matrix_model.cpp
+            src/include/knhv_cpu_matrix.h)
+    knhv_set_artifact_layout(KNHV_CpuMatrix program)
+    if(_knhv_toolchain_includes)
+        target_include_directories(KNHV_CpuMatrix SYSTEM BEFORE PRIVATE
+                                   ${_knhv_toolchain_includes})
+    endif()
+    target_include_directories(KNHV_CpuMatrix PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/include")
+    if(_knhv_user_toolchain_libdirs)
+        target_link_directories(KNHV_CpuMatrix PRIVATE
+                                ${_knhv_user_toolchain_libdirs})
+    endif()
+    target_compile_options(KNHV_CpuMatrix PRIVATE
+            /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    if(MSVC)
+        set_property(TARGET KNHV_CpuMatrix PROPERTY
+                     MSVC_RUNTIME_LIBRARY
+                     "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET KNHV_CpuMatrix APPEND_STRING PROPERTY
+                     LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+    endif()
+    if(_knhv_saved_cxx_standard_libraries)
+        set(_knhv_cpu_matrix_standard_libraries
+            "${_knhv_saved_cxx_standard_libraries}")
+        separate_arguments(_knhv_cpu_matrix_standard_libraries WINDOWS_COMMAND
+                           "${_knhv_cpu_matrix_standard_libraries}")
+        target_link_libraries(KNHV_CpuMatrix PRIVATE
+                              ${_knhv_cpu_matrix_standard_libraries})
     endif()
 endif()

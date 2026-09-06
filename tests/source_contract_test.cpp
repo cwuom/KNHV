@@ -508,6 +508,37 @@ void CheckPreflightContract(const fs::path& root, TestState& state) {
               !Contains(common, "__vmx") && !Contains(common, "__writemsr"));
 }
 
+void CheckCpuMatrixProbeContract(const fs::path& root, TestState& state) {
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string presets = Source(root, "CMakePresets.json", state);
+    const std::string build_script =
+        Source(root, "tools/Build-Driver.ps1", state);
+    const std::string readme = Source(root, "README.md", state);
+    const std::string probe =
+        Source(root, "preflight/cpu_matrix_probe.cpp", state);
+    Check(state, "CPU matrix probe has a reproducible executable artifact",
+          Contains(cmake, "KNHV_BUILD_CPU_MATRIX") &&
+              Contains(cmake, "KNHV_CpuMatrix") &&
+              Contains(presets, "KNHV_CpuMatrix") &&
+              Contains(build_script, "KNHV_CpuMatrix.exe") &&
+              Contains(readme, "KNHV_CpuMatrix.exe"));
+    Check(state, "CPU matrix probe restores affinity and records CPUID",
+          Contains(probe, "GetThreadGroupAffinity") &&
+              Contains(probe, "SetThreadGroupAffinity") &&
+              Contains(probe, "GetCurrentProcessorNumberEx") &&
+              Contains(probe, "__cpuidex") &&
+              Contains(probe, "knhv-cpu-matrix-1") &&
+              Contains(probe, "affinity_restored"));
+    Check(state, "CPU matrix probe never performs privileged bring-up",
+          Contains(probe, "read_only") &&
+              Contains(probe, "privileged_controls") &&
+              Contains(probe, "no VMXON") &&
+              !Contains(probe, "__vmx") &&
+              !Contains(probe, "__readmsr") &&
+              !Contains(probe, "__writemsr") &&
+              !Contains(probe, "DeviceIoControl"));
+}
+
 void CheckEptTimeContract(const fs::path& root, TestState& state) {
     const std::string ept_header = Source(root, "src/include/knhv_ept.h", state);
     const std::string ept_source = Source(root, "src/ept/ept_model.cpp", state);
@@ -961,6 +992,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckFaultInjectionContract(root, state);
     CheckBenchmarkContract(root, state);
     CheckPreflightContract(root, state);
+    CheckCpuMatrixProbeContract(root, state);
     CheckAbiV2Contract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);

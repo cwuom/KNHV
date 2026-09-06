@@ -209,6 +209,7 @@ $configureArgs += @(
     "-DKNHV_BUILD_NESTED_DRIVERS=ON",
     "-DKNHV_BUILD_BENCHMARKS=ON",
     "-DKNHV_BUILD_PREFLIGHT=ON",
+    "-DKNHV_BUILD_CPU_MATRIX=ON",
     "-DKNHV_ARTIFACT_ROOT=$BuildDirectory",
     "-DWDK_WINVER=0x0A00"
 )
@@ -258,6 +259,7 @@ $expectedPrograms = @(
     "KNHV_EptHookBench.exe",
     "KNHV_DeviceIoBench.exe",
     "KNHV_Preflight.exe",
+    "KNHV_CpuMatrix.exe",
     "KNHV_WHPBroker.exe"
 )
 foreach ($expectedProgram in $expectedPrograms) {

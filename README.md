@@ -46,7 +46,7 @@ compatibility.
 | Path | Responsibility |
 | --- | --- |
 | `src/core` | Driver entry, lifecycle facade, and shared runtime state |
-| `src/vmx` | Feature gates, VMCS setup, launch, exits, diagnostics, and stop paths |
+| `src/vmx` | Feature gates, VMCS setup, launch, exits, diagnostics, stop paths, and CPU capability model |
 | `src/include` | Public, private, and logging contracts |
 | `src/asm` | VMX entry, instruction wrappers, launch, and restore routines |
 | `src/nested` | VMCS12, VMCS shadow, VMX instruction, address, and exit models |
@@ -123,6 +123,7 @@ configuration root:
 - `bin/KNHV_EptHookBench.exe`
 - `bin/KNHV_DeviceIoBench.exe`
 - `bin/KNHV_Preflight.exe`
+- `bin/KNHV_CpuMatrix.exe`
 - `bin/KNHV_WHPBroker.exe`
 - `sys/KNHV.sys`
 - `sys/KNHV-Control.sys`
@@ -233,6 +234,22 @@ reports CPUID, topology, firmware-table, Secure Boot, DeviceGuard, WHP, service,
 and provider observations in `knhv-preflight-1` JSON. Unknown privileged state
 is retained as `unknown` and blocks a `native-l0` profile; the tool never changes
 boot policy, loads a driver, or executes VMX instructions.
+
+`KNHV_CpuMatrix.exe` is a separate read-only target-machine probe. It temporarily
+binds one user-mode thread to each active logical processor, records the
+observable CPUID feature set, restores the original affinity, and emits a
+`knhv-cpu-matrix-1` JSON file. A `pass` requires a complete uniform matrix with
+VMX and Invariant TSC; a blocked result is expected when a hypervisor owns VMX,
+affinity cannot be restored, or processors expose different features. VMX
+control MSRs, EPT/VPID, and IOMMU are reported as `unknown` because they need
+privileged target-side validation.
+
+Run it once on the isolated validation target after copying the matching build:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_CpuMatrix.exe `
+  --out results\cpu_matrix.json
+```
 
 `KNHV_WHPBroker.exe` dynamically loads the system `WinHvPlatform.dll` and
 queries `WHvGetCapability` to emit a `knhv-whp-probe-1` JSON snapshot. It does

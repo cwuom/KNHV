@@ -29,6 +29,7 @@ bool SameIdentity(const CpuMatrixSample& left,
            left.hypervisor_edx == right.hypervisor_edx &&
            left.max_basic_leaf == right.max_basic_leaf &&
            left.max_extended_leaf == right.max_extended_leaf &&
+           left.leaf7_max_subleaf == right.leaf7_max_subleaf &&
            left.physical_address_bits == right.physical_address_bits &&
            left.linear_address_bits == right.linear_address_bits;
 }
@@ -46,12 +47,20 @@ void InitializeSummary(CpuMatrixSummary* summary, u32 expected_count,
 }  // namespace
 
 bool IsCpuMatrixSampleValid(const CpuMatrixSample* sample) {
+    constexpr u32 kFailureFlags = kCpuMatrixSampleAffinityFailed |
+                                  kCpuMatrixSampleMigrated |
+                                  kCpuMatrixSampleCpuidFailed;
     if (sample == nullptr ||
         !IsVersionedSizeValid(sample->version, sample->size,
                               sizeof(CpuMatrixSample)) ||
         sample->logical_index >= kCpuMatrixMaxProcessors ||
+        sample->processor_group > 0xFFFFU ||
         sample->processor_number >= sizeof(u64) * 8U ||
         (sample->status & ~kCpuMatrixKnownSampleStatusMask) != 0 ||
+        ((sample->status & kCpuMatrixSampleCollected) != 0 &&
+         (sample->status & kFailureFlags) != 0) ||
+        ((sample->status & (kCpuMatrixSampleCollected | kFailureFlags)) ==
+         0) ||
         (sample->feature_flags & ~kCpuMatrixKnownFeatureMask) != 0 ||
         sample->max_basic_leaf >= 0x80000000U ||
         sample->physical_address_bits > 52U ||
@@ -62,8 +71,8 @@ bool IsCpuMatrixSampleValid(const CpuMatrixSample* sample) {
     if (IsCollected(*sample)) {
         if (sample->max_basic_leaf < 1U ||
             sample->max_extended_leaf < 0x80000000U ||
-            sample->vendor_ebx == 0U && sample->vendor_ecx == 0U &&
-                sample->vendor_edx == 0U) {
+            (sample->vendor_ebx == 0U && sample->vendor_ecx == 0U &&
+             sample->vendor_edx == 0U)) {
             return false;
         }
     }
@@ -104,6 +113,16 @@ bool BuildCpuMatrixSummary(const CpuMatrixSample* samples, u32 sample_count,
             structure_valid = false;
             break;
         }
+        for (u32 prior = 0; prior < index; ++prior) {
+            const CpuMatrixSample& previous = samples[prior];
+            if (sample.logical_index == previous.logical_index ||
+                (sample.processor_group == previous.processor_group &&
+                 sample.processor_number == previous.processor_number)) {
+                structure_valid = false;
+                break;
+            }
+        }
+        if (!structure_valid) break;
         if (!IsCpuMatrixSampleUsable(&sample)) {
             ++summary->invalid_count;
             continue;
@@ -198,6 +217,29 @@ bool IsCpuMatrixSummaryValid(const CpuMatrixSummary* summary) {
         summary->reserved[2] != 0) {
         return false;
     }
+    const bool all_vmx =
+        summary->valid_count != 0U &&
+        (summary->feature_intersection & kCpuMatrixFeatureVmx) != 0;
+    const bool all_invariant_tsc =
+        summary->valid_count != 0U &&
+        (summary->feature_intersection & kCpuMatrixFeatureInvariantTsc) != 0;
+    const bool any_hypervisor =
+        (summary->feature_union & kCpuMatrixFeatureHypervisor) != 0;
+    const bool has_invalid = summary->invalid_count != 0U;
+    const bool samples_complete =
+        summary->expected_count == summary->sample_count &&
+        summary->valid_count == summary->expected_count;
+    if (((summary->flags & kCpuMatrixSummaryAllVmx) != 0) != all_vmx ||
+        ((summary->flags & kCpuMatrixSummaryAllInvariantTsc) != 0) !=
+            all_invariant_tsc ||
+        ((summary->flags & kCpuMatrixSummaryAnyHypervisor) != 0) !=
+            any_hypervisor ||
+        ((summary->flags & kCpuMatrixSummaryHasInvalidSamples) != 0) !=
+            has_invalid ||
+        ((summary->flags & kCpuMatrixSummarySamplesComplete) != 0) !=
+            samples_complete) {
+        return false;
+    }
     const auto state = static_cast<CpuMatrixState>(summary->state);
     if (state == CpuMatrixState::Empty) {
         return summary->expected_count == 0U && summary->sample_count == 0U &&
@@ -205,11 +247,18 @@ bool IsCpuMatrixSummaryValid(const CpuMatrixSummary* summary) {
     }
     if (state == CpuMatrixState::CompleteUniform ||
         state == CpuMatrixState::CompleteMixed) {
-        return summary->expected_count == summary->sample_count &&
-               summary->expected_count != 0U &&
-               summary->invalid_count == 0U &&
-               (summary->flags & kCpuMatrixSummarySamplesComplete) != 0;
+        if (summary->expected_count != summary->sample_count ||
+            summary->expected_count == 0U || summary->invalid_count != 0U ||
+            (summary->flags & kCpuMatrixSummarySamplesComplete) == 0) {
+            return false;
+        }
+        if (state == CpuMatrixState::CompleteUniform) {
+            return (summary->flags & kCpuMatrixSummaryIdentityUniform) != 0 &&
+                   summary->inconsistent_features == 0;
+        }
+        return true;
     }
+    if (state == CpuMatrixState::Invalid) return false;
     return true;
 }
 
