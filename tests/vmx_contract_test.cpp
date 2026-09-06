@@ -22,6 +22,7 @@ int wmain(int argc, wchar_t** argv) {
     RunIommuModelContract(state);
     RunExitModelContract(state);
     RunCpuPolicyModelContract(state);
+    RunCpuMatrixModelContract(state);
     RunVpidModelContract(state);
     RunWhpModelContract(state);
     RunInterruptModelContract(state);

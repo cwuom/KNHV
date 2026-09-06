@@ -699,6 +699,37 @@ void CheckCpuPolicyContract(const fs::path& root, TestState& state) {
               !Contains(source, "__writemsr") && !Contains(source, "__vmx"));
 }
 
+void CheckCpuMatrixContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_cpu_matrix.h", state);
+    const std::string source =
+        Source(root, "src/vmx/cpu_matrix_model.cpp", state);
+    const std::string test =
+        Source(root, "tests/cpu_matrix_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "CPU matrix exposes fixed-layout sample and summary contracts",
+          Contains(header, "CpuMatrixSample") &&
+              Contains(header, "CpuMatrixSummary") &&
+              Contains(header, "kCpuMatrixMaxProcessors") &&
+              Contains(source, "BuildCpuMatrixSummary"));
+    Check(state, "CPU matrix distinguishes incomplete and mixed processors",
+          Contains(source, "CpuMatrixState::Incomplete") &&
+              Contains(source, "CpuMatrixState::CompleteMixed") &&
+              Contains(test, "mixed feature capabilities") &&
+              Contains(test, "incomplete sample set"));
+    Check(state, "CPU matrix requires explicit features for uniform readiness",
+          Contains(source, "IsCpuMatrixUniform") &&
+              Contains(source, "feature_intersection") &&
+              Contains(test, "uniform complete summary"));
+    Check(state, "CPU matrix model is wired into drivers and host tests",
+          Contains(cmake, "src/vmx/cpu_matrix_model.cpp") &&
+              Contains(cmake, "tests/cpu_matrix_model_test.cpp") &&
+              Contains(cmake, "src/include/knhv_cpu_matrix.h"));
+    Check(state, "CPU matrix model performs no privileged hardware access",
+          !Contains(source, "__cpuid") && !Contains(source, "__readmsr") &&
+              !Contains(source, "__writemsr") && !Contains(source, "__vmx"));
+}
+
 void CheckInterruptContract(const fs::path& root, TestState& state) {
     const std::string header =
         Source(root, "src/include/knhv_interrupt.h", state);
@@ -937,6 +968,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckIommuContract(root, state);
     CheckExitContract(root, state);
     CheckCpuPolicyContract(root, state);
+    CheckCpuMatrixContract(root, state);
     CheckVpidContract(root, state);
     CheckWhpContract(root, state);
     CheckWhpBrokerContract(root, state);
