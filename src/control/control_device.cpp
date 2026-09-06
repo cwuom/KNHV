@@ -446,23 +446,27 @@ NTSTATUS HandleReleaseLeaseV2(KnHvDeviceExtension* extension,
         irp->AssociatedIrp.SystemBuffer);
     HvReleaseLeaseV2Out* output = static_cast<HvReleaseLeaseV2Out*>(
         irp->AssociatedIrp.SystemBuffer);
-    if (input == nullptr || output == nullptr ||
-        !VersionedV2InputFits(input->version, input->size,
+    if (input == nullptr || output == nullptr) {
+        return SetIrpResult(irp, STATUS_INVALID_PARAMETER, 0);
+    }
+    // method buffered reuses the system buffer for input and output
+    const HvReleaseLeaseV2In request = *input;
+    if (!VersionedV2InputFits(request.version, request.size,
                               sizeof(HvReleaseLeaseV2In), input_length) ||
-        !IsOwnerLeaseV2Valid(&input->lease) ||
-        input->lease.mode == static_cast<u32>(HvLeaseModeV2::None) ||
-        input->session.reserved != 0) {
+        !IsOwnerLeaseV2Valid(&request.lease) ||
+        request.lease.mode == static_cast<u32>(HvLeaseModeV2::None) ||
+        request.session.reserved != 0) {
         return SetIrpResult(irp, STATUS_INVALID_PARAMETER, 0);
     }
     KIRQL old_irql = PASSIVE_LEVEL;
     KeAcquireSpinLock(&extension->state_lock, &old_irql);
     KnHvClientSession* session =
-        FindSession(extension, input->session, owner_file);
+        FindSession(extension, request.session, owner_file);
     if (session == nullptr || session->lease_active == 0 ||
-        session->lease.owner_id != input->lease.owner_id ||
-        session->lease.generation != input->lease.generation ||
-        session->lease.mode != input->lease.mode ||
-        session->lease.flags != input->lease.flags) {
+        session->lease.owner_id != request.lease.owner_id ||
+        session->lease.generation != request.lease.generation ||
+        session->lease.mode != request.lease.mode ||
+        session->lease.flags != request.lease.flags) {
         KeReleaseSpinLock(&extension->state_lock, old_irql);
         return SetIrpResult(irp, STATUS_INVALID_HANDLE, 0);
     }
@@ -471,7 +475,7 @@ NTSTATUS HandleReleaseLeaseV2(KnHvDeviceExtension* extension,
     *output = {};
     output->size = sizeof(*output);
     output->version = kAbiV2Version;
-    output->request_id = input->request_id;
+    output->request_id = request.request_id;
     output->status = HvStatus::Success;
     KeReleaseSpinLock(&extension->state_lock, old_irql);
     return SetIrpResult(irp, STATUS_SUCCESS, sizeof(*output));

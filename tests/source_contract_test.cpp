@@ -948,6 +948,10 @@ void CheckAbiV2Contract(const fs::path& root, TestState& state) {
               Contains(control, "HandleReleaseLeaseV2") &&
               Contains(control, "FindSession(extension, request.session,") &&
               Contains(control, "IOCTL_KNHV_QUERY_CAPS_V2"));
+    Check(state, "release v2 snapshots the buffered input before clearing output",
+          Contains(control, "const HvReleaseLeaseV2In request = *input;") &&
+              Contains(control, "output->request_id = request.request_id;") &&
+              !Contains(control, "output->request_id = input->request_id;"));
     Check(state, "nested probe exercises the v2 lease lifecycle",
           Contains(probe, "QueryCapsV2") &&
               Contains(probe, "AcquireSyntheticLease") &&
