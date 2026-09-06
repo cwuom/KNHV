@@ -126,8 +126,21 @@ void CheckVmcs02InputBoundaries(TestState& state) {
     vmcs12 = MakeVmcs12(capabilities);
     policy.size = knhv::kVmcs02MaxStructSize + 1U;
     Check(state, "VMCS02 model rejects an oversized policy contract",
-          knhv::BuildVmcs02Model(&vmcs12, &capabilities, &policy, &image) ==
-              knhv::Vmcs02BuildStatus::InvalidParameter);
+              knhv::BuildVmcs02Model(&vmcs12, &capabilities, &policy, &image) ==
+                  knhv::Vmcs02BuildStatus::InvalidParameter);
+
+    knhv::NestedVcpu vcpu = {};
+    knhv::InitializeNestedVcpu(&vcpu, &capabilities, nullptr);
+    knhv::NestedVmcs12 owned = {};
+    owned.allocated = 1;
+    owned.region_gpa = 0x8000;
+    owned.revision = capabilities.vmx_revision;
+    vcpu.vmcs[0] = owned;
+    vcpu.current_vmcs_gpa = owned.region_gpa;
+    knhv::NestedVmcs12 forged = owned;
+    Check(state, "VMCS12 reader rejects a pointer outside the vCPU table",
+          !knhv::ReadVmcs12Model(&vcpu, &forged, &vmcs12));
+
     std::uint64_t next = 0;
     Check(state, "VMCS02 model does not wrap a generation counter",
           !knhv::NextEptGeneration(~0ULL, &next));

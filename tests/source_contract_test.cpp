@@ -560,6 +560,9 @@ void CheckVmcs02Contract(const fs::path& root, TestState& state) {
     Check(state, "VMCS02 model cannot execute physical VMX instructions",
           !Contains(source, "__vmx") && !Contains(source, "__writemsr") &&
               !Contains(source, "VMWRITE") && !Contains(source, "VMLAUNCH"));
+    Check(state, "VMCS02 reader checks vCPU VMCS pointer ownership",
+          Contains(source, "IsVmcsPointerOwned") &&
+              Contains(test, "pointer outside the vCPU table"));
 }
 
 void CheckIommuContract(const fs::path& root, TestState& state) {

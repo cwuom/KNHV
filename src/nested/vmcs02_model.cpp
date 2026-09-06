@@ -52,6 +52,14 @@ bool ReadField(const NestedVcpu* vcpu, const NestedVmcs12* vmcs, u32 encoding,
            ReadNestedVmcsField(vcpu, encoding, value);
 }
 
+bool IsVmcsPointerOwned(const NestedVcpu* vcpu, const NestedVmcs12* vmcs) {
+    if (vcpu == nullptr || vmcs == nullptr) return false;
+    for (u32 index = 0; index < kNestedVmcsSlots; ++index) {
+        if (&vcpu->vmcs[index] == vmcs) return true;
+    }
+    return false;
+}
+
 bool IsVmcs12StateValue(u32 state) {
     return (state & ~kKnownVmcs12StateMask) == 0 &&
            (state == static_cast<u32>(Vmcs12State::Clear) ||
@@ -119,6 +127,7 @@ bool ReadVmcs12Model(const NestedVcpu* vcpu, const NestedVmcs12* vmcs,
     if (model == nullptr || vcpu == nullptr || vmcs == nullptr ||
         vcpu->version != kNestedModelVersion ||
         vcpu->size < sizeof(NestedVcpu) || vmcs->allocated == 0 ||
+        !IsVmcsPointerOwned(vcpu, vmcs) ||
         vmcs->revision !=
             (vcpu->capabilities.vmx_revision & kNestedVmxRevisionMask) ||
         vcpu->current_vmcs_gpa != vmcs->region_gpa) {
