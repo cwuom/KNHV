@@ -562,6 +562,36 @@ void CheckVmcs02Contract(const fs::path& root, TestState& state) {
               !Contains(source, "VMWRITE") && !Contains(source, "VMLAUNCH"));
 }
 
+void CheckIommuContract(const fs::path& root, TestState& state) {
+    const std::string header = Source(root, "src/include/knhv_iommu.h", state);
+    const std::string source = Source(root, "src/iommu/iommu_model.cpp", state);
+    const std::string test = Source(root, "tests/iommu_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "IOMMU model exposes device, domain, and mapping contracts",
+          Contains(header, "IommuDeviceProfile") &&
+              Contains(header, "IommuDomain") &&
+              Contains(header, "IommuDmaMapping") &&
+              Contains(source, "PrepareIommuAssignment"));
+    Check(state, "IOMMU assignment enforces isolation, reset, and generation",
+          Contains(source, "kIommuDeviceHasRmrr") &&
+              Contains(source, "kIommuDeviceResetReliable") &&
+              Contains(source, "GenerationMismatch") &&
+              Contains(source, "QuarantineIommuAssignment"));
+    Check(state, "nested DMA translation is fail-closed",
+          Contains(source, "ResolveNestedDma") &&
+              Contains(source, "kIommuMappingHostOwned") &&
+              Contains(test, "nested DMA translation") &&
+              Contains(test, "unpinned DMA mappings"));
+    Check(state, "IOMMU model is wired into drivers and host tests",
+          Contains(cmake, "src/iommu/iommu_model.cpp") &&
+              Contains(cmake, "tests/iommu_model_test.cpp"));
+    Check(state, "IOMMU model performs no physical device or VMX access",
+          !Contains(source, "IoGetDmaAdapter") &&
+              !Contains(source, "MmMapIoSpace") &&
+              !Contains(source, "DeviceIoControl") &&
+              !Contains(source, "__vmx") && !Contains(source, "__writemsr"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -682,6 +712,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckAbiV2Contract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
+    CheckIommuContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }
