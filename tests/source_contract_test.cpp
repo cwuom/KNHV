@@ -1203,6 +1203,7 @@ void CheckTargetEvidenceSnapshotCodecContract(const fs::path& root,
           Contains(header, "TargetEvidenceSnapshotWireHeader") &&
               Contains(header, "kTargetEvidenceSnapshotWireMaxSize") &&
               Contains(header, "InspectTargetEvidenceSnapshotPackage") &&
+              Contains(header, "GetTargetEvidenceSnapshotPackageDigest") &&
               Contains(header, "DecodeTargetEvidenceSnapshotPackage") &&
               Contains(implementation, "CalculatePayloadSize"));
     Check(state, "target snapshot codec integrity-checks and revalidates data",
@@ -1243,6 +1244,42 @@ void CheckTargetEvidenceSnapshotCodecContract(const fs::path& root,
           !Contains(gate_implementation, "__vmx") &&
               !Contains(gate_implementation, "__readmsr") &&
               !Contains(gate_implementation, "DeviceIoControl"));
+}
+
+void CheckTargetEvidenceCollectorContract(const fs::path& root,
+                                          TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_target_collector.h", state);
+    const std::string implementation =
+        Source(root, "src/validation/target_collector.cpp", state);
+    const std::string test =
+        Source(root, "tests/target_collector_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "collector binding exposes versioned provenance records",
+          Contains(header, "TargetEvidenceCollectorBinding") &&
+              Contains(header, "TargetEvidenceCollectorBindingResult") &&
+              Contains(header, "kTargetEvidenceCollectorFlagDigestVerified") &&
+              Contains(implementation,
+                       "ValidateTargetEvidenceCollectorBinding"));
+    Check(state, "collector binding checks digest and generation identity",
+          Contains(implementation, "DigestMismatch") &&
+              Contains(implementation, "GenerationMismatch") &&
+              Contains(implementation, "TimestampMismatch") &&
+              Contains(implementation, "SignatureMismatch") &&
+              Contains(test, "generation mismatch") &&
+              Contains(test, "signature mismatch"));
+    Check(state, "collector binding is wired into host contract tests",
+          Contains(cmake, "src/validation/target_collector.cpp") &&
+              Contains(cmake, "tests/target_collector_test.cpp") &&
+              Contains(cmake, "knhv_target_collector.h") &&
+              Contains(readme, "collector binding"));
+    Check(state, "collector binding remains a host-only boundary",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__readmsr") &&
+              !Contains(implementation, "__writemsr") &&
+              !Contains(implementation, "DeviceIoControl") &&
+              !Contains(implementation, "WinVerifyTrust"));
 }
 
 void CheckPureModels(TestState& state) {
@@ -1326,6 +1363,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckTargetEvidenceWriterContract(root, state);
     CheckTargetEvidenceSnapshotContract(root, state);
     CheckTargetEvidenceSnapshotCodecContract(root, state);
+    CheckTargetEvidenceCollectorContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);

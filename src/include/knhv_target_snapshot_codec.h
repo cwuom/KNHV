@@ -51,6 +51,8 @@ u32 GetTargetEvidenceSnapshotWireSize(u32 cpu_sample_count,
 TargetEvidenceSnapshotCodecStatus InspectTargetEvidenceSnapshotPackage(
     const u8* input, u32 input_size,
     TargetEvidenceSnapshotWireHeader* header);
+TargetEvidenceSnapshotCodecStatus GetTargetEvidenceSnapshotPackageDigest(
+    const u8* input, u32 input_size, u8* digest);
 TargetEvidenceSnapshotCodecStatus EncodeTargetEvidenceSnapshotPackage(
     const TargetEvidenceSnapshot* snapshot,
     const CpuMatrixSample* cpu_samples, u32 cpu_sample_count,

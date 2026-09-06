@@ -55,6 +55,7 @@ void RunTargetEvidenceWriterContract(TestState& state);
 void RunTargetEvidenceSnapshotContract(TestState& state);
 void RunTargetEvidenceSnapshotCodecContract(TestState& state);
 void RunTargetEvidenceSnapshotGateContract(TestState& state);
+void RunTargetEvidenceCollectorContract(TestState& state);
 void RunEptTimeModelContract(TestState& state);
 void RunVmcs02ModelContract(TestState& state);
 void RunVmcsShadowModelContract(TestState& state);

@@ -184,6 +184,39 @@ TargetEvidenceSnapshotCodecStatus InspectTargetEvidenceSnapshotPackage(
     return ValidateHeader(*header, input_size);
 }
 
+TargetEvidenceSnapshotCodecStatus GetTargetEvidenceSnapshotPackageDigest(
+    const u8* input, u32 input_size, u8* digest) {
+    if (digest == nullptr) {
+        return TargetEvidenceSnapshotCodecStatus::InvalidArgument;
+    }
+    if (input == nullptr) {
+        std::memset(digest, 0, kTargetEvidenceSnapshotWireDigestSize);
+        return TargetEvidenceSnapshotCodecStatus::InvalidArgument;
+    }
+    TargetEvidenceSnapshotWireHeader header{};
+    const TargetEvidenceSnapshotCodecStatus inspect_status =
+        InspectTargetEvidenceSnapshotPackage(input, input_size, &header);
+    if (inspect_status != TargetEvidenceSnapshotCodecStatus::Success) {
+        std::memset(digest, 0, kTargetEvidenceSnapshotWireDigestSize);
+        return inspect_status;
+    }
+    u8 expected_digest[kTargetEvidenceSnapshotWireDigestSize] = {};
+    if (!ComputeSha256(input, header.header_size + header.payload_size,
+                       expected_digest)) {
+        std::memset(digest, 0, kTargetEvidenceSnapshotWireDigestSize);
+        return TargetEvidenceSnapshotCodecStatus::DigestUnavailable;
+    }
+    const u8* actual_digest = input + header.header_size + header.payload_size;
+    if (!IsDigestEqual(expected_digest, actual_digest,
+                       kTargetEvidenceSnapshotWireDigestSize)) {
+        std::memset(digest, 0, kTargetEvidenceSnapshotWireDigestSize);
+        return TargetEvidenceSnapshotCodecStatus::DigestMismatch;
+    }
+    std::memcpy(digest, expected_digest,
+                kTargetEvidenceSnapshotWireDigestSize);
+    return TargetEvidenceSnapshotCodecStatus::Success;
+}
+
 TargetEvidenceSnapshotCodecStatus EncodeTargetEvidenceSnapshotPackage(
     const TargetEvidenceSnapshot* snapshot, const CpuMatrixSample* cpu_samples,
     u32 cpu_sample_count, const VmxCapabilitySample* vmx_samples,

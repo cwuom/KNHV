@@ -2,6 +2,7 @@
 
 #include "knhv_target_snapshot_codec.h"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <string>
@@ -167,6 +168,10 @@ void CheckInventoryRoundTrip(TestState& state) {
     knhv::TargetEvidenceSnapshotWireHeader header{};
     const auto inspect_status = knhv::InspectTargetEvidenceSnapshotPackage(
         encoded.data(), written, &header);
+    std::array<knhv::u8, knhv::kTargetEvidenceSnapshotWireDigestSize> digest{};
+    const auto digest_status =
+        knhv::GetTargetEvidenceSnapshotPackageDigest(
+            encoded.data(), written, digest.data());
     knhv::TargetEvidenceSnapshot decoded{};
     knhv::u32 cpu_count = 0U;
     knhv::u32 vmx_count = 0U;
@@ -177,6 +182,12 @@ void CheckInventoryRoundTrip(TestState& state) {
           encode_status == knhv::TargetEvidenceSnapshotCodecStatus::Success &&
               written == encoded.size() &&
               inspect_status == knhv::TargetEvidenceSnapshotCodecStatus::Success &&
+              digest_status == knhv::TargetEvidenceSnapshotCodecStatus::Success &&
+              std::memcmp(
+                  digest.data(),
+                  encoded.data() + written -
+                      knhv::kTargetEvidenceSnapshotWireDigestSize,
+                  digest.size()) == 0 &&
               header.cpu_sample_count == 0U && header.vmx_sample_count == 0U &&
               decode_status == knhv::TargetEvidenceSnapshotCodecStatus::Success &&
               std::memcmp(&source, &decoded, sizeof(source)) == 0 &&
@@ -229,6 +240,16 @@ void CheckMalformedPackages(TestState& state) {
               tampered.data(), written, &decoded, nullptr, 0U, &cpu_count,
               nullptr, 0U, &vmx_count) ==
               knhv::TargetEvidenceSnapshotCodecStatus::DigestMismatch);
+
+    std::array<knhv::u8, knhv::kTargetEvidenceSnapshotWireDigestSize>
+        cleared_digest{};
+    cleared_digest.fill(0xA5U);
+    Check(state, "snapshot codec clears a digest after tampering",
+          knhv::GetTargetEvidenceSnapshotPackageDigest(
+              tampered.data(), written, cleared_digest.data()) ==
+              knhv::TargetEvidenceSnapshotCodecStatus::DigestMismatch &&
+              std::all_of(cleared_digest.begin(), cleared_digest.end(),
+                          [](knhv::u8 byte) { return byte == 0U; }));
 
     auto bad_version = encoded;
     knhv::TargetEvidenceSnapshotWireHeader version_header{};

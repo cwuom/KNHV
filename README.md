@@ -318,6 +318,16 @@ matrices, checks owner and generation consistency, and forwards only a valid
 candidate to the writer. The adapter is host-only; privileged collection and
 hardware execution remain explicit target-side operations.
 
+The collector binding contract is the provenance boundary after package
+verification. A target-side collector supplies its identity, capture id,
+generation, timestamp window, sample counts, package digest, artifact hash, and
+signature result. The host validator compares those fields with the decoded
+snapshot and fails closed on stale, mixed, or incomplete evidence. It does not
+make an unsigned record trusted and does not collect privileged state itself.
+`GetTargetEvidenceSnapshotPackageDigest` exposes the digest only after the wire
+header and stored SHA-256 have both been verified, so callers do not need to
+reimplement package offsets.
+
 For offline transport, `KNHV_EvidenceTool.exe` can encode the approved snapshot
 and its raw samples into a bounded, SHA-256 protected package, then decode and
 re-run the same validation before materializing a manifest:
