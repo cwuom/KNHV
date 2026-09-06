@@ -21,6 +21,7 @@ int wmain(int argc, wchar_t** argv) {
     RunIommuModelContract(state);
     RunExitModelContract(state);
     RunCpuPolicyModelContract(state);
+    RunInterruptModelContract(state);
     if (options.hardware) RunHardwareContract(state);
     if (options.signature || options.runtime || options.driver_explicit) {
         RunArtifactContract(options.root, options.driver, state);

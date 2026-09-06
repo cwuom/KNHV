@@ -647,6 +647,33 @@ void CheckCpuPolicyContract(const fs::path& root, TestState& state) {
               !Contains(source, "__writemsr") && !Contains(source, "__vmx"));
 }
 
+void CheckInterruptContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_interrupt.h", state);
+    const std::string source =
+        Source(root, "src/interrupt/interrupt_model.cpp", state);
+    const std::string test =
+        Source(root, "tests/interrupt_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "interrupt model exposes bounded events and decisions",
+          Contains(header, "InterruptState") &&
+              Contains(header, "PostedInterruptDescriptor") &&
+              Contains(source, "SelectInterrupt"));
+    Check(state, "interrupt model orders and gates pending injection",
+          Contains(source, "Priority") && Contains(source, "IsBlocked") &&
+              Contains(test, "priority") && Contains(test, "STI"));
+    Check(state, "posted interrupts drain through the virtual event queue",
+          Contains(source, "DrainPostedInterrupt") &&
+              Contains(source, "kInterruptEventPosted") &&
+              Contains(test, "posted interrupt"));
+    Check(state, "interrupt model is wired into drivers and tests",
+          Contains(cmake, "src/interrupt/interrupt_model.cpp") &&
+              Contains(cmake, "tests/interrupt_model_test.cpp"));
+    Check(state, "interrupt model does not access physical APIC state",
+          !Contains(source, "MmMapIoSpace") &&
+              !Contains(source, "__readmsr") && !Contains(source, "__vmx"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -770,6 +797,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckIommuContract(root, state);
     CheckExitContract(root, state);
     CheckCpuPolicyContract(root, state);
+    CheckInterruptContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }
