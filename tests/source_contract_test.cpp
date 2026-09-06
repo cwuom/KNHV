@@ -540,6 +540,28 @@ void CheckEptTimeContract(const fs::path& root, TestState& state) {
               !Contains(time_source, "__writemsr"));
 }
 
+void CheckVmcs02Contract(const fs::path& root, TestState& state) {
+    const std::string header = Source(root, "src/include/knhv_vmcs02.h", state);
+    const std::string source = Source(root, "src/nested/vmcs02_model.cpp", state);
+    const std::string test = Source(root, "tests/vmcs02_model_test.cpp", state);
+    Check(state, "VMCS02 model exposes a separate image and policy",
+          Contains(header, "Vmcs12Model") &&
+              Contains(header, "Vmcs02Policy") &&
+              Contains(header, "Vmcs02Image") &&
+              Contains(source, "BuildVmcs02Model"));
+    Check(state, "VMCS02 model applies allowed masks and fixed CR checks",
+          Contains(source, "AdjustControl") &&
+              Contains(source, "IsFixedCrValid") &&
+              Contains(source, "kVmcs02PrimaryActivateSecondary"));
+    Check(state, "VMCS02 tests cover success and fail-closed paths",
+              Contains(test, "applies the L0 policy") &&
+              Contains(test, "invalid EPTP") &&
+              Contains(test, "contradictory policy controls"));
+    Check(state, "VMCS02 model cannot execute physical VMX instructions",
+          !Contains(source, "__vmx") && !Contains(source, "__writemsr") &&
+              !Contains(source, "VMWRITE") && !Contains(source, "VMLAUNCH"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -659,6 +681,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckPreflightContract(root, state);
     CheckAbiV2Contract(root, state);
     CheckEptTimeContract(root, state);
+    CheckVmcs02Contract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }

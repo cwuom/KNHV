@@ -48,6 +48,7 @@ void RunSourceContract(const fs::path& root, TestState& state);
 void RunNestedModelContract(const fs::path& root, TestState& state);
 void RunProviderV2Contract(TestState& state);
 void RunEptTimeModelContract(TestState& state);
+void RunVmcs02ModelContract(TestState& state);
 void RunArtifactContract(const fs::path& root, const fs::path& driver,
                          TestState& state);
 void RunSignatureContract(const fs::path& driver, bool allow_test_root,

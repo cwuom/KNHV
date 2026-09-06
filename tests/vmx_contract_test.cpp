@@ -17,6 +17,7 @@ int wmain(int argc, wchar_t** argv) {
     RunSourceContract(options.root, state);
     RunProviderV2Contract(state);
     RunEptTimeModelContract(state);
+    RunVmcs02ModelContract(state);
     if (options.hardware) RunHardwareContract(state);
     if (options.signature || options.runtime || options.driver_explicit) {
         RunArtifactContract(options.root, options.driver, state);
