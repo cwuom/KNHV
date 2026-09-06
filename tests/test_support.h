@@ -53,6 +53,7 @@ void RunIommuModelContract(TestState& state);
 void RunExitModelContract(TestState& state);
 void RunCpuPolicyModelContract(TestState& state);
 void RunVpidModelContract(TestState& state);
+void RunWhpModelContract(TestState& state);
 void RunInterruptModelContract(TestState& state);
 void RunArtifactContract(const fs::path& root, const fs::path& driver,
                          TestState& state);

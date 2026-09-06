@@ -704,6 +704,35 @@ void CheckVpidContract(const fs::path& root, TestState& state) {
               !Contains(source, "__invept") && !Contains(source, "__writemsr"));
 }
 
+void CheckWhpContract(const fs::path& root, TestState& state) {
+    const std::string header = Source(root, "src/include/knhv_whp.h", state);
+    const std::string source = Source(root, "src/whp/whp_model.cpp", state);
+    const std::string test = Source(root, "tests/whp_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "WHP model exposes capability, partition, and vCPU contracts",
+          Contains(header, "WhpCapabilities") &&
+              Contains(header, "WhpPartition") &&
+              Contains(header, "WhpVcpu") &&
+              Contains(source, "CreateWhpPartition"));
+    Check(state, "WHP model requires capabilities before nested configuration",
+          Contains(source, "kWhpCapNestedVmx") &&
+              Contains(source, "kWhpPartitionEnableNestedVmx") &&
+              Contains(test, "without capability"));
+    Check(state, "WHP model routes exits and rejects stale generations",
+          Contains(source, "EvaluateWhpExit") &&
+              Contains(source, "GenerationMismatch") &&
+              Contains(test, "routes CPUID") &&
+              Contains(test, "stale generations"));
+    Check(state, "WHP model is wired into drivers and host tests",
+          Contains(cmake, "src/whp/whp_model.cpp") &&
+              Contains(cmake, "tests/whp_model_test.cpp"));
+    Check(state, "WHP model performs no direct VMX or device operations",
+          !Contains(source, "WHvCreatePartition") &&
+              !Contains(source, "WHvRunVirtualProcessor") &&
+              !Contains(source, "__vmx") && !Contains(source, "__writemsr") &&
+              !Contains(source, "DeviceIoControl"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -828,6 +857,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckExitContract(root, state);
     CheckCpuPolicyContract(root, state);
     CheckVpidContract(root, state);
+    CheckWhpContract(root, state);
     CheckInterruptContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);

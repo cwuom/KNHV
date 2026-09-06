@@ -22,6 +22,7 @@ int wmain(int argc, wchar_t** argv) {
     RunExitModelContract(state);
     RunCpuPolicyModelContract(state);
     RunVpidModelContract(state);
+    RunWhpModelContract(state);
     RunInterruptModelContract(state);
     if (options.hardware) RunHardwareContract(state);
     if (options.signature || options.runtime || options.driver_explicit) {
