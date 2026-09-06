@@ -16,6 +16,7 @@ int wmain(int argc, wchar_t** argv) {
     TestState state;
     RunSourceContract(options.root, state);
     RunProviderV2Contract(state);
+    RunOwnerObservationModelContract(state);
     RunEptTimeModelContract(state);
     RunVmcs02ModelContract(state);
     RunVmcsShadowModelContract(state);

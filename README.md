@@ -253,6 +253,16 @@ VPID, or feature-control profile. The model contains no MSR or VMX instruction;
 the target collector must provide the raw snapshots and retain the per-CPU
 evidence.
 
+The `knhv_owner_observation` contract provides an owner observation gate and
+applies the same fail-closed rule to
+ownership evidence. It combines CPUID hypervisor state, Windows hypervisor and
+VBS/HVCI observations, provider state, boot-handoff evidence, and a generation
+counter. Only an active KNHV Boot L0 with complete handoff evidence can return
+`acquire-native`; an external owner, WHP owner, synthetic owner, or unknown
+state receives an explicit action and reason. The model does not claim that
+HyperDbg or another hypervisor can share physical VMX ownership, and it never
+executes VMX or MSR instructions.
+
 Run it once on the isolated validation target after copying the matching build:
 
 ```powershell

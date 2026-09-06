@@ -953,6 +953,33 @@ void CheckAbiV2Contract(const fs::path& root, TestState& state) {
               Contains(probe, "IOCTL_KNHV_ACQUIRE_LEASE_V2"));
 }
 
+void CheckOwnerObservationContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_owner_observation.h", state);
+    const std::string implementation =
+        Source(root, "src/provider/owner_observation.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string preflight =
+        Source(root, "preflight/preflight_common.cpp", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "owner observation contract is versioned and bounded",
+          Contains(header, "OwnerObservation") &&
+              Contains(header, "OwnerGateResult") &&
+              Contains(header, "kOwnerObservationMaxStructSize") &&
+              Contains(header, "IsOwnerObservationValid") &&
+              Contains(implementation, "EvaluateOwnerGate") &&
+              Contains(implementation, "ContradictoryEvidence"));
+    Check(state, "owner observation model is shared by contract builds",
+          Contains(cmake, "src/provider/owner_observation.cpp") &&
+              Contains(cmake, "tests/owner_observation_model_test.cpp") &&
+              Contains(cmake, "knhv_owner_observation.h"));
+    Check(state, "owner observation remains a pure fail-closed model",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__writemsr") &&
+              Contains(readme, "owner observation") &&
+              Contains(preflight, "no VMXON"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -1027,6 +1054,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckPreflightContract(root, state);
     CheckCpuMatrixProbeContract(root, state);
     CheckAbiV2Contract(root, state);
+    CheckOwnerObservationContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);
