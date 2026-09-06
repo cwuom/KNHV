@@ -60,6 +60,7 @@ compatibility.
 | `src/whp` | WHP partition, mapping, vCPU, and exit lifecycle model |
 | `src/broker` | Read-only WHP capability probe executable |
 | `src/provider` | Capability-gated provider selection |
+| `src/validation` | Versioned target evidence and release-gate model |
 | `src/control` | Shared secure WDM control-device implementation |
 | `src/test_driver` | Independent nested contract-test driver entry point |
 | `drivers` | Separate INF packages for the two control services |
@@ -266,6 +267,15 @@ counter. Only an active KNHV Boot L0 with complete handoff evidence can return
 state receives an explicit action and reason. The model does not claim that
 HyperDbg or another hypervisor can share physical VMX ownership, and it never
 executes VMX or MSR instructions.
+
+The `knhv_target_evidence` contract defines a versioned target evidence manifest
+for future hardware collection and release gates. It binds the chosen profile,
+stage, owner state, CPU coverage, artifact and PDB hashes, generation, signature
+state, time/telemetry status, recovery readiness, and device or performance proof.
+A gate accepts a manifest only when its requested profile, stage, generation,
+verdict, and required evidence flags all match. The current model validates
+supplied evidence only; it does not collect privileged state or claim that a
+Native L0 hardware validation has completed.
 
 Run it once on the isolated validation target after copying the matching build:
 

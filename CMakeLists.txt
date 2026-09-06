@@ -319,6 +319,7 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/provider/provider_selection.cpp
         src/provider/provider_v2.cpp
         src/provider/owner_observation.cpp
+        src/validation/target_evidence.cpp
         src/ept/ept_model.cpp
         src/time/time_contract.cpp
         src/nested/vmcs02_model.cpp
@@ -339,6 +340,7 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/include/knhv_abi.h
         src/include/knhv_provider.h
         src/include/knhv_owner_observation.h
+        src/include/knhv_target_evidence.h
         src/include/knhv_nested.h
         src/include/knhv_vmcs_shadow.h
         src/include/knhv_ept.h
@@ -439,6 +441,7 @@ if(KNHV_BUILD_TESTS)
             tests/nested_model_test.cpp
             tests/provider_v2_test.cpp
             tests/owner_observation_model_test.cpp
+            tests/target_evidence_model_test.cpp
             tests/ept_time_model_test.cpp
             tests/vmcs02_model_test.cpp
             tests/vmcs_shadow_model_test.cpp
@@ -453,6 +456,7 @@ if(KNHV_BUILD_TESTS)
             src/provider/provider_selection.cpp
             src/provider/provider_v2.cpp
             src/provider/owner_observation.cpp
+            src/validation/target_evidence.cpp
             src/ept/ept_model.cpp
             src/time/time_contract.cpp
             src/nested/vmcs02_model.cpp

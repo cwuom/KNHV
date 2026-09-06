@@ -982,6 +982,39 @@ void CheckOwnerObservationContract(const fs::path& root, TestState& state) {
               Contains(preflight, "no VMXON"));
 }
 
+void CheckTargetEvidenceContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_target_evidence.h", state);
+    const std::string implementation =
+        Source(root, "src/validation/target_evidence.cpp", state);
+    const std::string test =
+        Source(root, "tests/target_evidence_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "target evidence exposes a bounded versioned manifest",
+          Contains(header, "TargetEvidenceManifest") &&
+              Contains(header, "TargetEvidenceGateRequest") &&
+              Contains(header, "TargetEvidenceGateResult") &&
+              Contains(header, "kTargetEvidenceMaxStructSize") &&
+              Contains(implementation, "IsTargetEvidenceManifestValid"));
+    Check(state, "target evidence binds profile stage flags and generation",
+          Contains(implementation, "RequiredTargetEvidenceFlags") &&
+              Contains(implementation, "GenerationMismatch") &&
+              Contains(implementation, "SignatureUnverified") &&
+              Contains(test, "dirty release source") &&
+              Contains(test, "stale generation"));
+    Check(state, "target evidence model is wired into drivers and tests",
+          Contains(cmake, "src/validation/target_evidence.cpp") &&
+              Contains(cmake, "tests/target_evidence_model_test.cpp") &&
+              Contains(cmake, "knhv_target_evidence.h") &&
+              Contains(readme, "target evidence manifest"));
+    Check(state, "target evidence model performs no privileged operation",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__readmsr") &&
+              !Contains(implementation, "__writemsr") &&
+              !Contains(implementation, "DeviceIoControl"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -1057,6 +1090,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckCpuMatrixProbeContract(root, state);
     CheckAbiV2Contract(root, state);
     CheckOwnerObservationContract(root, state);
+    CheckTargetEvidenceContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);
