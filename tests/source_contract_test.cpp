@@ -674,6 +674,33 @@ void CheckInterruptContract(const fs::path& root, TestState& state) {
               !Contains(source, "__readmsr") && !Contains(source, "__vmx"));
 }
 
+void CheckVpidContract(const fs::path& root, TestState& state) {
+    const std::string header = Source(root, "src/include/knhv_vpid.h", state);
+    const std::string source = Source(root, "src/vmx/vpid_model.cpp", state);
+    const std::string test = Source(root, "tests/vpid_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "VPID model exposes versioned lease and shootdown contracts",
+          Contains(header, "VpidLease") &&
+              Contains(header, "ShootdownRequest") &&
+              Contains(header, "ReclaimVpid") &&
+              Contains(source, "CompleteShootdown"));
+    Check(state, "VPID reclaim requires a completed matching shootdown",
+          Contains(source, "ShootdownCoversVpid") &&
+              Contains(source, "ShootdownStateKind::Completed") &&
+              Contains(test, "cannot be reclaimed"));
+    Check(state, "VPID model gates all-context invalidation and timeouts",
+          Contains(source, "kShootdownAllowAllContext") &&
+              Contains(source, "TimedOut") &&
+              Contains(test, "explicit opt-in") &&
+              Contains(test, "marked timed out"));
+    Check(state, "VPID model is wired into drivers and host tests",
+          Contains(cmake, "src/vmx/vpid_model.cpp") &&
+              Contains(cmake, "tests/vpid_model_test.cpp"));
+    Check(state, "VPID model executes no physical invalidation instruction",
+          !Contains(source, "__vmx") && !Contains(source, "__invvpid") &&
+              !Contains(source, "__invept") && !Contains(source, "__writemsr"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -797,6 +824,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckIommuContract(root, state);
     CheckExitContract(root, state);
     CheckCpuPolicyContract(root, state);
+    CheckVpidContract(root, state);
     CheckInterruptContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
