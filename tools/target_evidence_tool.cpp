@@ -19,6 +19,7 @@
 #include "knhv_target_evidence_signature.h"
 #include "knhv_target_snapshot.h"
 #include "knhv_target_snapshot_codec.h"
+#include "knhv_target_snapshot_gate.h"
 
 namespace {
 
@@ -39,6 +40,7 @@ enum class Operation : std::uint32_t {
     VerifySignature = 4,
     EmitSyntheticSnapshot = 5,
     ValidateSnapshot = 6,
+    GateSnapshot = 7,
 };
 
 struct Options {
@@ -63,6 +65,9 @@ void PrintUsage() {
         << "KNHV_EvidenceTool --emit-synthetic-snapshot path"
            " [--out report.json]\n"
         << "KNHV_EvidenceTool --validate-snapshot path"
+           " [--out report.json]\n"
+        << "KNHV_EvidenceTool --gate-snapshot path --profile profile"
+           " --stage stage [--expected-generation value]"
            " [--out report.json]\n"
         << "KNHV_EvidenceTool --gate path --profile profile --stage stage"
            " [--expected-generation value] [--out report.json]\n"
@@ -195,6 +200,14 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options,
                 if (error.empty()) error = "--gate needs a path";
                 return false;
             }
+        } else if (argument == L"--gate-snapshot") {
+            fs::path path;
+            if (!TakePath(index, argc, argv, path) ||
+                !SetOperation(options, Operation::GateSnapshot, path,
+                               error)) {
+                if (error.empty()) error = "--gate-snapshot needs a path";
+                return false;
+            }
         } else if (argument == L"--verify-signature") {
             fs::path path;
             if (!TakePath(index, argc, argv, path) ||
@@ -245,18 +258,26 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options,
         error = "an operation is required";
         return false;
     }
-    if (options.operation == Operation::Gate &&
+    if ((options.operation == Operation::Gate ||
+        options.operation == Operation::GateSnapshot) &&
         options.profile == knhv::TargetEvidenceProfile::Unknown) {
-        error = "--gate requires --profile";
+        error = options.operation == Operation::Gate
+                    ? "--gate requires --profile"
+                    : "--gate-snapshot requires --profile";
         return false;
     }
-    if (options.operation == Operation::Gate && !options.stage_set) {
-        error = "--gate requires --stage";
+    if ((options.operation == Operation::Gate ||
+        options.operation == Operation::GateSnapshot) &&
+        !options.stage_set) {
+        error = options.operation == Operation::Gate
+                    ? "--gate requires --stage"
+                    : "--gate-snapshot requires --stage";
         return false;
     }
     if (options.operation != Operation::Gate &&
+        options.operation != Operation::GateSnapshot &&
         (options.profile_set || options.stage_set || options.generation_set)) {
-        error = "profile, stage, and generation apply only to --gate";
+        error = "profile, stage, and generation apply only to gate operations";
         return false;
     }
     if (options.operation != Operation::VerifySignature &&
@@ -352,11 +373,17 @@ bool ReadBytes(const fs::path& path, std::uint32_t maximum_size,
         return false;
     }
     file.seekg(0, std::ios::beg);
-    if (!file) {
-        error = "input cannot be rewound";
+   if (!file) {
+       error = "input cannot be rewound";
+       return false;
+   }
+    try {
+        bytes.resize(static_cast<std::size_t>(end));
+    } catch (const std::bad_alloc&) {
+        error = "input allocation failed";
+        bytes.clear();
         return false;
     }
-    bytes.resize(static_cast<std::size_t>(end));
     if (!bytes.empty()) {
         file.read(reinterpret_cast<char*>(bytes.data()),
                   static_cast<std::streamsize>(bytes.size()));
@@ -758,6 +785,111 @@ int RunValidateSnapshot(const Options& options) {
     }
 }
 
+int RunGateSnapshot(const Options& options) {
+    std::vector<knhv::u8> bytes;
+    std::string error;
+    if (!ReadBytes(options.input, knhv::kTargetEvidenceSnapshotWireMaxSize,
+                   bytes, error)) {
+        std::cerr << error << '\n';
+        return kExitIo;
+    }
+    knhv::TargetEvidenceSnapshotWireHeader header{};
+    knhv::TargetEvidenceSnapshotCodecStatus codec_status =
+        knhv::InspectTargetEvidenceSnapshotPackage(
+            bytes.data(), static_cast<knhv::u32>(bytes.size()), &header);
+    if (codec_status !=
+        knhv::TargetEvidenceSnapshotCodecStatus::Success) {
+        const std::string report = BuildJson(
+            "gate-snapshot", "fail",
+            knhv::TargetEvidenceSnapshotCodecStatusText(codec_status),
+            options.input, nullptr, nullptr, false, false);
+        if (!WriteReport(options.output, report, error)) {
+            std::cerr << error << '\n';
+            return kExitIo;
+        }
+        return kExitInvalid;
+    }
+
+    try {
+        std::vector<knhv::CpuMatrixSample> cpu_samples(
+            header.cpu_sample_count);
+        std::vector<knhv::VmxCapabilitySample> vmx_samples(
+            header.vmx_sample_count);
+        knhv::TargetEvidenceSnapshot snapshot{};
+        knhv::u32 cpu_sample_count = 0U;
+        knhv::u32 vmx_sample_count = 0U;
+        codec_status = knhv::DecodeTargetEvidenceSnapshotPackage(
+            bytes.data(), static_cast<knhv::u32>(bytes.size()), &snapshot,
+            cpu_samples.empty() ? nullptr : cpu_samples.data(),
+            static_cast<knhv::u32>(cpu_samples.size()), &cpu_sample_count,
+            vmx_samples.empty() ? nullptr : vmx_samples.data(),
+            static_cast<knhv::u32>(vmx_samples.size()), &vmx_sample_count);
+        if (codec_status !=
+            knhv::TargetEvidenceSnapshotCodecStatus::Success) {
+            const std::string report = BuildJson(
+                "gate-snapshot", "fail",
+                knhv::TargetEvidenceSnapshotCodecStatusText(codec_status),
+                options.input, nullptr, nullptr, false, false);
+            if (!WriteReport(options.output, report, error)) {
+                std::cerr << error << '\n';
+                return kExitIo;
+            }
+            return kExitInvalid;
+        }
+
+        knhv::TargetEvidenceGateRequest request{};
+        request.size = sizeof(request);
+        request.version = knhv::kTargetEvidenceContractVersion;
+        request.profile = static_cast<knhv::u32>(options.profile);
+        request.minimum_stage = static_cast<knhv::u32>(options.stage);
+        request.expected_generation =
+            options.generation_set ? options.expected_generation : 0U;
+        knhv::TargetEvidenceSnapshotGateResult result{};
+        const auto gate_status =
+            knhv::EvaluateTargetEvidenceSnapshotGate(
+                &snapshot,
+                cpu_samples.empty() ? nullptr : cpu_samples.data(),
+                cpu_sample_count,
+                vmx_samples.empty() ? nullptr : vmx_samples.data(),
+                vmx_sample_count, &request, &result);
+        const bool synthetic =
+            snapshot.profile == static_cast<knhv::u32>(
+                                    knhv::TargetEvidenceProfile::SyntheticLab);
+        const bool result_valid =
+            knhv::IsTargetEvidenceSnapshotGateResultValid(&result);
+        const bool passed =
+            result_valid &&
+            gate_status == knhv::TargetEvidenceSnapshotGateStatus::Success;
+        const bool blocked =
+            result_valid &&
+            gate_status ==
+                knhv::TargetEvidenceSnapshotGateStatus::GateBlocked;
+        const bool manifest_valid =
+            knhv::IsTargetEvidenceManifestValid(&result.manifest);
+        const char* reason = nullptr;
+        if (passed || blocked) {
+            reason = knhv::TargetEvidenceReasonText(
+                static_cast<knhv::TargetEvidenceReason>(result.gate.reason));
+        } else {
+            reason = knhv::TargetEvidenceSnapshotGateStatusText(gate_status);
+        }
+        const std::string report = BuildJson(
+            "gate-snapshot", passed ? "pass" : (blocked ? "blocked" : "fail"),
+            reason, options.input, manifest_valid ? &result.manifest : nullptr,
+            (passed || blocked) ? &result.gate : nullptr, true, synthetic);
+        if (!WriteReport(options.output, report, error)) {
+            std::cerr << error << '\n';
+            return kExitIo;
+        }
+        if (passed) return kExitSuccess;
+        if (blocked) return kExitBlocked;
+        return kExitInvalid;
+    } catch (const std::bad_alloc&) {
+        std::cerr << "snapshot sample allocation failed\n";
+        return kExitInvalid;
+    }
+}
+
 int RunValidate(const Options& options) {
     std::vector<knhv::u8> bytes;
     std::string error;
@@ -904,6 +1036,7 @@ int wmain(int argc, wchar_t** argv) {
             return RunEmitSyntheticSnapshot(options);
         case Operation::Validate: return RunValidate(options);
         case Operation::ValidateSnapshot: return RunValidateSnapshot(options);
+        case Operation::GateSnapshot: return RunGateSnapshot(options);
         case Operation::Gate: return RunGate(options);
         case Operation::VerifySignature: return RunVerifySignature(options);
         default: return kExitUsage;

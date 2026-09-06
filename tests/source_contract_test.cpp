@@ -1193,13 +1193,19 @@ void CheckTargetEvidenceSnapshotCodecContract(const fs::path& root,
         Source(root, "tools/target_evidence_tool.cpp", state);
     const std::string cmake = Source(root, "CMakeLists.txt", state);
     const std::string readme = Source(root, "README.md", state);
+    const std::string gate_header = Source(
+        root, "src/include/knhv_target_snapshot_gate.h", state);
+    const std::string gate_implementation = Source(
+        root, "src/validation/target_snapshot_gate.cpp", state);
+    const std::string gate_test =
+        Source(root, "tests/target_snapshot_gate_test.cpp", state);
     Check(state, "target snapshot codec exposes a bounded wire format",
           Contains(header, "TargetEvidenceSnapshotWireHeader") &&
               Contains(header, "kTargetEvidenceSnapshotWireMaxSize") &&
               Contains(header, "InspectTargetEvidenceSnapshotPackage") &&
               Contains(header, "DecodeTargetEvidenceSnapshotPackage") &&
               Contains(implementation, "CalculatePayloadSize"));
-    Check(state, "target snapshot codec authenticates and revalidates data",
+    Check(state, "target snapshot codec integrity-checks and revalidates data",
           Contains(implementation, "BCryptHashData") &&
               Contains(implementation, "DigestMismatch") &&
               Contains(implementation, "IsTargetEvidenceSnapshotValid") &&
@@ -1209,9 +1215,14 @@ void CheckTargetEvidenceSnapshotCodecContract(const fs::path& root,
           Contains(cmake, "src/validation/target_snapshot_codec.cpp") &&
               Contains(cmake, "tests/target_snapshot_codec_test.cpp") &&
               Contains(cmake, "knhv_target_snapshot_codec.h") &&
+              Contains(cmake, "src/validation/target_snapshot_gate.cpp") &&
+              Contains(cmake, "tests/target_snapshot_gate_test.cpp") &&
+              Contains(cmake, "knhv_target_snapshot_gate.h") &&
               Contains(tool, "--emit-synthetic-snapshot") &&
               Contains(tool, "--validate-snapshot") &&
-              Contains(readme, "validate-snapshot"));
+              Contains(tool, "--gate-snapshot") &&
+              Contains(readme, "validate-snapshot") &&
+              Contains(readme, "gate-snapshot"));
     Check(state, "target snapshot codec remains a host-only boundary",
           !Contains(implementation, "__vmx") &&
               !Contains(implementation, "__readmsr") &&
@@ -1219,6 +1230,19 @@ void CheckTargetEvidenceSnapshotCodecContract(const fs::path& root,
               !Contains(implementation, "DeviceIoControl") &&
               !Contains(tool, "DeviceIoControl") &&
               !Contains(tool, "VMXON"));
+    Check(state, "target snapshot gate binds decode and release policy",
+          Contains(gate_header, "TargetEvidenceSnapshotGateResult") &&
+              Contains(gate_header, "EvaluateTargetEvidenceSnapshotGate") &&
+              Contains(gate_implementation,
+                       "BuildTargetEvidenceManifestFromSnapshot") &&
+              Contains(gate_implementation,
+                       "EvaluateTargetEvidenceGate") &&
+              Contains(gate_test, "profile mismatch") &&
+              Contains(gate_test, "generation mismatch"));
+    Check(state, "target snapshot gate remains host-only",
+          !Contains(gate_implementation, "__vmx") &&
+              !Contains(gate_implementation, "__readmsr") &&
+              !Contains(gate_implementation, "DeviceIoControl"));
 }
 
 void CheckPureModels(TestState& state) {

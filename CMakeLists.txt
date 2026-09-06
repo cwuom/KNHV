@@ -449,6 +449,7 @@ if(KNHV_BUILD_TESTS)
             tests/target_evidence_writer_test.cpp
             tests/target_snapshot_test.cpp
             tests/target_snapshot_codec_test.cpp
+            tests/target_snapshot_gate_test.cpp
             tests/ept_time_model_test.cpp
             tests/vmcs02_model_test.cpp
             tests/vmcs_shadow_model_test.cpp
@@ -469,10 +470,12 @@ if(KNHV_BUILD_TESTS)
             src/validation/target_evidence_writer.cpp
             src/validation/target_snapshot.cpp
             src/validation/target_snapshot_codec.cpp
+            src/validation/target_snapshot_gate.cpp
             src/include/knhv_target_evidence_signature.h
             src/include/knhv_target_evidence_writer.h
             src/include/knhv_target_snapshot.h
             src/include/knhv_target_snapshot_codec.h
+            src/include/knhv_target_snapshot_gate.h
             src/ept/ept_model.cpp
             src/time/time_contract.cpp
             src/nested/vmcs02_model.cpp
@@ -601,6 +604,7 @@ if(KNHV_BUILD_EVIDENCE_TOOL)
             src/validation/target_evidence_writer.cpp
             src/validation/target_snapshot.cpp
             src/validation/target_snapshot_codec.cpp
+            src/validation/target_snapshot_gate.cpp
             src/provider/owner_observation.cpp
             src/vmx/cpu_matrix_model.cpp
             src/vmx/vmx_capability_model.cpp
@@ -610,6 +614,7 @@ if(KNHV_BUILD_EVIDENCE_TOOL)
             src/include/knhv_target_evidence_writer.h
             src/include/knhv_target_snapshot.h
             src/include/knhv_target_snapshot_codec.h
+            src/include/knhv_target_snapshot_gate.h
             src/include/knhv_cpu_matrix.h
             src/include/knhv_owner_observation.h
             src/include/knhv_vmx_capability.h)

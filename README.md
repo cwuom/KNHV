@@ -329,6 +329,19 @@ re-run the same validation before materializing a manifest:
   --validate-snapshot snapshot.bin --out snapshot-validate.json
 ```
 
+After validation, the same executable can apply the profile, stage, and
+generation gate to the decoded snapshot in one operation:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --gate-snapshot snapshot.bin --profile synthetic-lab --stage release `
+  --expected-generation 1 --out snapshot-gate.json
+```
+
+A blocked or malformed package returns a nonzero exit code and never becomes
+a release manifest. This command evaluates supplied evidence only; it does
+not acquire VMX ownership, start a driver, or touch devices.
+
 The synthetic command is a laboratory fixture only. A target collector must
 provide the real per-processor samples and a matching generation; malformed,
 truncated, or tampered packages are rejected before a manifest is written.
