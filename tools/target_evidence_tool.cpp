@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "knhv_target_evidence_codec.h"
+#include "knhv_target_evidence_signature.h"
 
 namespace {
 
@@ -31,6 +32,7 @@ enum class Operation : std::uint32_t {
     EmitSynthetic = 1,
     Validate = 2,
     Gate = 3,
+    VerifySignature = 4,
 };
 
 struct Options {
@@ -41,8 +43,10 @@ struct Options {
         knhv::TargetEvidenceProfile::Unknown;
     knhv::TargetEvidenceStage stage = knhv::TargetEvidenceStage::Inventory;
     std::uint64_t expected_generation = 0U;
+    bool profile_set = false;
     bool stage_set = false;
     bool generation_set = false;
+    bool allow_test_root = false;
     bool help = false;
 };
 
@@ -52,21 +56,28 @@ void PrintUsage() {
         << "KNHV_EvidenceTool --validate path [--out report.json]\n"
         << "KNHV_EvidenceTool --gate path --profile profile --stage stage"
            " [--expected-generation value] [--out report.json]\n"
+        << "KNHV_EvidenceTool --verify-signature path"
+           " [--allow-test-root] [--out report.json]\n"
         << "  profiles: native-intel-l0, whp-managed, external-l0,"
            " synthetic-lab\n"
         << "  stages: inventory, preflight, capability, boot, nested,"
            " device, performance, reliability, release\n"
         << "  emit-synthetic creates laboratory evidence only; it never"
-           " asserts hardware ownership\n";
+           " asserts hardware ownership\n"
+        << "  verify-signature uses WinVerifyTrust with no online revocation"
+           " check\n";
 }
 
 bool TakePath(int& index, int argc, wchar_t** argv, fs::path& path) {
     if (index + 1 >= argc) return false;
+    const std::wstring_view candidate(argv[index + 1]);
+    if (candidate.empty() ||
+        (candidate.size() >= 2U && candidate[0] == L'-' &&
+         candidate[1] == L'-')) {
+        return false;
+    }
     path = fs::path(argv[++index]);
-    return !path.empty() && path.filename() != fs::path(L"--out") &&
-           path.filename() != fs::path(L"--validate") &&
-           path.filename() != fs::path(L"--gate") &&
-           path.filename() != fs::path(L"--emit-synthetic");
+    return !path.empty();
 }
 
 bool ParseUnsigned(std::wstring_view text, std::uint64_t& value) {
@@ -154,12 +165,21 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options,
                 if (error.empty()) error = "--gate needs a path";
                 return false;
             }
+        } else if (argument == L"--verify-signature") {
+            fs::path path;
+            if (!TakePath(index, argc, argv, path) ||
+                !SetOperation(options, Operation::VerifySignature, path,
+                               error)) {
+                if (error.empty()) error = "--verify-signature needs a path";
+                return false;
+            }
         } else if (argument == L"--profile") {
             if (index + 1 >= argc ||
                 !ParseProfile(argv[++index], options.profile)) {
                 error = "--profile is unknown";
                 return false;
             }
+            options.profile_set = true;
         } else if (argument == L"--stage") {
             if (index + 1 >= argc ||
                 !ParseStage(argv[++index], options.stage)) {
@@ -183,6 +203,8 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options,
                 error = "--out needs a path";
                 return false;
             }
+        } else if (argument == L"--allow-test-root") {
+            options.allow_test_root = true;
         } else {
             error = "unknown option";
             return false;
@@ -200,6 +222,16 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options,
     }
     if (options.operation == Operation::Gate && !options.stage_set) {
         error = "--gate requires --stage";
+        return false;
+    }
+    if (options.operation != Operation::Gate &&
+        (options.profile_set || options.stage_set || options.generation_set)) {
+        error = "profile, stage, and generation apply only to --gate";
+        return false;
+    }
+    if (options.operation != Operation::VerifySignature &&
+        options.allow_test_root) {
+        error = "--allow-test-root applies only to --verify-signature";
         return false;
     }
     return true;
@@ -396,6 +428,60 @@ std::string BuildJson(const char* operation, const char* status,
     return output.str();
 }
 
+std::string HexU32(std::uint32_t value) {
+    std::ostringstream output;
+    output << "0x" << std::hex << value;
+    return output.str();
+}
+
+std::string BuildSignatureJson(
+    const fs::path& path, const knhv::TargetEvidenceSignatureResult& result,
+    bool allow_test_root) {
+    const auto signature_status =
+        static_cast<knhv::TargetEvidenceSignatureStatus>(result.status);
+    const bool passed =
+        signature_status == knhv::TargetEvidenceSignatureStatus::Trusted ||
+        signature_status ==
+            knhv::TargetEvidenceSignatureStatus::PrivateTestRoot;
+    const bool blocked =
+        signature_status == knhv::TargetEvidenceSignatureStatus::NotSigned ||
+        signature_status == knhv::TargetEvidenceSignatureStatus::Untrusted;
+    const bool private_root_accepted =
+        (result.result_flags &
+         knhv::kTargetEvidenceSignatureResultPrivateRootAccepted) != 0U;
+    std::ostringstream output;
+    output << "{\n"
+           << "  \"schema\":\"knhv-target-evidence-tool-1\",\n"
+           << "  \"operation\":\"verify-signature\",\n"
+           << "  \"status\":\""
+           << (passed ? "pass" : (blocked ? "blocked" : "fail"))
+           << "\",\n"
+           << "  \"reason\":\""
+           << knhv::TargetEvidenceSignatureStatusText(signature_status)
+           << "\",\n"
+           << "  \"path\":\"" << JsonEscape(path.generic_string())
+           << "\",\n"
+           << "  \"hardware_execution\":false,\n"
+           << "  \"revocation_checks\":\"none\",\n"
+           << "  \"cache_only_url_retrieval\":true,\n"
+           << "  \"certificate_store_modified\":false,\n"
+           << "  \"verifier\":\"WinVerifyTrust\",\n"
+           << "  \"signature\":{\n"
+           << "    \"status_code\":" << result.status << ",\n"
+           << "    \"status\":\""
+           << knhv::TargetEvidenceSignatureStatusText(signature_status)
+           << "\",\n"
+           << "    \"wintrust_status\":\""
+           << HexU32(result.wintrust_status) << "\",\n"
+           << "    \"allow_private_test_root\":"
+           << (allow_test_root ? "true" : "false") << ",\n"
+           << "    \"private_test_root_accepted\":"
+           << (private_root_accepted ? "true" : "false") << "\n"
+           << "  }\n"
+           << "}\n";
+    return output.str();
+}
+
 bool WriteReport(const fs::path& path, const std::string& text,
                  std::string& error) {
     if (path.empty()) {
@@ -541,6 +627,46 @@ int RunGate(const Options& options) {
     return passed ? kExitSuccess : kExitBlocked;
 }
 
+int RunVerifySignature(const Options& options) {
+    knhv::TargetEvidenceSignatureRequest request{};
+    request.size = sizeof(request);
+    request.version = knhv::kTargetEvidenceSignatureContractVersion;
+    request.flags = options.allow_test_root
+                        ? knhv::kTargetEvidenceSignatureFlagAllowPrivateTestRoot
+                        : 0U;
+    knhv::TargetEvidenceSignatureResult result{};
+    const std::wstring path = options.input.wstring();
+    const knhv::TargetEvidenceSignatureStatus status =
+        knhv::VerifyTargetEvidenceFileSignature(path.c_str(), &request,
+                                                &result);
+    std::string error;
+    if (!knhv::IsTargetEvidenceSignatureResultValid(&result)) {
+        std::cerr << "signature verifier returned an invalid result\n";
+        return kExitInvalid;
+    }
+    const std::string report =
+        BuildSignatureJson(options.input, result, options.allow_test_root);
+    if (!WriteReport(options.output, report, error)) {
+        std::cerr << error << '\n';
+        return kExitIo;
+    }
+    switch (status) {
+        case knhv::TargetEvidenceSignatureStatus::Trusted:
+        case knhv::TargetEvidenceSignatureStatus::PrivateTestRoot:
+            return kExitSuccess;
+        case knhv::TargetEvidenceSignatureStatus::NotSigned:
+        case knhv::TargetEvidenceSignatureStatus::Untrusted:
+            return kExitBlocked;
+        case knhv::TargetEvidenceSignatureStatus::FileNotFound:
+            return kExitIo;
+        case knhv::TargetEvidenceSignatureStatus::VerificationUnavailable:
+            return kExitInvalid;
+        case knhv::TargetEvidenceSignatureStatus::InvalidArgument:
+        default:
+            return kExitUsage;
+    }
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -559,6 +685,7 @@ int wmain(int argc, wchar_t** argv) {
         case Operation::EmitSynthetic: return RunEmit(options);
         case Operation::Validate: return RunValidate(options);
         case Operation::Gate: return RunGate(options);
+        case Operation::VerifySignature: return RunVerifySignature(options);
         default: return kExitUsage;
     }
 }

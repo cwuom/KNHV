@@ -445,6 +445,7 @@ if(KNHV_BUILD_TESTS)
             tests/owner_observation_model_test.cpp
             tests/target_evidence_model_test.cpp
             tests/target_evidence_codec_test.cpp
+            tests/target_evidence_signature_test.cpp
             tests/ept_time_model_test.cpp
             tests/vmcs02_model_test.cpp
             tests/vmcs_shadow_model_test.cpp
@@ -461,6 +462,8 @@ if(KNHV_BUILD_TESTS)
             src/provider/owner_observation.cpp
             src/validation/target_evidence.cpp
             src/validation/target_evidence_codec.cpp
+            src/validation/target_evidence_signature.cpp
+            src/include/knhv_target_evidence_signature.h
             src/ept/ept_model.cpp
             src/time/time_contract.cpp
             src/nested/vmcs02_model.cpp
@@ -585,8 +588,10 @@ if(KNHV_BUILD_EVIDENCE_TOOL)
             tools/target_evidence_tool.cpp
             src/validation/target_evidence.cpp
             src/validation/target_evidence_codec.cpp
+            src/validation/target_evidence_signature.cpp
             src/include/knhv_target_evidence.h
-            src/include/knhv_target_evidence_codec.h)
+            src/include/knhv_target_evidence_codec.h
+            src/include/knhv_target_evidence_signature.h)
     knhv_set_artifact_layout(KNHV_EvidenceTool program)
     if(_knhv_toolchain_includes)
         target_include_directories(KNHV_EvidenceTool SYSTEM BEFORE PRIVATE
@@ -607,7 +612,7 @@ if(KNHV_BUILD_EVIDENCE_TOOL)
         set_property(TARGET KNHV_EvidenceTool APPEND_STRING PROPERTY
                      LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
     endif()
-    target_link_libraries(KNHV_EvidenceTool PRIVATE bcrypt)
+    target_link_libraries(KNHV_EvidenceTool PRIVATE bcrypt wintrust)
     if(_knhv_saved_cxx_standard_libraries)
         set(_knhv_evidence_tool_standard_libraries
             "${_knhv_saved_cxx_standard_libraries}")

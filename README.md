@@ -256,9 +256,13 @@ privileged target-side validation.
 evidence contract. `--emit-synthetic` creates a clearly marked laboratory
 package, `--validate` checks its fixed wire header and SHA-256 envelope digest,
 and `--gate` evaluates profile, stage, generation, and required flags. The
-tool never turns a synthetic package into hardware evidence. Detached signature
-verification is an adapter contract; an isolated release pipeline must provide
-the Windows certificate-chain verifier before setting `SignatureVerified`.
+tool never turns a synthetic package into hardware evidence. `--verify-signature`
+uses Windows `WinVerifyTrust` with revocation checks disabled and cache-only URL
+retrieval. It reports `trusted`, `not-signed`, `untrusted`, or
+`private-test-root` without changing the certificate store or setting
+`SignatureVerified` in a manifest. A private test root is accepted only with
+the explicit `--allow-test-root` option and remains unsuitable as a production
+signing result.
 
 Example offline flow:
 
@@ -269,6 +273,9 @@ Example offline flow:
   --validate evidence.bin --out evidence-validate.json
 .\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
   --gate evidence.bin --profile synthetic-lab --stage release
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --verify-signature .\build\vscode\Release\sys\KNHV.sys `
+  --out driver-signature.json
 ```
 
 The pure `knhv_vmx_capability` contract is the next validation boundary for a

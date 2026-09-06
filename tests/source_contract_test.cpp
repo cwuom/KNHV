@@ -1057,6 +1057,50 @@ void CheckTargetEvidenceCodecContract(const fs::path& root,
               !Contains(tool, "VMXON"));
 }
 
+void CheckTargetEvidenceSignatureContract(const fs::path& root,
+                                          TestState& state) {
+    const std::string header = Source(
+        root, "src/include/knhv_target_evidence_signature.h", state);
+    const std::string implementation = Source(
+        root, "src/validation/target_evidence_signature.cpp", state);
+    const std::string test = Source(
+        root, "tests/target_evidence_signature_test.cpp", state);
+    const std::string tool = Source(
+        root, "tools/target_evidence_tool.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "signature verifier exposes bounded versioned records",
+          Contains(header, "TargetEvidenceSignatureRequest") &&
+              Contains(header, "TargetEvidenceSignatureResult") &&
+              Contains(header, "kTargetEvidenceSignatureMaxPath") &&
+              Contains(header, "PrivateTestRoot") &&
+              Contains(implementation,
+                       "IsTargetEvidenceSignatureResultValid"));
+    Check(state, "signature verifier uses the offline WinVerifyTrust policy",
+          Contains(implementation, "WinVerifyTrust") &&
+              Contains(implementation, "WTD_REVOKE_NONE") &&
+              Contains(implementation, "WTD_CACHE_ONLY_URL_RETRIEVAL") &&
+              Contains(implementation, "WTD_STATEACTION_CLOSE"));
+    Check(state, "signature verifier reports trusted and blocked evidence",
+          Contains(test, "missing signature input") &&
+              Contains(test, "private test root") &&
+              Contains(tool, "--verify-signature") &&
+              Contains(tool, "--allow-test-root") &&
+              Contains(tool, "private_test_root_accepted"));
+    Check(state, "signature verifier is built only for host tools and tests",
+          Contains(cmake, "tests/target_evidence_signature_test.cpp") &&
+              Contains(cmake, "src/validation/target_evidence_signature.cpp") &&
+              Contains(cmake, "knhv_target_evidence_signature.h") &&
+              Contains(cmake, "bcrypt wintrust") &&
+              Contains(readme, "--verify-signature"));
+    Check(state, "signature verifier performs no privileged operation",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__readmsr") &&
+              !Contains(implementation, "__writemsr") &&
+              !Contains(implementation, "DeviceIoControl") &&
+              !Contains(tool, "DeviceIoControl") && !Contains(tool, "VMXON"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -1134,6 +1178,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckOwnerObservationContract(root, state);
     CheckTargetEvidenceContract(root, state);
     CheckTargetEvidenceCodecContract(root, state);
+    CheckTargetEvidenceSignatureContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);
