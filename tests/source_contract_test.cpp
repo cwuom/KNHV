@@ -500,6 +500,8 @@ void CheckPreflightContract(const fs::path& root, TestState& state) {
     Check(state, "preflight is read-only and fail-closed",
           Contains(header, "GateState") &&
               Contains(common, "knhv-preflight-1") &&
+              Contains(common, "EvaluateOwnerGate") &&
+              Contains(common, "owner_gate") &&
               Contains(common, "EnumSystemFirmwareTables") &&
               Contains(common, "0x52414D44U") &&
               Contains(common, "DeviceIoControl") &&

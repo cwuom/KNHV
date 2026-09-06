@@ -666,7 +666,9 @@ if(KNHV_BUILD_PREFLIGHT)
     add_executable(KNHV_Preflight
             preflight/preflight_main.cpp
             preflight/preflight_common.cpp
-            preflight/preflight.h)
+            preflight/preflight.h
+            src/provider/owner_observation.cpp
+            src/include/knhv_owner_observation.h)
     knhv_set_artifact_layout(KNHV_Preflight program)
     if(_knhv_toolchain_includes)
         target_include_directories(KNHV_Preflight SYSTEM BEFORE PRIVATE

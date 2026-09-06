@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "knhv_control_ioctl.h"
+#include "knhv_owner_observation.h"
 
 namespace knhv_preflight {
 namespace {
@@ -182,6 +183,7 @@ struct ProviderSnapshot {
     std::uint32_t status = 0U;
     std::uint32_t flags = 0U;
     std::uint64_t features = 0U;
+    std::uint64_t generation = 0U;
 };
 
 struct HostSnapshot {
@@ -189,6 +191,8 @@ struct HostSnapshot {
     TopologySnapshot topology;
     PlatformSnapshot platform;
     ProviderSnapshot provider;
+    knhv::OwnerObservation owner_observation{};
+    knhv::OwnerGateResult owner_gate{};
 };
 
 void ReadCpuid(int leaf, int subleaf, std::array<int, 4>& registers) {
@@ -455,6 +459,9 @@ void QueryProvider(ProviderSnapshot& snapshot) {
     snapshot.status = static_cast<std::uint32_t>(response.status);
     snapshot.flags = response.snapshot.status_flags;
     snapshot.features = response.snapshot.feature_bits;
+    snapshot.generation = response.snapshot.owner_generation != 0U
+                              ? response.snapshot.owner_generation
+                              : response.snapshot.boot_generation;
     snapshot.reason = "capability snapshot received";
     const bool boot_l0 =
         (snapshot.flags & knhv::kFlagKnhvBootL0Active) != 0U;
@@ -469,6 +476,143 @@ void QueryProvider(ProviderSnapshot& snapshot) {
                                 : TriState::Yes;
     if (outer_l0) snapshot.unique_owner = TriState::No;
     CloseHandle(device);
+}
+
+knhv::OwnerEvidenceState ToOwnerEvidence(TriState state) {
+    switch (state) {
+        case TriState::Yes:
+            return knhv::OwnerEvidenceState::Present;
+        case TriState::No:
+            return knhv::OwnerEvidenceState::Clear;
+        default:
+            return knhv::OwnerEvidenceState::Unknown;
+    }
+}
+
+const char* OwnerEvidenceText(std::uint32_t value) {
+    switch (static_cast<knhv::OwnerEvidenceState>(value)) {
+        case knhv::OwnerEvidenceState::Present:
+            return "present";
+        case knhv::OwnerEvidenceState::Clear:
+            return "clear";
+        case knhv::OwnerEvidenceState::Unknown:
+            return "unknown";
+        default:
+            return "invalid";
+    }
+}
+
+std::uint32_t ProviderOwnerFlagCount(const ProviderSnapshot& provider) {
+    const std::uint32_t flags = provider.flags;
+    return ((flags & knhv::kFlagSyntheticSnapshot) != 0U ? 1U : 0U) +
+           ((flags & knhv::kFlagKnhvBootL0Active) != 0U ? 1U : 0U) +
+           ((flags & knhv::kFlagOuterL0Active) != 0U ? 1U : 0U) +
+           ((flags & knhv::kFlagWhpPartition) != 0U ? 1U : 0U);
+}
+
+knhv::HvOwnerKindV2 ProviderOwner(const ProviderSnapshot& provider) {
+    if (provider.device != TriState::Yes || ProviderOwnerFlagCount(provider) >
+                                                1U) {
+        return knhv::HvOwnerKindV2::Unknown;
+    }
+    if ((provider.flags & knhv::kFlagSyntheticSnapshot) != 0U) {
+        return knhv::HvOwnerKindV2::SyntheticLab;
+    }
+    if ((provider.flags & knhv::kFlagKnhvBootL0Active) != 0U) {
+        return knhv::HvOwnerKindV2::KnhvBootL0;
+    }
+    if ((provider.flags & knhv::kFlagOuterL0Active) != 0U) {
+        return knhv::HvOwnerKindV2::ExternalL0;
+    }
+    if ((provider.flags & knhv::kFlagWhpPartition) != 0U) {
+        return knhv::HvOwnerKindV2::WhpManaged;
+    }
+    return knhv::HvOwnerKindV2::Unknown;
+}
+
+knhv::HvProviderStateV2 ProviderState(const ProviderSnapshot& provider) {
+    if (provider.device != TriState::Yes) {
+        return knhv::HvProviderStateV2::Unknown;
+    }
+    if (ProviderOwnerFlagCount(provider) > 1U ||
+        (provider.flags & knhv::kFlagOuterL0Active) != 0U) {
+        return knhv::HvProviderStateV2::Conflict;
+    }
+    if ((provider.flags & knhv::kFlagKnhvBootL0Active) != 0U) {
+        return (provider.flags & knhv::kFlagBootHandoffVerified) != 0U
+                   ? knhv::HvProviderStateV2::Active
+                   : knhv::HvProviderStateV2::Blocked;
+    }
+    if ((provider.flags & (knhv::kFlagWhpPartition |
+                           knhv::kFlagSyntheticSnapshot)) != 0U) {
+        return knhv::HvProviderStateV2::Available;
+    }
+    return knhv::HvProviderStateV2::Unknown;
+}
+
+TriState WindowsHypervisorEvidence(const PlatformSnapshot& platform) {
+    bool all_service_states_known = true;
+    for (const auto& service : platform.services) {
+        if (service.second.running == TriState::Yes) return TriState::Yes;
+        if (service.second.running == TriState::Unknown) {
+            all_service_states_known = false;
+        }
+    }
+    if (platform.whp_hypervisor == TriState::Yes) return TriState::Yes;
+    if (platform.whp_hypervisor == TriState::No &&
+        !all_service_states_known) {
+        return TriState::Unknown;
+    }
+    return all_service_states_known ? TriState::No : TriState::Unknown;
+}
+
+TriState WhpAvailability(const PlatformSnapshot& platform) {
+    if (platform.whp_library == TriState::No ||
+        platform.whp_api == TriState::No) {
+        return TriState::No;
+    }
+    if (platform.whp_library == TriState::Yes &&
+        platform.whp_api == TriState::Yes) {
+        return TriState::Yes;
+    }
+    return TriState::Unknown;
+}
+
+knhv::OwnerObservation BuildOwnerObservation(const HostSnapshot& host) {
+    knhv::OwnerObservation observation = {};
+    observation.size = sizeof(observation);
+    observation.version = knhv::kOwnerObservationContractVersion;
+    observation.cpuid_hypervisor = static_cast<std::uint32_t>(
+        host.cpu.max_basic_leaf < 1U
+            ? knhv::OwnerEvidenceState::Unknown
+            : host.cpu.hypervisor_bit
+                  ? knhv::OwnerEvidenceState::Present
+                  : knhv::OwnerEvidenceState::Clear);
+    observation.windows_hypervisor = static_cast<std::uint32_t>(
+        ToOwnerEvidence(WindowsHypervisorEvidence(host.platform)));
+    observation.vbs = static_cast<std::uint32_t>(
+        ToOwnerEvidence(host.platform.vbs_configured));
+    observation.hvci = static_cast<std::uint32_t>(
+        ToOwnerEvidence(host.platform.hvci_configured));
+    observation.whp_available = static_cast<std::uint32_t>(
+        ToOwnerEvidence(WhpAvailability(host.platform)));
+    observation.provider_device = static_cast<std::uint32_t>(
+        ToOwnerEvidence(host.provider.device));
+    observation.boot_handoff = host.provider.device != TriState::Yes
+                                   ? static_cast<std::uint32_t>(
+                                         knhv::OwnerEvidenceState::Unknown)
+                               : (host.provider.flags &
+                                  knhv::kFlagBootHandoffVerified) != 0U
+                                   ? static_cast<std::uint32_t>(
+                                         knhv::OwnerEvidenceState::Present)
+                                   : static_cast<std::uint32_t>(
+                                         knhv::OwnerEvidenceState::Clear);
+    observation.provider_owner = static_cast<std::uint32_t>(
+        ProviderOwner(host.provider));
+    observation.provider_state = static_cast<std::uint32_t>(
+        ProviderState(host.provider));
+    observation.generation = host.provider.generation;
+    return observation;
 }
 
 HostSnapshot CollectHost() {
@@ -495,6 +639,8 @@ HostSnapshot CollectHost() {
     }
     QueryWhp(snapshot.platform);
     QueryProvider(snapshot.provider);
+    snapshot.owner_observation = BuildOwnerObservation(snapshot);
+    EvaluateOwnerGate(&snapshot.owner_observation, &snapshot.owner_gate);
     return snapshot;
 }
 
@@ -504,6 +650,32 @@ GateResult MakeGate(std::string name, GateState state, std::string reason) {
     result.state = state;
     result.reason = std::move(reason);
     return result;
+}
+
+GateState OwnerGateState(const knhv::OwnerGateResult& result) {
+    if (!knhv::IsOwnerGateResultValid(&result)) return GateState::Unknown;
+    const bool native = result.action == static_cast<std::uint32_t>(
+                            knhv::OwnerGateAction::AcquireNative) &&
+                        result.status == knhv::HvStatus::Success;
+    if (native) return GateState::Pass;
+    if ((result.flags & knhv::kOwnerGateFlagConflict) != 0U ||
+        result.status == knhv::HvStatus::BootHandoffFailed ||
+        result.status == knhv::HvStatus::HardwareOwnerConflict) {
+        return GateState::Fail;
+    }
+    return GateState::Unknown;
+}
+
+std::string OwnerGateReasonText(const knhv::OwnerGateResult& result) {
+    const auto action = static_cast<knhv::OwnerGateAction>(result.action);
+    const auto reason = static_cast<knhv::OwnerGateReason>(result.reason);
+    const auto owner = static_cast<knhv::HvOwnerKindV2>(result.owner);
+    std::ostringstream output;
+    output << "action=" << knhv::OwnerGateActionText(action)
+           << ", reason=" << knhv::OwnerGateReasonText(reason)
+           << ", owner=" << knhv::OwnerKindText(owner)
+           << ", status=" << static_cast<std::uint32_t>(result.status);
+    return output.str();
 }
 
 std::vector<GateResult> EvaluateGates(const HostSnapshot& host,
@@ -570,6 +742,8 @@ std::vector<GateResult> EvaluateGates(const HostSnapshot& host,
                                                     : GateState::Unknown,
         std::string("KNHV_BOOT_L0=") +
             TriStateText(host.provider.knhv_boot_l0)));
+    gates.push_back(MakeGate("owner.gate", OwnerGateState(host.owner_gate),
+                             OwnerGateReasonText(host.owner_gate)));
     if (host_only) {
         gates.push_back(MakeGate(
             "profile.host-only", GateState::Pass,
@@ -667,8 +841,47 @@ std::string BuildJson(const HostSnapshot& host,
            << "\",\"status\":" << host.provider.status
            << ",\"flags\":\"" << Hex(host.provider.flags)
            << "\",\"features\":\"" << Hex(host.provider.features)
+           << "\",\"generation\":\"" << Hex(host.provider.generation)
            << "\",\"reason\":\""
            << JsonEscape(host.provider.reason) << "\"},\n"
+           << "  \"owner_observation\":{\"cpuid_hypervisor\":\""
+           << OwnerEvidenceText(host.owner_observation.cpuid_hypervisor)
+           << "\",\"windows_hypervisor\":\""
+           << OwnerEvidenceText(host.owner_observation.windows_hypervisor)
+           << "\",\"vbs\":\""
+           << OwnerEvidenceText(host.owner_observation.vbs)
+           << "\",\"hvci\":\""
+           << OwnerEvidenceText(host.owner_observation.hvci)
+           << "\",\"whp_available\":\""
+           << OwnerEvidenceText(host.owner_observation.whp_available)
+           << "\",\"provider_device\":\""
+           << OwnerEvidenceText(host.owner_observation.provider_device)
+           << "\",\"boot_handoff\":\""
+           << OwnerEvidenceText(host.owner_observation.boot_handoff)
+           << "\",\"provider_owner\":\""
+           << knhv::OwnerKindText(static_cast<knhv::HvOwnerKindV2>(
+                  host.owner_observation.provider_owner))
+           << "\",\"provider_state\":"
+           << host.owner_observation.provider_state
+           << ",\"generation\":\""
+           << Hex(host.owner_observation.generation) << "\"},\n"
+           << "  \"owner_gate\":{\"valid\":"
+           << (knhv::IsOwnerGateResultValid(&host.owner_gate) ? "true"
+                                                               : "false")
+           << ",\"action\":\""
+           << knhv::OwnerGateActionText(static_cast<knhv::OwnerGateAction>(
+                  host.owner_gate.action))
+           << "\",\"reason\":\""
+           << knhv::OwnerGateReasonText(static_cast<knhv::OwnerGateReason>(
+                  host.owner_gate.reason))
+           << "\",\"status\":"
+           << static_cast<std::uint32_t>(host.owner_gate.status)
+           << ",\"owner\":\""
+           << knhv::OwnerKindText(static_cast<knhv::HvOwnerKindV2>(
+                  host.owner_gate.owner))
+           << "\",\"flags\":\"" << Hex(host.owner_gate.flags)
+           << "\",\"generation\":\""
+           << Hex(host.owner_gate.generation) << "\"},\n"
            << "  \"services\":[";
     for (std::size_t index = 0; index < host.platform.services.size(); ++index) {
         if (index != 0U) output << ',';

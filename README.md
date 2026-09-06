@@ -237,6 +237,10 @@ and provider observations in `knhv-preflight-1` JSON. Unknown privileged state
 is retained as `unknown` and blocks a `native-l0` profile; the tool never changes
 boot policy, loads a driver, or executes VMX instructions.
 
+The owner_observation and owner_gate fields record the selected action, reason,
+owner, and generation. Only a complete, active KNHV Boot L0 handoff can
+produce acquire-native; unknown or conflicting evidence remains blocked.
+
 `KNHV_CpuMatrix.exe` is a separate read-only target-machine probe. It temporarily
 binds one user-mode thread to each active logical processor, records the
 observable CPUID feature set, restores the original affinity, and emits a
