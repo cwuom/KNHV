@@ -312,6 +312,12 @@ carry hardware evidence. Native Intel capability and release profiles require
 target hardware evidence and a trusted signature; the writer never reads VMX,
 VT-d, DMA, device, or certificate-store state itself.
 
+The target snapshot adapter is the boundary before the writer. It accepts a
+versioned snapshot plus raw per-processor CPU and VMX samples, recomputes both
+matrices, checks owner and generation consistency, and forwards only a valid
+candidate to the writer. The adapter is host-only; privileged collection and
+hardware execution remain explicit target-side operations.
+
 Run it once on the isolated validation target after copying the matching build:
 
 ```powershell

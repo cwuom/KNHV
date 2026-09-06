@@ -1127,8 +1127,8 @@ void CheckTargetEvidenceWriterContract(const fs::path& root,
               Contains(test, "synthetic evidence requires the allow flag") &&
               Contains(test, "native release commits a trusted signature"));
     Check(state, "manifest writer is used by synthetic package emission",
-          Contains(tool, "TargetEvidenceManifestWriteRequest") &&
-              Contains(tool, "BuildTargetEvidenceManifest") &&
+          Contains(tool, "TargetEvidenceSnapshot") &&
+              Contains(tool, "BuildTargetEvidenceManifestFromSnapshot") &&
               Contains(cmake, "src/validation/target_evidence_writer.cpp") &&
               Contains(cmake, "tests/target_evidence_writer_test.cpp") &&
               Contains(cmake, "knhv_target_evidence_writer.h") &&
@@ -1139,6 +1139,46 @@ void CheckTargetEvidenceWriterContract(const fs::path& root,
               !Contains(implementation, "__writemsr") &&
               !Contains(implementation, "DeviceIoControl") &&
               !Contains(implementation, "WinVerifyTrust"));
+}
+
+void CheckTargetEvidenceSnapshotContract(const fs::path& root,
+                                         TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_target_snapshot.h", state);
+    const std::string implementation =
+        Source(root, "src/validation/target_snapshot.cpp", state);
+    const std::string test =
+        Source(root, "tests/target_snapshot_test.cpp", state);
+    const std::string tool =
+        Source(root, "tools/target_evidence_tool.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "target snapshot exposes bounded versioned records",
+          Contains(header, "TargetEvidenceSnapshot") &&
+              Contains(header, "TargetEvidenceSnapshotResult") &&
+              Contains(header, "kTargetEvidenceSnapshotMaxStructSize") &&
+              Contains(header, "ValidateTargetEvidenceSnapshot") &&
+              Contains(implementation,
+                       "BuildTargetEvidenceManifestFromSnapshot"));
+    Check(state, "target snapshot recomputes CPU and VMX evidence",
+          Contains(implementation, "BuildCpuMatrixSummary") &&
+              Contains(implementation, "BuildVmxCapabilityMatrix") &&
+              Contains(implementation, "GenerationMismatch") &&
+              Contains(test, "forged CPU summary") &&
+              Contains(test, "forged VMX summary"));
+    Check(state, "target snapshot is wired into host tools and tests",
+          Contains(cmake, "src/validation/target_snapshot.cpp") &&
+              Contains(cmake, "tests/target_snapshot_test.cpp") &&
+              Contains(cmake, "knhv_target_snapshot.h") &&
+              Contains(tool, "MakeSyntheticSnapshot") &&
+              Contains(readme, "snapshot adapter"));
+    Check(state, "target snapshot remains a host-only boundary",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__readmsr") &&
+              !Contains(implementation, "__writemsr") &&
+              !Contains(implementation, "DeviceIoControl") &&
+              !Contains(tool, "DeviceIoControl") &&
+              !Contains(tool, "VMXON"));
 }
 
 void CheckPureModels(TestState& state) {
@@ -1220,6 +1260,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckTargetEvidenceCodecContract(root, state);
     CheckTargetEvidenceSignatureContract(root, state);
     CheckTargetEvidenceWriterContract(root, state);
+    CheckTargetEvidenceSnapshotContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);

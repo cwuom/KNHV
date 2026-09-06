@@ -16,7 +16,7 @@
 
 #include "knhv_target_evidence_codec.h"
 #include "knhv_target_evidence_signature.h"
-#include "knhv_target_evidence_writer.h"
+#include "knhv_target_snapshot.h"
 
 namespace {
 
@@ -245,34 +245,70 @@ void FillDigest(knhv::u8* digest, knhv::u8 seed) {
     }
 }
 
-knhv::TargetEvidenceManifest MakeSyntheticManifest() {
-    knhv::TargetEvidenceManifest manifest{};
-    manifest.size = sizeof(manifest);
-    manifest.version = knhv::kTargetEvidenceContractVersion;
-    manifest.profile = static_cast<knhv::u32>(
+knhv::TargetEvidenceSnapshot MakeSyntheticSnapshot() {
+    knhv::TargetEvidenceSnapshot snapshot{};
+    snapshot.size = sizeof(snapshot);
+    snapshot.version = knhv::kTargetEvidenceSnapshotContractVersion;
+    snapshot.profile = static_cast<knhv::u32>(
         knhv::TargetEvidenceProfile::SyntheticLab);
-    manifest.stage = static_cast<knhv::u32>(
+    snapshot.stage = static_cast<knhv::u32>(
         knhv::TargetEvidenceStage::Release);
-    manifest.verdict = static_cast<knhv::u32>(
+    snapshot.verdict = static_cast<knhv::u32>(
         knhv::TargetEvidenceVerdict::Pass);
-    manifest.flags = knhv::RequiredTargetEvidenceFlags(
-        knhv::TargetEvidenceProfile::SyntheticLab,
-        knhv::TargetEvidenceStage::Release);
-    manifest.owner_kind = static_cast<knhv::u32>(
+    snapshot.flags =
+        knhv::kTargetEvidenceSnapshotFlagOwnerObservation |
+        knhv::kTargetEvidenceSnapshotFlagOwnerGate |
+        knhv::kTargetEvidenceSnapshotFlagArtifacts |
+        knhv::kTargetEvidenceSnapshotFlagSourceClean |
+        knhv::kTargetEvidenceSnapshotFlagRecoveryReady |
+        knhv::kTargetEvidenceSnapshotFlagSignature |
+        knhv::kTargetEvidenceSnapshotFlagSynthetic |
+        knhv::kTargetEvidenceSnapshotFlagTimeSynchronized |
+        knhv::kTargetEvidenceSnapshotFlagTelemetry |
+        knhv::kTargetEvidenceSnapshotFlagNoCriticalFaults |
+        knhv::kTargetEvidenceSnapshotFlagPerformance |
+        knhv::kTargetEvidenceSnapshotFlagWarningsClear |
+        knhv::kTargetEvidenceSnapshotFlagAllowPrivateTestRoot;
+    snapshot.artifact_count = 1U;
+    snapshot.generation = 1U;
+    snapshot.started_tsc = 100U;
+    snapshot.ended_tsc = 200U;
+    FillDigest(snapshot.build_id, 1U);
+    FillDigest(snapshot.artifact_hash, 2U);
+    FillDigest(snapshot.manifest_hash, 4U);
+    snapshot.owner_observation.size = sizeof(snapshot.owner_observation);
+    snapshot.owner_observation.version =
+        knhv::kOwnerObservationContractVersion;
+    snapshot.owner_observation.cpuid_hypervisor = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Clear);
+    snapshot.owner_observation.windows_hypervisor = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Clear);
+    snapshot.owner_observation.vbs = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Clear);
+    snapshot.owner_observation.hvci = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Clear);
+    snapshot.owner_observation.whp_available = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Clear);
+    snapshot.owner_observation.provider_device = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Present);
+    snapshot.owner_observation.boot_handoff = static_cast<knhv::u32>(
+        knhv::OwnerEvidenceState::Clear);
+    snapshot.owner_observation.provider_owner = static_cast<knhv::u32>(
         knhv::HvOwnerKindV2::SyntheticLab);
-    manifest.owner_state = static_cast<knhv::u32>(
+    snapshot.owner_observation.provider_state = static_cast<knhv::u32>(
         knhv::HvProviderStateV2::Active);
-    manifest.cpu_count = 1U;
-    manifest.cpu_valid_count = 1U;
-    manifest.artifact_count = 1U;
-    manifest.generation = 1U;
-    manifest.started_tsc = 100U;
-    manifest.ended_tsc = 200U;
-    FillDigest(manifest.build_id, 1U);
-    FillDigest(manifest.artifact_hash, 2U);
-    FillDigest(manifest.capability_hash, 3U);
-    FillDigest(manifest.manifest_hash, 4U);
-    return manifest;
+    snapshot.owner_observation.generation = snapshot.generation;
+    (void)knhv::EvaluateOwnerGate(&snapshot.owner_observation,
+                                  &snapshot.owner_gate);
+    snapshot.signature.size = sizeof(snapshot.signature);
+    snapshot.signature.version =
+        knhv::kTargetEvidenceSignatureContractVersion;
+    snapshot.signature.status = static_cast<knhv::u32>(
+        knhv::TargetEvidenceSignatureStatus::PrivateTestRoot);
+    snapshot.signature.wintrust_status = kSyntheticPrivateRootMarker;
+    snapshot.signature.result_flags =
+        knhv::kTargetEvidenceSignatureResultPrivateRootAccepted;
+    return snapshot;
 }
 
 bool ReadBytes(const fs::path& path, std::vector<knhv::u8>& bytes,
@@ -512,39 +548,22 @@ bool WriteReport(const fs::path& path, const std::string& text,
 }
 
 int RunEmit(const Options& options) {
-    const knhv::TargetEvidenceManifest candidate = MakeSyntheticManifest();
-    knhv::TargetEvidenceSignatureResult signature{};
-    signature.size = sizeof(signature);
-    signature.version = knhv::kTargetEvidenceSignatureContractVersion;
-    signature.status = static_cast<knhv::u32>(
-        knhv::TargetEvidenceSignatureStatus::PrivateTestRoot);
-    signature.wintrust_status = kSyntheticPrivateRootMarker;
-    signature.result_flags =
-        knhv::kTargetEvidenceSignatureResultPrivateRootAccepted;
-
-    knhv::TargetEvidenceManifestWriteRequest write_request{};
-    write_request.size = sizeof(write_request);
-    write_request.version = knhv::kTargetEvidenceWriterContractVersion;
-    write_request.flags =
-        knhv::kTargetEvidenceWriterFlagAllowSynthetic |
-        knhv::kTargetEvidenceWriterFlagAllowPrivateTestRoot |
-        knhv::kTargetEvidenceWriterFlagSourceCleanObserved |
-        knhv::kTargetEvidenceWriterFlagCommitSignature;
-    write_request.candidate = candidate;
-    write_request.signature = signature;
-    knhv::TargetEvidenceManifestWriteResult write_result{};
-    if (!knhv::BuildTargetEvidenceManifest(&write_request, &write_result) ||
-        write_result.status != static_cast<knhv::u32>(
-                                    knhv::TargetEvidenceWriterStatus::Success) ||
-        !knhv::IsTargetEvidenceManifestWriteResultValid(&write_result)) {
-        std::cerr << "manifest writer rejected synthetic evidence: "
-                  << knhv::TargetEvidenceWriterStatusText(
-                         static_cast<knhv::TargetEvidenceWriterStatus>(
-                             write_result.status))
+    const knhv::TargetEvidenceSnapshot snapshot = MakeSyntheticSnapshot();
+    knhv::TargetEvidenceSnapshotResult snapshot_result{};
+    if (!knhv::BuildTargetEvidenceManifestFromSnapshot(
+            &snapshot, nullptr, 0U, nullptr, 0U, &snapshot_result) ||
+        snapshot_result.status != static_cast<knhv::u32>(
+                                       knhv::TargetEvidenceSnapshotStatus::
+                                           Success) ||
+        !knhv::IsTargetEvidenceSnapshotResultValid(&snapshot_result)) {
+        std::cerr << "snapshot adapter rejected synthetic evidence: "
+                  << knhv::TargetEvidenceSnapshotStatusText(
+                         static_cast<knhv::TargetEvidenceSnapshotStatus>(
+                             snapshot_result.status))
                   << '\n';
         return kExitInvalid;
     }
-    const knhv::TargetEvidenceManifest& manifest = write_result.manifest;
+    const knhv::TargetEvidenceManifest& manifest = snapshot_result.manifest;
     std::array<knhv::u8, knhv::kTargetEvidenceWireEnvelopeSize> encoded{};
     knhv::u32 written = 0U;
     const knhv::TargetEvidenceCodecStatus status =
