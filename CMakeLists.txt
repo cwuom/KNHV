@@ -317,6 +317,7 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/nested/vmcs02_model.cpp
         src/iommu/iommu_model.cpp
         src/exit/exit_model.cpp
+        src/vmx/cpu_policy_model.cpp
         src/nested/nested_vmcs.cpp
         src/nested/nested_memory.cpp
         src/nested/nested_instructions.cpp
@@ -330,6 +331,7 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/include/knhv_vmcs02.h
         src/include/knhv_iommu.h
         src/include/knhv_exit.h
+        src/include/knhv_cpu_policy.h
         src/include/knhv_control_ioctl.h
 )
 
@@ -420,6 +422,7 @@ if(KNHV_BUILD_TESTS)
             tests/vmcs02_model_test.cpp
             tests/iommu_model_test.cpp
             tests/exit_model_test.cpp
+            tests/cpu_policy_model_test.cpp
             src/provider/provider_selection.cpp
             src/provider/provider_v2.cpp
             src/ept/ept_model.cpp
@@ -427,6 +430,7 @@ if(KNHV_BUILD_TESTS)
             src/nested/vmcs02_model.cpp
             src/iommu/iommu_model.cpp
             src/exit/exit_model.cpp
+            src/vmx/cpu_policy_model.cpp
             src/nested/nested_vmcs.cpp
             src/nested/nested_memory.cpp
             src/nested/nested_instructions.cpp

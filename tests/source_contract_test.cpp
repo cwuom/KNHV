@@ -617,6 +617,36 @@ void CheckExitContract(const fs::path& root, TestState& state) {
               !Contains(source, "DeviceIoControl"));
 }
 
+void CheckCpuPolicyContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_cpu_policy.h", state);
+    const std::string source =
+        Source(root, "src/vmx/cpu_policy_model.cpp", state);
+    const std::string test =
+        Source(root, "tests/cpu_policy_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "CPU policy model exposes bounded CPUID and MSR rules",
+          Contains(header, "CpuidPolicy") && Contains(header, "MsrPolicy") &&
+              Contains(header, "FilterCpuid") &&
+              Contains(source, "EvaluateMsrAccess"));
+    Check(state, "CPU policy hides unsupported VMX and topology state",
+          Contains(source, "kCpuidExposeVmx") &&
+              Contains(source, "kCpuidPreserveTopology") &&
+              Contains(test, "hides VMX") &&
+              Contains(test, "hides topology"));
+    Check(state, "CPU policy fails closed for unknown or sensitive MSRs",
+          Contains(source, "InjectGeneralProtection") &&
+              Contains(source, "kMsrIa32Efer") &&
+              Contains(test, "unknown MSRs") &&
+              Contains(test, "sensitive EFER"));
+    Check(state, "CPU policy model is wired into drivers and tests",
+          Contains(cmake, "src/vmx/cpu_policy_model.cpp") &&
+              Contains(cmake, "tests/cpu_policy_model_test.cpp"));
+    Check(state, "CPU policy model performs no physical register access",
+          !Contains(source, "__cpuid") && !Contains(source, "__readmsr") &&
+              !Contains(source, "__writemsr") && !Contains(source, "__vmx"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -739,6 +769,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckVmcs02Contract(root, state);
     CheckIommuContract(root, state);
     CheckExitContract(root, state);
+    CheckCpuPolicyContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);
 }
