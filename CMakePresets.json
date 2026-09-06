@@ -19,6 +19,7 @@
                 "KNHV_BUILD_PREFLIGHT": "ON",
                 "KNHV_BUILD_CPU_MATRIX": "ON",
                 "KNHV_BUILD_WHP_BROKER": "ON",
+                "KNHV_BUILD_EVIDENCE_TOOL": "ON",
                 "KNHV_ARTIFACT_ROOT": "${sourceDir}/build/vscode/Debug",
                 "WDK_WINVER": "0x0A00"
             }
@@ -41,6 +42,7 @@
                 "KNHV_BUILD_PREFLIGHT": "ON",
                 "KNHV_BUILD_CPU_MATRIX": "ON",
                 "KNHV_BUILD_WHP_BROKER": "ON",
+                "KNHV_BUILD_EVIDENCE_TOOL": "ON",
                 "KNHV_ARTIFACT_ROOT": "${sourceDir}/build/vscode/Release",
                 "WDK_WINVER": "0x0A00"
             }
@@ -79,7 +81,8 @@
                 "KNHV_DeviceIoBench",
                 "KNHV_Preflight",
                 "KNHV_CpuMatrix",
-                "KNHV_WHPBroker"
+                "KNHV_WHPBroker",
+                "KNHV_EvidenceTool"
             ]
         },
         {
@@ -100,7 +103,8 @@
                 "KNHV_DeviceIoBench",
                 "KNHV_Preflight",
                 "KNHV_CpuMatrix",
-                "KNHV_WHPBroker"
+                "KNHV_WHPBroker",
+                "KNHV_EvidenceTool"
             ]
         },
         {
@@ -122,7 +126,8 @@
                 "KNHV_DeviceIoBench",
                 "KNHV_Preflight",
                 "KNHV_CpuMatrix",
-                "KNHV_WHPBroker"
+                "KNHV_WHPBroker",
+                "KNHV_EvidenceTool"
             ]
         },
         {
@@ -144,7 +149,8 @@
                 "KNHV_DeviceIoBench",
                 "KNHV_Preflight",
                 "KNHV_CpuMatrix",
-                "KNHV_WHPBroker"
+                "KNHV_WHPBroker",
+                "KNHV_EvidenceTool"
             ]
         }
     ]

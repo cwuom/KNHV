@@ -1015,6 +1015,48 @@ void CheckTargetEvidenceContract(const fs::path& root, TestState& state) {
               !Contains(implementation, "DeviceIoControl"));
 }
 
+void CheckTargetEvidenceCodecContract(const fs::path& root,
+                                      TestState& state) {
+    const std::string header = Source(
+        root, "src/include/knhv_target_evidence_codec.h", state);
+    const std::string implementation = Source(
+        root, "src/validation/target_evidence_codec.cpp", state);
+    const std::string test =
+        Source(root, "tests/target_evidence_codec_test.cpp", state);
+    const std::string tool =
+        Source(root, "tools/target_evidence_tool.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string presets = Source(root, "CMakePresets.json", state);
+    const std::string build_script =
+        Source(root, "tools/Build-Driver.ps1", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "target evidence wire format is fixed and bounded",
+          Contains(header, "TargetEvidenceWireHeader") &&
+              Contains(header, "kTargetEvidenceWireMaxSize") &&
+              Contains(header, "kTargetEvidenceWireEnvelopeSize") &&
+              Contains(implementation, "ValidateHeader") &&
+              Contains(implementation, "DigestMismatch"));
+    Check(state, "target evidence codec covers corruption and callbacks",
+          Contains(test, "payload tampering") &&
+              Contains(test, "unsupported wire version") &&
+              Contains(test, "MarkerVerifier") &&
+              Contains(implementation, "BCryptHashData") &&
+              Contains(header, "TargetEvidenceSignatureVerifier"));
+    Check(state, "evidence tool is wired into both build configurations",
+          Contains(cmake, "KNHV_BUILD_EVIDENCE_TOOL") &&
+              Contains(cmake, "KNHV_EvidenceTool") &&
+              Contains(presets, "KNHV_EvidenceTool") &&
+              Contains(build_script, "KNHV_EvidenceTool.exe") &&
+              Contains(readme, "KNHV_EvidenceTool.exe"));
+    Check(state, "evidence codec and tool remain host-only",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__readmsr") &&
+              !Contains(implementation, "__writemsr") &&
+              !Contains(implementation, "DeviceIoControl") &&
+              !Contains(tool, "DeviceIoControl") &&
+              !Contains(tool, "VMXON"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -1091,6 +1133,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckAbiV2Contract(root, state);
     CheckOwnerObservationContract(root, state);
     CheckTargetEvidenceContract(root, state);
+    CheckTargetEvidenceCodecContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);

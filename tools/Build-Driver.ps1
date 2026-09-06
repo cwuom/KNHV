@@ -210,6 +210,7 @@ $configureArgs += @(
     "-DKNHV_BUILD_BENCHMARKS=ON",
     "-DKNHV_BUILD_PREFLIGHT=ON",
     "-DKNHV_BUILD_CPU_MATRIX=ON",
+    "-DKNHV_BUILD_EVIDENCE_TOOL=ON",
     "-DKNHV_ARTIFACT_ROOT=$BuildDirectory",
     "-DWDK_WINVER=0x0A00"
 )
@@ -260,7 +261,8 @@ $expectedPrograms = @(
     "KNHV_DeviceIoBench.exe",
     "KNHV_Preflight.exe",
     "KNHV_CpuMatrix.exe",
-    "KNHV_WHPBroker.exe"
+    "KNHV_WHPBroker.exe",
+    "KNHV_EvidenceTool.exe"
 )
 foreach ($expectedProgram in $expectedPrograms) {
     $programPath = Join-Path $programOutputDirectory $expectedProgram

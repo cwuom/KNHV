@@ -60,7 +60,7 @@ compatibility.
 | `src/whp` | WHP partition, mapping, vCPU, and exit lifecycle model |
 | `src/broker` | Read-only WHP capability probe executable |
 | `src/provider` | Capability-gated provider selection |
-| `src/validation` | Versioned target evidence and release-gate model |
+| `src/validation` | Versioned target evidence, wire codec, and release-gate model |
 | `src/control` | Shared secure WDM control-device implementation |
 | `src/test_driver` | Independent nested contract-test driver entry point |
 | `drivers` | Separate INF packages for the two control services |
@@ -128,6 +128,7 @@ configuration root:
 - `bin/KNHV_Preflight.exe`
 - `bin/KNHV_CpuMatrix.exe`
 - `bin/KNHV_WHPBroker.exe`
+- `bin/KNHV_EvidenceTool.exe`
 - `sys/KNHV.sys`
 - `sys/KNHV-Control.sys`
 - `sys/KNHV-NestedTest.sys`
@@ -250,6 +251,25 @@ VMX and Invariant TSC; a blocked result is expected when a hypervisor owns VMX,
 affinity cannot be restored, or processors expose different features. VMX
 control MSRs, EPT/VPID, and IOMMU are reported as `unknown` because they need
 privileged target-side validation.
+
+`KNHV_EvidenceTool.exe` is a host-only encoder and gate reader for the target
+evidence contract. `--emit-synthetic` creates a clearly marked laboratory
+package, `--validate` checks its fixed wire header and SHA-256 envelope digest,
+and `--gate` evaluates profile, stage, generation, and required flags. The
+tool never turns a synthetic package into hardware evidence. Detached signature
+verification is an adapter contract; an isolated release pipeline must provide
+the Windows certificate-chain verifier before setting `SignatureVerified`.
+
+Example offline flow:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --emit-synthetic evidence.bin --out evidence-emit.json
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --validate evidence.bin --out evidence-validate.json
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --gate evidence.bin --profile synthetic-lab --stage release
+```
 
 The pure `knhv_vmx_capability` contract is the next validation boundary for a
 privileged target collector. It normalizes VMX control MSR masks, checks the

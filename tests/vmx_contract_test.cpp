@@ -18,6 +18,7 @@ int wmain(int argc, wchar_t** argv) {
     RunProviderV2Contract(state);
     RunOwnerObservationModelContract(state);
     RunTargetEvidenceModelContract(state);
+    RunTargetEvidenceCodecContract(state);
     RunEptTimeModelContract(state);
     RunVmcs02ModelContract(state);
     RunVmcsShadowModelContract(state);

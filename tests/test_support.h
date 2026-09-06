@@ -49,6 +49,7 @@ void RunNestedModelContract(const fs::path& root, TestState& state);
 void RunProviderV2Contract(TestState& state);
 void RunOwnerObservationModelContract(TestState& state);
 void RunTargetEvidenceModelContract(TestState& state);
+void RunTargetEvidenceCodecContract(TestState& state);
 void RunEptTimeModelContract(TestState& state);
 void RunVmcs02ModelContract(TestState& state);
 void RunVmcsShadowModelContract(TestState& state);
