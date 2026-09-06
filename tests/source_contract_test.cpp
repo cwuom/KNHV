@@ -761,6 +761,39 @@ void CheckCpuMatrixContract(const fs::path& root, TestState& state) {
               !Contains(source, "__writemsr") && !Contains(source, "__vmx"));
 }
 
+void CheckVmxCapabilityContract(const fs::path& root, TestState& state) {
+    const std::string header =
+        Source(root, "src/include/knhv_vmx_capability.h", state);
+    const std::string source =
+        Source(root, "src/vmx/vmx_capability_model.cpp", state);
+    const std::string test =
+        Source(root, "tests/vmx_capability_model_test.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    Check(state, "VMX capability model exposes control and matrix contracts",
+          Contains(header, "VmxControlCapability") &&
+              Contains(header, "VmxCapabilitySample") &&
+              Contains(header, "VmxCapabilityMatrix") &&
+              Contains(source, "NormalizeVmxControlSet"));
+    Check(state, "VMX capability model validates control dependencies",
+          Contains(source, "kVmxPrimaryActivateSecondary") &&
+              Contains(source, "kVmxSecondaryEnableEpt") &&
+              Contains(source, "kVmxSecondaryEnableVpid") &&
+              Contains(test, "explicit dependencies") &&
+              Contains(test, "without basic EPT capability"));
+    Check(state, "VMX capability matrix fails closed on mixed CPUs",
+          Contains(source, "VmxCapabilityMatrixState::CompleteMixed") &&
+              Contains(source, "ept_vpid_intersection") &&
+              Contains(test, "mixed EPT capabilities"));
+    Check(state, "VMX capability model is wired into host and driver graphs",
+          Contains(cmake, "src/vmx/vmx_capability_model.cpp") &&
+              Contains(cmake, "tests/vmx_capability_model_test.cpp") &&
+              Contains(cmake, "src/include/knhv_vmx_capability.h"));
+    Check(state, "VMX capability model performs no privileged access",
+          !Contains(source, "__cpuid") && !Contains(source, "__readmsr") &&
+              !Contains(source, "__writemsr") && !Contains(source, "__vmx") &&
+              !Contains(source, "DeviceIoControl"));
+}
+
 void CheckInterruptContract(const fs::path& root, TestState& state) {
     const std::string header =
         Source(root, "src/include/knhv_interrupt.h", state);
@@ -1001,6 +1034,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckExitContract(root, state);
     CheckCpuPolicyContract(root, state);
     CheckCpuMatrixContract(root, state);
+    CheckVmxCapabilityContract(root, state);
     CheckVpidContract(root, state);
     CheckWhpContract(root, state);
     CheckWhpBrokerContract(root, state);

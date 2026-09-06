@@ -54,6 +54,7 @@ void RunIommuModelContract(TestState& state);
 void RunExitModelContract(TestState& state);
 void RunCpuPolicyModelContract(TestState& state);
 void RunCpuMatrixModelContract(TestState& state);
+void RunVmxCapabilityModelContract(TestState& state);
 void RunVpidModelContract(TestState& state);
 void RunWhpModelContract(TestState& state);
 void RunInterruptModelContract(TestState& state);

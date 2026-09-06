@@ -36,6 +36,8 @@ compatibility.
 - versioned provider and session ABI for a future BootL0 interposer
 - pure software VMCS12/nested-VMX, VMCS shadow, EPT policy, and TSC/QPC contract
   models
+- a versioned VMX control-capability and per-processor consistency model for
+  target-side validation
 - an isolated `KNHV-NestedTest.sys` contract-test driver
 - a read-only Windows Hypervisor Platform capability broker
 - no physical BootL0 handoff, EPT/VMCS02 acceleration, device passthrough, or
@@ -243,6 +245,13 @@ VMX and Invariant TSC; a blocked result is expected when a hypervisor owns VMX,
 affinity cannot be restored, or processors expose different features. VMX
 control MSRs, EPT/VPID, and IOMMU are reported as `unknown` because they need
 privileged target-side validation.
+
+The pure `knhv_vmx_capability` contract is the next validation boundary for a
+privileged target collector. It normalizes VMX control MSR masks, checks the
+primary/secondary/tertiary dependency rules, and rejects a mixed per-CPU EPT,
+VPID, or feature-control profile. The model contains no MSR or VMX instruction;
+the target collector must provide the raw snapshots and retain the per-CPU
+evidence.
 
 Run it once on the isolated validation target after copying the matching build:
 

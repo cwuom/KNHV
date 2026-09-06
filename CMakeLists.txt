@@ -202,6 +202,7 @@ set(SOURCES
         src/vmx/vmx_vmcs.cpp
         src/vmx/vmx_launch.cpp
         src/vmx/vmx_stop.cpp
+        src/vmx/vmx_capability_model.cpp
         src/asm/vmx_entry.asm
         src/asm/vmx_instructions.asm
         src/asm/vmx_launch.asm
@@ -212,6 +213,7 @@ set(SOURCES
         src/include/vmm_internal.h
         src/include/vmx.h
         src/include/vmx_contract.h
+        src/include/knhv_vmx_capability.h
 )
 
 # MASM does not always emit include dependencies for Ninja. Keep the shared
@@ -324,6 +326,7 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/exit/exit_model.cpp
         src/vmx/cpu_policy_model.cpp
         src/vmx/cpu_matrix_model.cpp
+        src/vmx/vmx_capability_model.cpp
         src/vmx/vpid_model.cpp
         src/whp/whp_model.cpp
         src/interrupt/interrupt_model.cpp
@@ -343,6 +346,7 @@ set(KNHV_NESTED_MODEL_SOURCES
         src/include/knhv_exit.h
         src/include/knhv_cpu_policy.h
         src/include/knhv_cpu_matrix.h
+        src/include/knhv_vmx_capability.h
         src/include/knhv_vpid.h
         src/include/knhv_whp.h
         src/include/knhv_interrupt.h
@@ -439,6 +443,7 @@ if(KNHV_BUILD_TESTS)
             tests/exit_model_test.cpp
             tests/cpu_policy_model_test.cpp
             tests/cpu_matrix_model_test.cpp
+            tests/vmx_capability_model_test.cpp
             tests/vpid_model_test.cpp
             tests/whp_model_test.cpp
             tests/interrupt_model_test.cpp
@@ -452,6 +457,7 @@ if(KNHV_BUILD_TESTS)
             src/exit/exit_model.cpp
             src/vmx/cpu_policy_model.cpp
             src/vmx/cpu_matrix_model.cpp
+            src/vmx/vmx_capability_model.cpp
             src/vmx/vpid_model.cpp
             src/whp/whp_model.cpp
             src/interrupt/interrupt_model.cpp
