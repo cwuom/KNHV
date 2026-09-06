@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <new>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@
 #include "knhv_target_evidence_codec.h"
 #include "knhv_target_evidence_signature.h"
 #include "knhv_target_snapshot.h"
+#include "knhv_target_snapshot_codec.h"
 
 namespace {
 
@@ -35,6 +37,8 @@ enum class Operation : std::uint32_t {
     Validate = 2,
     Gate = 3,
     VerifySignature = 4,
+    EmitSyntheticSnapshot = 5,
+    ValidateSnapshot = 6,
 };
 
 struct Options {
@@ -56,6 +60,10 @@ void PrintUsage() {
     std::cout
         << "KNHV_EvidenceTool --emit-synthetic path [--out report.json]\n"
         << "KNHV_EvidenceTool --validate path [--out report.json]\n"
+        << "KNHV_EvidenceTool --emit-synthetic-snapshot path"
+           " [--out report.json]\n"
+        << "KNHV_EvidenceTool --validate-snapshot path"
+           " [--out report.json]\n"
         << "KNHV_EvidenceTool --gate path --profile profile --stage stage"
            " [--expected-generation value] [--out report.json]\n"
         << "KNHV_EvidenceTool --verify-signature path"
@@ -66,6 +74,8 @@ void PrintUsage() {
            " device, performance, reliability, release\n"
         << "  emit-synthetic creates laboratory evidence only; it never"
            " asserts hardware ownership\n"
+        << "  snapshot commands only encode or verify supplied evidence; they"
+           " do not collect privileged state\n"
         << "  verify-signature uses WinVerifyTrust with no online revocation"
            " check\n";
 }
@@ -153,11 +163,29 @@ bool ParseOptions(int argc, wchar_t** argv, Options& options,
                 if (error.empty()) error = "--emit-synthetic needs a path";
                 return false;
             }
+        } else if (argument == L"--emit-synthetic-snapshot") {
+            fs::path path;
+            if (!TakePath(index, argc, argv, path) ||
+                !SetOperation(options, Operation::EmitSyntheticSnapshot, path,
+                               error)) {
+                if (error.empty()) {
+                    error = "--emit-synthetic-snapshot needs a path";
+                }
+                return false;
+            }
         } else if (argument == L"--validate") {
             fs::path path;
             if (!TakePath(index, argc, argv, path) ||
                 !SetOperation(options, Operation::Validate, path, error)) {
                 if (error.empty()) error = "--validate needs a path";
+                return false;
+            }
+        } else if (argument == L"--validate-snapshot") {
+            fs::path path;
+            if (!TakePath(index, argc, argv, path) ||
+                !SetOperation(options, Operation::ValidateSnapshot, path,
+                               error)) {
+                if (error.empty()) error = "--validate-snapshot needs a path";
                 return false;
             }
         } else if (argument == L"--gate") {
@@ -311,16 +339,15 @@ knhv::TargetEvidenceSnapshot MakeSyntheticSnapshot() {
     return snapshot;
 }
 
-bool ReadBytes(const fs::path& path, std::vector<knhv::u8>& bytes,
-               std::string& error) {
+bool ReadBytes(const fs::path& path, std::uint32_t maximum_size,
+               std::vector<knhv::u8>& bytes, std::string& error) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         error = "input cannot be opened";
         return false;
     }
     const std::streamoff end = file.tellg();
-    if (end < 0 || static_cast<std::uint64_t>(end) >
-                       knhv::kTargetEvidenceWireMaxSize) {
+    if (end < 0 || static_cast<std::uint64_t>(end) > maximum_size) {
         error = "input exceeds the bounded wire size";
         return false;
     }
@@ -596,10 +623,146 @@ int RunEmit(const Options& options) {
     return kExitSuccess;
 }
 
+int RunEmitSyntheticSnapshot(const Options& options) {
+    const knhv::TargetEvidenceSnapshot snapshot = MakeSyntheticSnapshot();
+    knhv::TargetEvidenceSnapshotResult snapshot_result{};
+    if (!knhv::BuildTargetEvidenceManifestFromSnapshot(
+            &snapshot, nullptr, 0U, nullptr, 0U, &snapshot_result) ||
+        snapshot_result.status != static_cast<knhv::u32>(
+                                       knhv::TargetEvidenceSnapshotStatus::
+                                           Success) ||
+        !knhv::IsTargetEvidenceSnapshotResultValid(&snapshot_result)) {
+        std::cerr << "snapshot adapter rejected synthetic evidence: "
+                  << knhv::TargetEvidenceSnapshotStatusText(
+                         static_cast<knhv::TargetEvidenceSnapshotStatus>(
+                             snapshot_result.status))
+                  << '\n';
+        return kExitInvalid;
+    }
+    const knhv::u32 package_size =
+        knhv::GetTargetEvidenceSnapshotWireSize(0U, 0U);
+    if (package_size == 0U) {
+        std::cerr << "snapshot package size is invalid\n";
+        return kExitInvalid;
+    }
+    std::vector<knhv::u8> bytes(package_size);
+    knhv::u32 written = 0U;
+    const knhv::TargetEvidenceSnapshotCodecStatus status =
+        knhv::EncodeTargetEvidenceSnapshotPackage(
+            &snapshot, nullptr, 0U, nullptr, 0U, bytes.data(), package_size,
+            &written);
+    if (status != knhv::TargetEvidenceSnapshotCodecStatus::Success ||
+        written != package_size) {
+        std::cerr << "snapshot encode failed: "
+                  << knhv::TargetEvidenceSnapshotCodecStatusText(status)
+                  << '\n';
+        return kExitInvalid;
+    }
+    std::string error;
+    if (!WriteBytes(options.input, bytes, error)) {
+        std::cerr << error << '\n';
+        return kExitIo;
+    }
+    const std::string report = BuildJson(
+        "emit-synthetic-snapshot", "pass", "synthetic snapshot emitted",
+        options.input, &snapshot_result.manifest, nullptr, true, true);
+    if (!WriteReport(options.output, report, error)) {
+        std::cerr << error << '\n';
+        return kExitIo;
+    }
+    return kExitSuccess;
+}
+
+int RunValidateSnapshot(const Options& options) {
+    std::vector<knhv::u8> bytes;
+    std::string error;
+    if (!ReadBytes(options.input, knhv::kTargetEvidenceSnapshotWireMaxSize,
+                   bytes, error)) {
+        std::cerr << error << '\n';
+        return kExitIo;
+    }
+    knhv::TargetEvidenceSnapshotWireHeader header{};
+    knhv::TargetEvidenceSnapshotCodecStatus status =
+        knhv::InspectTargetEvidenceSnapshotPackage(
+            bytes.data(), static_cast<knhv::u32>(bytes.size()), &header);
+    if (status != knhv::TargetEvidenceSnapshotCodecStatus::Success) {
+        const std::string report = BuildJson(
+            "validate-snapshot", "fail",
+            knhv::TargetEvidenceSnapshotCodecStatusText(status), options.input,
+            nullptr, nullptr, false, false);
+        if (!WriteReport(options.output, report, error)) {
+            std::cerr << error << '\n';
+            return kExitIo;
+        }
+        return kExitInvalid;
+    }
+
+    try {
+        std::vector<knhv::CpuMatrixSample> cpu_samples(
+            header.cpu_sample_count);
+        std::vector<knhv::VmxCapabilitySample> vmx_samples(
+            header.vmx_sample_count);
+        knhv::TargetEvidenceSnapshot snapshot{};
+        knhv::u32 cpu_sample_count = 0U;
+        knhv::u32 vmx_sample_count = 0U;
+        status = knhv::DecodeTargetEvidenceSnapshotPackage(
+            bytes.data(), static_cast<knhv::u32>(bytes.size()), &snapshot,
+            cpu_samples.empty() ? nullptr : cpu_samples.data(),
+            static_cast<knhv::u32>(cpu_samples.size()), &cpu_sample_count,
+            vmx_samples.empty() ? nullptr : vmx_samples.data(),
+            static_cast<knhv::u32>(vmx_samples.size()), &vmx_sample_count);
+        if (status != knhv::TargetEvidenceSnapshotCodecStatus::Success) {
+            const std::string report = BuildJson(
+                "validate-snapshot", "fail",
+                knhv::TargetEvidenceSnapshotCodecStatusText(status),
+                options.input, nullptr, nullptr, false, false);
+            if (!WriteReport(options.output, report, error)) {
+                std::cerr << error << '\n';
+                return kExitIo;
+            }
+            return kExitInvalid;
+        }
+
+        knhv::TargetEvidenceSnapshotResult snapshot_result{};
+        const bool materialized = knhv::BuildTargetEvidenceManifestFromSnapshot(
+            &snapshot, cpu_samples.empty() ? nullptr : cpu_samples.data(),
+            cpu_sample_count,
+            vmx_samples.empty() ? nullptr : vmx_samples.data(),
+            vmx_sample_count, &snapshot_result);
+        const bool valid = materialized &&
+                           snapshot_result.status == static_cast<knhv::u32>(
+                               knhv::TargetEvidenceSnapshotStatus::Success) &&
+                           knhv::IsTargetEvidenceSnapshotResultValid(
+                               &snapshot_result);
+        const char* reason = valid
+                                 ? "snapshot and manifest validated"
+                                 : knhv::TargetEvidenceSnapshotStatusText(
+                                       static_cast<
+                                           knhv::TargetEvidenceSnapshotStatus>(
+                                           snapshot_result.status));
+        const bool synthetic =
+            snapshot.profile == static_cast<knhv::u32>(
+                                    knhv::TargetEvidenceProfile::SyntheticLab);
+        const std::string report = BuildJson(
+            "validate-snapshot", valid ? "pass" : "fail", reason,
+            options.input, valid ? &snapshot_result.manifest : nullptr, nullptr,
+            valid, synthetic);
+        if (!WriteReport(options.output, report, error)) {
+            std::cerr << error << '\n';
+            return kExitIo;
+        }
+        return valid ? kExitSuccess : kExitInvalid;
+    } catch (const std::bad_alloc&) {
+        std::cerr << "snapshot sample allocation failed\n";
+        return kExitInvalid;
+    }
+}
+
 int RunValidate(const Options& options) {
     std::vector<knhv::u8> bytes;
     std::string error;
-    if (!ReadBytes(options.input, bytes, error)) {
+    if (!ReadBytes(options.input, knhv::kTargetEvidenceWireMaxSize, bytes,
+                   error)) {
         std::cerr << error << '\n';
         return kExitIo;
     }
@@ -625,7 +788,8 @@ int RunValidate(const Options& options) {
 int RunGate(const Options& options) {
     std::vector<knhv::u8> bytes;
     std::string error;
-    if (!ReadBytes(options.input, bytes, error)) {
+    if (!ReadBytes(options.input, knhv::kTargetEvidenceWireMaxSize, bytes,
+                   error)) {
         std::cerr << error << '\n';
         return kExitIo;
     }
@@ -736,7 +900,10 @@ int wmain(int argc, wchar_t** argv) {
     }
     switch (options.operation) {
         case Operation::EmitSynthetic: return RunEmit(options);
+        case Operation::EmitSyntheticSnapshot:
+            return RunEmitSyntheticSnapshot(options);
         case Operation::Validate: return RunValidate(options);
+        case Operation::ValidateSnapshot: return RunValidateSnapshot(options);
         case Operation::Gate: return RunGate(options);
         case Operation::VerifySignature: return RunVerifySignature(options);
         default: return kExitUsage;

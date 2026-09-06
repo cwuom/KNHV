@@ -1181,6 +1181,46 @@ void CheckTargetEvidenceSnapshotContract(const fs::path& root,
               !Contains(tool, "VMXON"));
 }
 
+void CheckTargetEvidenceSnapshotCodecContract(const fs::path& root,
+                                              TestState& state) {
+    const std::string header = Source(
+        root, "src/include/knhv_target_snapshot_codec.h", state);
+    const std::string implementation = Source(
+        root, "src/validation/target_snapshot_codec.cpp", state);
+    const std::string test =
+        Source(root, "tests/target_snapshot_codec_test.cpp", state);
+    const std::string tool =
+        Source(root, "tools/target_evidence_tool.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "target snapshot codec exposes a bounded wire format",
+          Contains(header, "TargetEvidenceSnapshotWireHeader") &&
+              Contains(header, "kTargetEvidenceSnapshotWireMaxSize") &&
+              Contains(header, "InspectTargetEvidenceSnapshotPackage") &&
+              Contains(header, "DecodeTargetEvidenceSnapshotPackage") &&
+              Contains(implementation, "CalculatePayloadSize"));
+    Check(state, "target snapshot codec authenticates and revalidates data",
+          Contains(implementation, "BCryptHashData") &&
+              Contains(implementation, "DigestMismatch") &&
+              Contains(implementation, "IsTargetEvidenceSnapshotValid") &&
+              Contains(test, "payload tampering") &&
+              Contains(test, "embedded snapshot"));
+    Check(state, "target snapshot codec is exposed by the evidence tool",
+          Contains(cmake, "src/validation/target_snapshot_codec.cpp") &&
+              Contains(cmake, "tests/target_snapshot_codec_test.cpp") &&
+              Contains(cmake, "knhv_target_snapshot_codec.h") &&
+              Contains(tool, "--emit-synthetic-snapshot") &&
+              Contains(tool, "--validate-snapshot") &&
+              Contains(readme, "validate-snapshot"));
+    Check(state, "target snapshot codec remains a host-only boundary",
+          !Contains(implementation, "__vmx") &&
+              !Contains(implementation, "__readmsr") &&
+              !Contains(implementation, "__writemsr") &&
+              !Contains(implementation, "DeviceIoControl") &&
+              !Contains(tool, "DeviceIoControl") &&
+              !Contains(tool, "VMXON"));
+}
+
 void CheckPureModels(TestState& state) {
     struct MsrBitmap {
         std::array<std::uint8_t, 0x1000> bytes{};
@@ -1261,6 +1301,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckTargetEvidenceSignatureContract(root, state);
     CheckTargetEvidenceWriterContract(root, state);
     CheckTargetEvidenceSnapshotContract(root, state);
+    CheckTargetEvidenceSnapshotCodecContract(root, state);
     CheckEptTimeContract(root, state);
     CheckVmcs02Contract(root, state);
     CheckVmcsShadowContract(root, state);

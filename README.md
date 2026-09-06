@@ -318,6 +318,21 @@ matrices, checks owner and generation consistency, and forwards only a valid
 candidate to the writer. The adapter is host-only; privileged collection and
 hardware execution remain explicit target-side operations.
 
+For offline transport, `KNHV_EvidenceTool.exe` can encode the approved snapshot
+and its raw samples into a bounded, SHA-256 protected package, then decode and
+re-run the same validation before materializing a manifest:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --emit-synthetic-snapshot snapshot.bin --out snapshot-emit.json
+.\build\vscode\Release\bin\KNHV_EvidenceTool.exe `
+  --validate-snapshot snapshot.bin --out snapshot-validate.json
+```
+
+The synthetic command is a laboratory fixture only. A target collector must
+provide the real per-processor samples and a matching generation; malformed,
+truncated, or tampered packages are rejected before a manifest is written.
+
 Run it once on the isolated validation target after copying the matching build:
 
 ```powershell
