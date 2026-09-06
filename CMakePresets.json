@@ -17,6 +17,7 @@
                 "KNHV_BUILD_NESTED_DRIVERS": "ON",
                 "KNHV_BUILD_BENCHMARKS": "ON",
                 "KNHV_BUILD_PREFLIGHT": "ON",
+                "KNHV_BUILD_WHP_BROKER": "ON",
                 "KNHV_ARTIFACT_ROOT": "${sourceDir}/build/vscode/Debug",
                 "WDK_WINVER": "0x0A00"
             }
@@ -37,6 +38,7 @@
                 "KNHV_BUILD_NESTED_DRIVERS": "ON",
                 "KNHV_BUILD_BENCHMARKS": "ON",
                 "KNHV_BUILD_PREFLIGHT": "ON",
+                "KNHV_BUILD_WHP_BROKER": "ON",
                 "KNHV_ARTIFACT_ROOT": "${sourceDir}/build/vscode/Release",
                 "WDK_WINVER": "0x0A00"
             }
@@ -73,7 +75,8 @@
                 "KNHV_TscQpcBench",
                 "KNHV_EptHookBench",
                 "KNHV_DeviceIoBench",
-                "KNHV_Preflight"
+                "KNHV_Preflight",
+                "KNHV_WHPBroker"
             ]
         },
         {
@@ -92,7 +95,8 @@
                 "KNHV_TscQpcBench",
                 "KNHV_EptHookBench",
                 "KNHV_DeviceIoBench",
-                "KNHV_Preflight"
+                "KNHV_Preflight",
+                "KNHV_WHPBroker"
             ]
         },
         {
@@ -112,7 +116,8 @@
                 "KNHV_TscQpcBench",
                 "KNHV_EptHookBench",
                 "KNHV_DeviceIoBench",
-                "KNHV_Preflight"
+                "KNHV_Preflight",
+                "KNHV_WHPBroker"
             ]
         },
         {
@@ -132,7 +137,8 @@
                 "KNHV_TscQpcBench",
                 "KNHV_EptHookBench",
                 "KNHV_DeviceIoBench",
-                "KNHV_Preflight"
+                "KNHV_Preflight",
+                "KNHV_WHPBroker"
             ]
         }
     ]

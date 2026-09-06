@@ -257,7 +257,8 @@ $expectedPrograms = @(
     "KNHV_TscQpcBench.exe",
     "KNHV_EptHookBench.exe",
     "KNHV_DeviceIoBench.exe",
-    "KNHV_Preflight.exe"
+    "KNHV_Preflight.exe",
+    "KNHV_WHPBroker.exe"
 )
 foreach ($expectedProgram in $expectedPrograms) {
     $programPath = Join-Path $programOutputDirectory $expectedProgram

@@ -119,6 +119,8 @@ option(KNHV_BUILD_BENCHMARKS
        "Build host-only benchmark executables with explicit hardware gates" ON)
 option(KNHV_BUILD_PREFLIGHT
        "Build the read-only capability and ownership preflight executable" ON)
+option(KNHV_BUILD_WHP_BROKER
+       "Build the read-only WHP capability broker executable" ON)
 option(KNHV_FAULT_INJECTION
        "Enable deterministic launch fault injection for isolated tests" OFF)
 set(KNHV_TEST_FAIL_CPU "-1" CACHE STRING
@@ -544,6 +546,44 @@ if(KNHV_BUILD_TESTS)
                            "${_knhv_native_probe_standard_libraries}")
         target_link_libraries(KNHV_NativeVmxProbe PRIVATE
                               ${_knhv_native_probe_standard_libraries})
+    endif()
+endif()
+
+# The WHP broker is intentionally capability-only in this build. It resolves
+# WHvGetCapability at runtime and keeps partition creation behind a future,
+# separately reviewed runner so a compile host cannot start a guest by
+# accident.
+if(KNHV_BUILD_WHP_BROKER)
+    add_executable(KNHV_WHPBroker
+            src/broker/whp_broker.cpp
+            src/whp/whp_model.cpp)
+    knhv_set_artifact_layout(KNHV_WHPBroker program)
+    if(_knhv_toolchain_includes)
+        target_include_directories(KNHV_WHPBroker SYSTEM BEFORE PRIVATE
+                                   ${_knhv_toolchain_includes})
+    endif()
+    target_include_directories(KNHV_WHPBroker PRIVATE
+                               "${CMAKE_CURRENT_SOURCE_DIR}/src/include")
+    if(_knhv_user_toolchain_libdirs)
+        target_link_directories(KNHV_WHPBroker PRIVATE
+                                ${_knhv_user_toolchain_libdirs})
+    endif()
+    target_compile_options(KNHV_WHPBroker PRIVATE
+            /W4 /WX /EHsc /GR /GS /permissive- /std:c++17)
+    if(MSVC)
+        set_property(TARGET KNHV_WHPBroker PROPERTY
+                     MSVC_RUNTIME_LIBRARY
+                     "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        set_property(TARGET KNHV_WHPBroker APPEND_STRING PROPERTY
+                     LINK_FLAGS " /DEBUG /INCREMENTAL:NO")
+    endif()
+    if(_knhv_saved_cxx_standard_libraries)
+        set(_knhv_whp_broker_standard_libraries
+            "${_knhv_saved_cxx_standard_libraries}")
+        separate_arguments(_knhv_whp_broker_standard_libraries WINDOWS_COMMAND
+                           "${_knhv_whp_broker_standard_libraries}")
+        target_link_libraries(KNHV_WHPBroker PRIVATE
+                              ${_knhv_whp_broker_standard_libraries})
     endif()
 endif()
 

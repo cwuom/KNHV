@@ -733,6 +733,37 @@ void CheckWhpContract(const fs::path& root, TestState& state) {
               !Contains(source, "DeviceIoControl"));
 }
 
+void CheckWhpBrokerContract(const fs::path& root, TestState& state) {
+    const std::string broker =
+        Source(root, "src/broker/whp_broker.cpp", state);
+    const std::string cmake = Source(root, "CMakeLists.txt", state);
+    const std::string presets = Source(root, "CMakePresets.json", state);
+    const std::string build_script =
+        Source(root, "tools/Build-Driver.ps1", state);
+    const std::string readme = Source(root, "README.md", state);
+    Check(state, "WHP broker target and artifact are explicit",
+          Contains(cmake, "KNHV_BUILD_WHP_BROKER") &&
+              Contains(cmake, "KNHV_WHPBroker") &&
+              Contains(presets, "KNHV_WHPBroker") &&
+              Contains(build_script, "KNHV_WHPBroker.exe") &&
+              Contains(readme, "KNHV_WHPBroker.exe"));
+    Check(state, "WHP broker records a bounded capability snapshot",
+          Contains(broker, "WHvGetCapability") &&
+              Contains(broker, "LoadLibraryExW") &&
+              Contains(broker, "RequiredQueriesPresent") &&
+              Contains(broker, "knhv-whp-probe-1") &&
+              Contains(broker, "partition_create_attempted"));
+    Check(state, "WHP broker remains read-only and fail-closed",
+          Contains(broker, "kExitBlocked") &&
+              Contains(broker, "partition runner is not enabled") &&
+              !Contains(broker, "WHvCreatePartition") &&
+              !Contains(broker, "WHvSetupPartition") &&
+              !Contains(broker, "WHvMapGpaRange") &&
+              !Contains(broker, "WHvCreateVirtualProcessor") &&
+              !Contains(broker, "WHvRunVirtualProcessor") &&
+              !Contains(broker, "__vmx") && !Contains(broker, "__writemsr"));
+}
+
 void CheckAbiV2Contract(const fs::path& root, TestState& state) {
     const std::string abi = Source(root, "src/include/knhv_abi.h", state);
     const std::string ioctl =
@@ -858,6 +889,7 @@ void RunSourceContract(const fs::path& root, TestState& state) {
     CheckCpuPolicyContract(root, state);
     CheckVpidContract(root, state);
     CheckWhpContract(root, state);
+    CheckWhpBrokerContract(root, state);
     CheckInterruptContract(root, state);
     CheckPureModels(state);
     RunNestedModelContract(root, state);

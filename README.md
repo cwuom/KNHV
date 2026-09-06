@@ -33,6 +33,7 @@ compatibility.
 - versioned provider and session ABI for a future BootL0 interposer
 - pure software VMCS12/nested-VMX, EPT policy, and TSC/QPC contract models
 - an isolated `KNHV-NestedTest.sys` contract-test driver
+- a read-only Windows Hypervisor Platform capability broker
 - no physical BootL0 handoff, EPT/VMCS02 acceleration, device passthrough, or
   production support
 
@@ -47,6 +48,11 @@ compatibility.
 | `src/nested` | Pure VMCS12, VMX instruction, address, and exit model |
 | `src/ept` | Pure EPTP, nested mapping, generation, and debug-lease policy model |
 | `src/time` | Fixed-point TSC transform, calibration, and drift contract model |
+| `src/iommu` | Device, DMA-domain, and quarantine contract model |
+| `src/exit` | Fail-closed VM-exit policy and routing model |
+| `src/interrupt` | Bounded injection and posted-interrupt contract model |
+| `src/whp` | WHP partition, mapping, vCPU, and exit lifecycle model |
+| `src/broker` | Read-only WHP capability probe executable |
 | `src/provider` | Capability-gated provider selection |
 | `src/control` | Shared secure WDM control-device implementation |
 | `src/test_driver` | Independent nested contract-test driver entry point |
@@ -113,6 +119,7 @@ configuration root:
 - `bin/KNHV_EptHookBench.exe`
 - `bin/KNHV_DeviceIoBench.exe`
 - `bin/KNHV_Preflight.exe`
+- `bin/KNHV_WHPBroker.exe`
 - `sys/KNHV.sys`
 - `sys/KNHV-Control.sys`
 - `sys/KNHV-NestedTest.sys`
@@ -222,6 +229,16 @@ reports CPUID, topology, firmware-table, Secure Boot, DeviceGuard, WHP, service,
 and provider observations in `knhv-preflight-1` JSON. Unknown privileged state
 is retained as `unknown` and blocks a `native-l0` profile; the tool never changes
 boot policy, loads a driver, or executes VMX instructions.
+
+`KNHV_WHPBroker.exe` dynamically loads the system `WinHvPlatform.dll` and
+queries `WHvGetCapability` to emit a `knhv-whp-probe-1` JSON snapshot. It does
+not create a partition, map guest memory, create a vCPU, or execute a vCPU.
+`--run` is intentionally blocked until a separately validated runner exists:
+
+```powershell
+.\build\vscode\Release\bin\KNHV_WHPBroker.exe --caps-only `
+  --out results\whp_capabilities.json
+```
 
 To validate a built SYS and its matching PDB:
 
