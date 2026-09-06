@@ -524,6 +524,22 @@ void CheckEptTimeContract(const fs::path& root, TestState& state) {
           Contains(ept_source, "BeginEptGeneration") &&
               Contains(ept_source, "AcknowledgeEptGeneration") &&
               Contains(ept_source, "PublishEptGeneration"));
+    Check(state, "EPT hook updates use an auditable transaction lifecycle",
+          Contains(ept_header, "EptHookMetadata") &&
+              Contains(ept_header, "EptHookTransaction") &&
+              Contains(ept_source, "BeginEptHookUpdate") &&
+              Contains(ept_source, "IsEptHookTransactionLive") &&
+              Contains(ept_source, "PublishEptHookUpdate") &&
+              Contains(ept_source, "RollbackEptHookUpdate") &&
+              Contains(ept_source, "QuarantineEptHookUpdate") &&
+              Contains(ept_source, "ExpireEptHookUpdate"));
+    const std::string ept_test =
+        Source(root, "tests/ept_time_model_test.cpp", state);
+    Check(state, "EPT hook tests cover rollback, budget, and overflow paths",
+          Contains(ept_test, "hook transaction can roll back") &&
+              Contains(ept_test, "expired published hook updates") &&
+              Contains(ept_test, "rate budget") &&
+              Contains(ept_test, "physical address overflow"));
     Check(state, "time model uses fixed-point transforms and monotonic gates",
           Contains(time_header, "TscTransform") &&
               Contains(time_header, "ComposeTscTransforms") &&

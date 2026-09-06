@@ -43,6 +43,37 @@ bool IsHookKindValid(u32 value) {
            value <= static_cast<u32>(EptHookKind::Monitor);
 }
 
+bool IsHookTransactionStateValid(u32 value) {
+    return value >= static_cast<u32>(EptHookTransactionState::Prepared) &&
+           value <= static_cast<u32>(EptHookTransactionState::Quarantined);
+}
+
+bool IsHookRangeValid(u64 guest_physical, u64 page_count) {
+    if (page_count == 0 || page_count > kEptMaxMappingPages ||
+        (guest_physical & (kEptPageSize - 1ULL)) != 0 ||
+        page_count > ~0ULL / kEptPageSize) {
+        return false;
+    }
+    const u64 span = page_count * kEptPageSize;
+    u64 last = 0;
+    return !AddOverflow(guest_physical, span - 1ULL, &last) &&
+           IsPhysicalAddress(guest_physical, kEptMaxPhysicalAddressBits) &&
+           IsPhysicalAddress(last, kEptMaxPhysicalAddressBits);
+}
+
+bool IsCanonicalInstructionAddress(u64 address) {
+    const u64 upper = address >> 48U;
+    return upper == 0ULL || upper == 0xFFFFULL;
+}
+
+bool AddMulOverflow(u64 left, u64 right, u64* result) {
+    if (result == nullptr || (right != 0 && left > ~0ULL / right)) {
+        return true;
+    }
+    *result = left * right;
+    return false;
+}
+
 EptLookupResult MakeLookup(EptLookupStatus status, u32 permissions, u64 hpa,
                            u64 generation) {
     EptLookupResult result = {};
@@ -249,8 +280,7 @@ bool IsEptHookRequestValid(const EptHookRequest* request) {
         !IsVersionedSizeValid(request->version, request->size,
                               sizeof(EptHookRequest)) ||
         request->owner_id == 0 || request->expected_generation == 0 ||
-        request->guest_physical % kEptPageSize != 0 ||
-        request->page_count == 0 || request->page_count > kEptMaxMappingPages ||
+        !IsHookRangeValid(request->guest_physical, request->page_count) ||
         request->view != static_cast<u32>(EptViewKind::GuestDebug) ||
         !IsHookKindValid(request->hook_kind) ||
         (request->permissions & ~kEptPermissionKnownMask) != 0 ||
@@ -271,6 +301,241 @@ bool CanPublishEptHook(const EptHookLease* lease,
            lease->hook_kind == request->hook_kind &&
            now_tsc < lease->expires_tsc &&
            request->page_count <= lease->max_pages;
+}
+
+bool IsEptHookMetadataValid(const EptHookMetadata* metadata) {
+    if (metadata == nullptr ||
+        !IsVersionedSizeValid(metadata->version, metadata->size,
+                              sizeof(EptHookMetadata)) ||
+        metadata->original_page_physical == metadata->shadow_page_physical ||
+        metadata->original_page_physical == 0 ||
+        metadata->shadow_page_physical == 0 ||
+        (metadata->original_page_physical & (kEptPageSize - 1ULL)) != 0 ||
+        (metadata->shadow_page_physical & (kEptPageSize - 1ULL)) != 0 ||
+        !IsPhysicalAddress(metadata->original_page_physical,
+                           kEptMaxPhysicalAddressBits) ||
+        !IsPhysicalAddress(metadata->shadow_page_physical,
+                           kEptMaxPhysicalAddressBits) ||
+        (metadata->module_hash[0] == 0 && metadata->module_hash[1] == 0) ||
+        metadata->target_rip == 0 ||
+        !IsCanonicalInstructionAddress(metadata->target_rip) ||
+        metadata->instruction_length == 0 ||
+        metadata->instruction_length > 15U ||
+        (metadata->cet_policy & ~kEptHookKnownCetPolicyMask) != 0 ||
+        (metadata->cfg_policy & ~kEptHookKnownCfgPolicyMask) != 0 ||
+        metadata->reserved != 0 || metadata->rollback_generation == 0) {
+        return false;
+    }
+    return true;
+}
+
+bool IsEptHookTransactionValid(const EptHookTransaction* transaction) {
+    if (transaction == nullptr ||
+        !IsVersionedSizeValid(transaction->version, transaction->size,
+                              sizeof(EptHookTransaction)) ||
+        transaction->transaction_id == 0 || transaction->owner_id == 0 ||
+        transaction->parent_generation == 0 ||
+        transaction->parent_generation == ~0ULL ||
+        transaction->pending_generation != transaction->parent_generation + 1ULL ||
+        transaction->rollback_generation != transaction->parent_generation ||
+        transaction->deadline_tsc == 0 ||
+        !IsHookRangeValid(transaction->guest_physical,
+                          transaction->page_count) ||
+        transaction->view != static_cast<u32>(EptViewKind::GuestDebug) ||
+        !IsHookKindValid(transaction->hook_kind) ||
+        !IsHookTransactionStateValid(transaction->state) ||
+        transaction->required_cpu_acks == 0 ||
+        transaction->required_cpu_acks > kEptHookMaxCpuAcks ||
+        transaction->observed_cpu_acks > transaction->required_cpu_acks ||
+        transaction->max_exits_per_second == 0 || transaction->reserved != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool IsEptHookMetadataCompatible(const EptHookRequest* request,
+                                 const EptHookTransaction* transaction,
+                                 const EptHookMetadata* metadata) {
+    return IsEptHookRequestValid(request) &&
+           IsEptHookTransactionValid(transaction) &&
+           IsEptHookMetadataValid(metadata) &&
+           (transaction->state ==
+                static_cast<u32>(EptHookTransactionState::Prepared) ||
+            transaction->state ==
+                static_cast<u32>(EptHookTransactionState::Published)) &&
+           request->owner_id == transaction->owner_id &&
+           request->expected_generation == transaction->parent_generation &&
+           request->guest_physical == transaction->guest_physical &&
+           request->page_count == transaction->page_count &&
+           request->view == transaction->view &&
+           request->hook_kind == transaction->hook_kind &&
+           request->module_hash[0] == metadata->module_hash[0] &&
+           request->module_hash[1] == metadata->module_hash[1] &&
+           metadata->rollback_generation == transaction->rollback_generation;
+}
+
+bool BeginEptHookUpdate(const EptHookLease* lease,
+                        const EptHookRequest* request,
+                        u64 current_generation, u64 now_tsc,
+                        u32 required_cpu_acks, u64 transaction_id,
+                        EptHookTransaction* transaction) {
+    if (transaction == nullptr) return false;
+    *transaction = {};
+    if (!CanPublishEptHook(lease, request, current_generation, now_tsc) ||
+        required_cpu_acks == 0 || required_cpu_acks > kEptHookMaxCpuAcks ||
+        transaction_id == 0 || current_generation == ~0ULL) {
+        return false;
+    }
+    transaction->size = sizeof(*transaction);
+    transaction->version = kEptContractVersion;
+    transaction->transaction_id = transaction_id;
+    transaction->owner_id = request->owner_id;
+    transaction->parent_generation = current_generation;
+    transaction->pending_generation = current_generation + 1ULL;
+    transaction->guest_physical = request->guest_physical;
+    transaction->page_count = request->page_count;
+    transaction->deadline_tsc = lease->expires_tsc;
+    transaction->rollback_generation = current_generation;
+    transaction->view = request->view;
+    transaction->hook_kind = request->hook_kind;
+    transaction->state =
+        static_cast<u32>(EptHookTransactionState::Prepared);
+    transaction->required_cpu_acks = required_cpu_acks;
+    transaction->max_exits_per_second = lease->max_exits_per_second;
+    return IsEptHookTransactionValid(transaction);
+}
+
+bool IsEptHookTransactionLive(const EptHookTransaction* transaction,
+                              u64 now_tsc) {
+    return IsEptHookTransactionValid(transaction) &&
+           (transaction->state ==
+                static_cast<u32>(EptHookTransactionState::Prepared) ||
+            transaction->state ==
+                static_cast<u32>(EptHookTransactionState::Published)) &&
+           now_tsc < transaction->deadline_tsc;
+}
+
+bool AcknowledgeEptHookCpu(EptHookTransaction* transaction,
+                           u64 generation, u32 cpu_count, u64 now_tsc) {
+    if (!IsEptHookTransactionLive(transaction, now_tsc) ||
+        transaction->state !=
+            static_cast<u32>(EptHookTransactionState::Prepared) ||
+        generation != transaction->parent_generation || cpu_count == 0 ||
+        cpu_count > transaction->required_cpu_acks -
+                        transaction->observed_cpu_acks) {
+        return false;
+    }
+    transaction->observed_cpu_acks += cpu_count;
+    return true;
+}
+
+bool PublishEptHookUpdate(EptHookTransaction* transaction,
+                          u64 current_generation, u64 now_tsc) {
+    if (!IsEptHookTransactionLive(transaction, now_tsc) ||
+        transaction->state !=
+            static_cast<u32>(EptHookTransactionState::Prepared) ||
+        current_generation != transaction->parent_generation ||
+        transaction->observed_cpu_acks != transaction->required_cpu_acks) {
+        return false;
+    }
+    transaction->state =
+        static_cast<u32>(EptHookTransactionState::Published);
+    return true;
+}
+
+bool RetireEptHookUpdate(EptHookTransaction* transaction,
+                         u64 current_generation) {
+    if (!IsEptHookTransactionValid(transaction) ||
+        transaction->state !=
+            static_cast<u32>(EptHookTransactionState::Published) ||
+        current_generation != transaction->pending_generation) {
+        return false;
+    }
+    transaction->state = static_cast<u32>(EptHookTransactionState::Retired);
+    return true;
+}
+
+bool RollbackEptHookUpdate(EptHookTransaction* transaction,
+                           u64 current_generation) {
+    if (!IsEptHookTransactionValid(transaction) ||
+        (transaction->state !=
+             static_cast<u32>(EptHookTransactionState::Prepared) &&
+         transaction->state !=
+             static_cast<u32>(EptHookTransactionState::Published)) ||
+        (transaction->state ==
+             static_cast<u32>(EptHookTransactionState::Prepared)
+             ? current_generation != transaction->parent_generation
+             : current_generation != transaction->pending_generation)) {
+        return false;
+    }
+    transaction->state =
+        static_cast<u32>(EptHookTransactionState::RolledBack);
+    return true;
+}
+
+bool QuarantineEptHookUpdate(EptHookTransaction* transaction,
+                             u64 current_generation) {
+    if (!IsEptHookTransactionValid(transaction) ||
+        transaction->state ==
+            static_cast<u32>(EptHookTransactionState::Retired) ||
+        transaction->state ==
+            static_cast<u32>(EptHookTransactionState::RolledBack) ||
+        transaction->state ==
+            static_cast<u32>(EptHookTransactionState::Quarantined) ||
+        (transaction->state ==
+             static_cast<u32>(EptHookTransactionState::Prepared)
+             ? current_generation != transaction->parent_generation
+             : current_generation != transaction->pending_generation)) {
+        return false;
+    }
+    transaction->state =
+        static_cast<u32>(EptHookTransactionState::Quarantined);
+    return true;
+}
+
+bool ExpireEptHookUpdate(EptHookTransaction* transaction,
+                         u64 current_generation, u64 now_tsc) {
+    if (!IsEptHookTransactionValid(transaction) ||
+        now_tsc < transaction->deadline_tsc) {
+        return false;
+    }
+    if (transaction->state ==
+            static_cast<u32>(EptHookTransactionState::Prepared) &&
+        current_generation == transaction->parent_generation) {
+        transaction->state =
+            static_cast<u32>(EptHookTransactionState::RolledBack);
+        return true;
+    }
+    if (transaction->state ==
+            static_cast<u32>(EptHookTransactionState::Published) &&
+        current_generation == transaction->pending_generation) {
+        transaction->state =
+            static_cast<u32>(EptHookTransactionState::Quarantined);
+        return true;
+    }
+    return false;
+}
+
+bool IsEptHookRateWithin(const EptHookLease* lease, u64 exit_count,
+                         u64 window_tsc, u64 tsc_hz) {
+    if (!IsEptHookLeaseValid(lease) || tsc_hz == 0 || window_tsc == 0) {
+        return false;
+    }
+    if (window_tsc >= tsc_hz) {
+        const u64 seconds = window_tsc / tsc_hz;
+        u64 allowed = 0;
+        if (AddMulOverflow(lease->max_exits_per_second, seconds,
+                           &allowed)) {
+            return false;
+        }
+        return exit_count <= allowed;
+    }
+    if (exit_count > ~0ULL / tsc_hz ||
+        lease->max_exits_per_second > ~0ULL / window_tsc) {
+        return false;
+    }
+    return exit_count * tsc_hz <=
+           static_cast<u64>(lease->max_exits_per_second) * window_tsc;
 }
 
 bool NextEptGeneration(u64 current_generation, u64* next_generation) {

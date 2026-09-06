@@ -32,6 +32,12 @@ constexpr u32 kEptPermissionKnownMask = kEptPermissionRead |
                                          kEptPermissionWrite |
                                          kEptPermissionExecute;
 constexpr u32 kEptMaxMappingPages = 1U << 20;
+constexpr u32 kEptHookMaxCpuAcks = 4096U;
+constexpr u32 kEptHookCodeCet = 1U << 0;
+constexpr u32 kEptHookCodeIbt = 1U << 1;
+constexpr u32 kEptHookCodeCfg = 1U << 2;
+constexpr u32 kEptHookKnownCetPolicyMask = kEptHookCodeCet | kEptHookCodeIbt;
+constexpr u32 kEptHookKnownCfgPolicyMask = kEptHookCodeCfg;
 
 enum class EptAccess : u32 {
     Read = 1,
@@ -74,6 +80,14 @@ enum class EptGenerationState : u32 {
     Pending = 2,
     Retired = 3,
     Quarantined = 4,
+};
+
+enum class EptHookTransactionState : u32 {
+    Prepared = 1,
+    Published = 2,
+    Retired = 3,
+    RolledBack = 4,
+    Quarantined = 5,
 };
 
 #pragma pack(push, 8)
@@ -150,6 +164,40 @@ struct EptGeneration {
     u32 reserved;
 };
 
+struct EptHookMetadata {
+    u32 size;
+    u32 version;
+    u64 original_page_physical;
+    u64 shadow_page_physical;
+    u64 module_hash[2];
+    u64 target_rip;
+    u32 instruction_length;
+    u32 cet_policy;
+    u32 cfg_policy;
+    u32 reserved;
+    u64 rollback_generation;
+};
+
+struct EptHookTransaction {
+    u32 size;
+    u32 version;
+    u64 transaction_id;
+    u64 owner_id;
+    u64 parent_generation;
+    u64 pending_generation;
+    u64 guest_physical;
+    u64 page_count;
+    u64 deadline_tsc;
+    u64 rollback_generation;
+    u32 view;
+    u32 hook_kind;
+    u32 state;
+    u32 required_cpu_acks;
+    u32 observed_cpu_acks;
+    u32 max_exits_per_second;
+    u32 reserved;
+};
+
 #pragma pack(pop)
 
 bool IsEptpConfigValid(const EptpConfig* config, u32 max_physical_bits);
@@ -168,6 +216,32 @@ bool IsEptHookRequestValid(const EptHookRequest* request);
 bool CanPublishEptHook(const EptHookLease* lease,
                        const EptHookRequest* request,
                        u64 current_generation, u64 now_tsc);
+bool IsEptHookMetadataValid(const EptHookMetadata* metadata);
+bool IsEptHookTransactionValid(const EptHookTransaction* transaction);
+bool IsEptHookMetadataCompatible(const EptHookRequest* request,
+                                 const EptHookTransaction* transaction,
+                                 const EptHookMetadata* metadata);
+bool BeginEptHookUpdate(const EptHookLease* lease,
+                        const EptHookRequest* request,
+                        u64 current_generation, u64 now_tsc,
+                        u32 required_cpu_acks, u64 transaction_id,
+                        EptHookTransaction* transaction);
+bool IsEptHookTransactionLive(const EptHookTransaction* transaction,
+                              u64 now_tsc);
+bool AcknowledgeEptHookCpu(EptHookTransaction* transaction,
+                           u64 generation, u32 cpu_count, u64 now_tsc);
+bool PublishEptHookUpdate(EptHookTransaction* transaction,
+                          u64 current_generation, u64 now_tsc);
+bool RetireEptHookUpdate(EptHookTransaction* transaction,
+                         u64 current_generation);
+bool RollbackEptHookUpdate(EptHookTransaction* transaction,
+                           u64 current_generation);
+bool QuarantineEptHookUpdate(EptHookTransaction* transaction,
+                             u64 current_generation);
+bool ExpireEptHookUpdate(EptHookTransaction* transaction,
+                         u64 current_generation, u64 now_tsc);
+bool IsEptHookRateWithin(const EptHookLease* lease, u64 exit_count,
+                         u64 window_tsc, u64 tsc_hz);
 
 bool NextEptGeneration(u64 current_generation, u64* next_generation);
 bool BeginEptGeneration(const EptGeneration* current,
@@ -190,4 +264,8 @@ static_assert(sizeof(knhv::EptHookRequest) == 72,
               "EPT hook request ABI changed");
 static_assert(sizeof(knhv::EptGeneration) == 40,
               "EPT generation ABI changed");
+static_assert(sizeof(knhv::EptHookMetadata) == 72,
+              "EPT hook metadata ABI changed");
+static_assert(sizeof(knhv::EptHookTransaction) == 104,
+              "EPT hook transaction ABI changed");
 #endif
