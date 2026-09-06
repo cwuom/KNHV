@@ -304,6 +304,14 @@ verdict, and required evidence flags all match. The current model validates
 supplied evidence only; it does not collect privileged state or claim that a
 Native L0 hardware validation has completed.
 
+The manifest writer is the host-only boundary that turns an already collected
+snapshot into the fixed manifest. It checks the snapshot's version, profile,
+stage, owner generation, source-clean observation, and signature result before
+writing it. Synthetic snapshots require an explicit laboratory flag and cannot
+carry hardware evidence. Native Intel capability and release profiles require
+target hardware evidence and a trusted signature; the writer never reads VMX,
+VT-d, DMA, device, or certificate-store state itself.
+
 Run it once on the isolated validation target after copying the matching build:
 
 ```powershell

@@ -446,6 +446,7 @@ if(KNHV_BUILD_TESTS)
             tests/target_evidence_model_test.cpp
             tests/target_evidence_codec_test.cpp
             tests/target_evidence_signature_test.cpp
+            tests/target_evidence_writer_test.cpp
             tests/ept_time_model_test.cpp
             tests/vmcs02_model_test.cpp
             tests/vmcs_shadow_model_test.cpp
@@ -463,7 +464,9 @@ if(KNHV_BUILD_TESTS)
             src/validation/target_evidence.cpp
             src/validation/target_evidence_codec.cpp
             src/validation/target_evidence_signature.cpp
+            src/validation/target_evidence_writer.cpp
             src/include/knhv_target_evidence_signature.h
+            src/include/knhv_target_evidence_writer.h
             src/ept/ept_model.cpp
             src/time/time_contract.cpp
             src/nested/vmcs02_model.cpp
@@ -589,9 +592,11 @@ if(KNHV_BUILD_EVIDENCE_TOOL)
             src/validation/target_evidence.cpp
             src/validation/target_evidence_codec.cpp
             src/validation/target_evidence_signature.cpp
+            src/validation/target_evidence_writer.cpp
             src/include/knhv_target_evidence.h
             src/include/knhv_target_evidence_codec.h
-            src/include/knhv_target_evidence_signature.h)
+            src/include/knhv_target_evidence_signature.h
+            src/include/knhv_target_evidence_writer.h)
     knhv_set_artifact_layout(KNHV_EvidenceTool program)
     if(_knhv_toolchain_includes)
         target_include_directories(KNHV_EvidenceTool SYSTEM BEFORE PRIVATE

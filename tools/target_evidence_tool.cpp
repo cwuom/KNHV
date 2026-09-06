@@ -16,6 +16,7 @@
 
 #include "knhv_target_evidence_codec.h"
 #include "knhv_target_evidence_signature.h"
+#include "knhv_target_evidence_writer.h"
 
 namespace {
 
@@ -26,6 +27,7 @@ constexpr int kExitUsage = 2;
 constexpr int kExitBlocked = 10;
 constexpr int kExitInvalid = 11;
 constexpr int kExitIo = 12;
+constexpr knhv::u32 kSyntheticPrivateRootMarker = 1U;
 
 enum class Operation : std::uint32_t {
     None = 0,
@@ -510,7 +512,39 @@ bool WriteReport(const fs::path& path, const std::string& text,
 }
 
 int RunEmit(const Options& options) {
-    const knhv::TargetEvidenceManifest manifest = MakeSyntheticManifest();
+    const knhv::TargetEvidenceManifest candidate = MakeSyntheticManifest();
+    knhv::TargetEvidenceSignatureResult signature{};
+    signature.size = sizeof(signature);
+    signature.version = knhv::kTargetEvidenceSignatureContractVersion;
+    signature.status = static_cast<knhv::u32>(
+        knhv::TargetEvidenceSignatureStatus::PrivateTestRoot);
+    signature.wintrust_status = kSyntheticPrivateRootMarker;
+    signature.result_flags =
+        knhv::kTargetEvidenceSignatureResultPrivateRootAccepted;
+
+    knhv::TargetEvidenceManifestWriteRequest write_request{};
+    write_request.size = sizeof(write_request);
+    write_request.version = knhv::kTargetEvidenceWriterContractVersion;
+    write_request.flags =
+        knhv::kTargetEvidenceWriterFlagAllowSynthetic |
+        knhv::kTargetEvidenceWriterFlagAllowPrivateTestRoot |
+        knhv::kTargetEvidenceWriterFlagSourceCleanObserved |
+        knhv::kTargetEvidenceWriterFlagCommitSignature;
+    write_request.candidate = candidate;
+    write_request.signature = signature;
+    knhv::TargetEvidenceManifestWriteResult write_result{};
+    if (!knhv::BuildTargetEvidenceManifest(&write_request, &write_result) ||
+        write_result.status != static_cast<knhv::u32>(
+                                    knhv::TargetEvidenceWriterStatus::Success) ||
+        !knhv::IsTargetEvidenceManifestWriteResultValid(&write_result)) {
+        std::cerr << "manifest writer rejected synthetic evidence: "
+                  << knhv::TargetEvidenceWriterStatusText(
+                         static_cast<knhv::TargetEvidenceWriterStatus>(
+                             write_result.status))
+                  << '\n';
+        return kExitInvalid;
+    }
+    const knhv::TargetEvidenceManifest& manifest = write_result.manifest;
     std::array<knhv::u8, knhv::kTargetEvidenceWireEnvelopeSize> encoded{};
     knhv::u32 written = 0U;
     const knhv::TargetEvidenceCodecStatus status =

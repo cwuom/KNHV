@@ -20,6 +20,7 @@ int wmain(int argc, wchar_t** argv) {
     RunTargetEvidenceModelContract(state);
     RunTargetEvidenceCodecContract(state);
     RunTargetEvidenceSignatureContract(state);
+    RunTargetEvidenceWriterContract(state);
     RunEptTimeModelContract(state);
     RunVmcs02ModelContract(state);
     RunVmcsShadowModelContract(state);
